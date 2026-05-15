@@ -107,6 +107,7 @@ final class AppStore: ObservableObject {
     @Published var savedEvents: [SavedEvent] = []
     @Published var eventParticipants: [String: [EventParticipant]] = [:]
     @Published var organizerProfiles: [String: PublicProfile] = [:]
+    @Published var organizerPublicProfiles: [String: OrganizerPublicProfile] = [:]
     @Published var notifications: [UserNotification] = []
     @Published var products: [MerchProduct] = []
     @Published var rewards: [Reward] = []
@@ -119,6 +120,7 @@ final class AppStore: ObservableObject {
     @Published var isLoading = false
     @Published var errorMessage: String?
     @Published var pendingPayment: PendingPayment?
+    @Published var homeDiscoveryRequest: HomeDiscoveryRequest?
 
     private let api = SupabaseAPI()
     private let pushNotifications = PushNotificationService.shared
@@ -277,6 +279,8 @@ final class AppStore: ObservableObject {
     }
 
     func sendPasswordReset(email: String) async -> Bool {
+        isLoading = true
+        defer { isLoading = false }
         do {
             try await api.sendPasswordReset(email: email)
             return true
@@ -397,7 +401,9 @@ final class AppStore: ObservableObject {
             let update = try await api.updatePassword(newPassword, session: recovery.session)
             let recoveredUser = AuthUser(
                 id: update.id?.nilIfBlank ?? recovery.session.user.id,
-                email: update.email ?? recovery.session.user.email
+                email: update.email ?? recovery.session.user.email,
+                appMetadata: recovery.session.user.appMetadata,
+                identities: recovery.session.user.identities
             )
             let recoveredSession = recovery.session.replacingUser(recoveredUser)
             session = recoveredSession
@@ -470,7 +476,7 @@ final class AppStore: ObservableObject {
             }
 
             let registration = try await api.insertRegistration(event: freshEvent, input: input, profile: profile, session: authSession)
-            if !input.asWaitlist && (selectedRequiresOnlinePayment || !(profile?.hasActiveMembership ?? false)) {
+            if !input.asWaitlist && !input.requestApproval && (selectedRequiresOnlinePayment || !(profile?.hasActiveMembership ?? false)) {
                 let result = try await api.createCheckout(eventId: freshEvent.id, registrationId: registration.id, priceOptionId: input.priceOptionId, discountCodeId: input.discountCodeId, paymentChoice: input.paymentChoice, session: authSession)
                 if let sessionId = result.sessionId, let url = result.url {
                     let pending = PendingPayment(sessionId: sessionId, eventId: freshEvent.id, registrationId: registration.id, checkoutURL: url)
@@ -488,8 +494,86 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func resumeCheckout(for registration: Registration) async -> CheckoutResult? {
+        guard session != nil else {
+            errorMessage = "Devi effettuare il login"
+            return nil
+        }
+        guard let event = registration.event else {
+            errorMessage = "Evento non disponibile"
+            return nil
+        }
+        do {
+            let authSession = try await authenticatedSession()
+            let result = try await api.createCheckout(
+                eventId: event.id,
+                registrationId: registration.id,
+                priceOptionId: registration.priceOptionId,
+                discountCodeId: nil,
+                paymentChoice: "deposit",
+                session: authSession
+            )
+            if let sessionId = result.sessionId, let url = result.url {
+                let pending = PendingPayment(sessionId: sessionId, eventId: event.id, registrationId: registration.id, checkoutURL: url)
+                pending.save()
+                pendingPayment = pending
+            }
+            await refreshEventState(session: authSession, participantEventId: event.id)
+            return result
+        } catch {
+            report(error)
+            return nil
+        }
+    }
+
+    func completeWaitlistBooking(for registration: Registration) async -> Bool {
+        guard session != nil else {
+            errorMessage = "Devi effettuare il login"
+            return false
+        }
+        guard let event = registration.event else {
+            errorMessage = "Evento non disponibile"
+            return false
+        }
+        do {
+            let authSession = try await authenticatedSession()
+            let freshEvent = try await api.fetchEvent(eventId: event.id, session: authSession)
+            mergeEventSnapshot(freshEvent)
+
+            let selectedOption = registration.priceOptionId.flatMap { optionId in
+                freshEvent.priceOptions.first { $0.id == optionId }
+            }
+            let hasSpot = selectedOption?.isBookable(in: freshEvent) ?? (freshEvent.bookableSpots > 0)
+            guard hasSpot else {
+                errorMessage = "Il posto è stato preso da un altro partecipante. Resti in lista d'attesa."
+                await refreshEventState(session: authSession, participantEventId: freshEvent.id)
+                return false
+            }
+
+            let paymentType = selectedOption?.effectivePaymentType(fallback: freshEvent) ?? freshEvent.paymentType ?? "free"
+            let requiresOnlinePayment = selectedOption?.requiresOnlinePayment(fallback: freshEvent) ?? freshEvent.requiresOnlinePayment
+            guard !requiresOnlinePayment else {
+                errorMessage = "Completa il pagamento per finalizzare la prenotazione."
+                return false
+            }
+
+            let paymentStatus = paymentType == "location" ? "pay_on_location" : "not_required"
+            try await api.completeWaitlistRegistration(registrationId: registration.id, eventId: freshEvent.id, paymentStatus: paymentStatus, session: authSession)
+            await refreshEventState(session: authSession, participantEventId: freshEvent.id)
+            return true
+        } catch {
+            report(error)
+            return false
+        }
+    }
+
     func verifyPendingPayment() async -> PaymentVerificationStatus {
         guard let pendingPayment else { return .error("Nessun pagamento in corso") }
+        guard pendingPayment.isFresh else {
+            PendingPayment.clear()
+            self.pendingPayment = nil
+            return .error("Sessione di pagamento scaduta. Puoi riprendere l'iscrizione da I miei eventi.")
+        }
         do {
             let authSession = try await authenticatedSession()
             let result = try await api.verifyEventPayment(sessionId: pendingPayment.sessionId, session: authSession)
@@ -503,6 +587,34 @@ final class AppStore: ObservableObject {
                 PendingPayment.clear()
                 self.pendingPayment = nil
                 await refreshEventState(session: authSession, participantEventId: pendingPayment.eventId)
+                return .spotTaken(result.message ?? "Il posto è stato assegnato a un altro partecipante. Rimani in lista d'attesa.")
+            }
+            return .error(result.error ?? "Pagamento non ancora confermato")
+        } catch {
+            if error.isCancellation { return .error("") }
+            return .error(error.localizedDescription)
+        }
+    }
+
+    func verifyEventPayment(sessionId: String, eventId: String?) async -> PaymentVerificationStatus {
+        do {
+            let authSession = try await authenticatedSession()
+            let result = try await api.verifyEventPayment(sessionId: sessionId, session: authSession)
+            let refreshEventId = eventId ?? pendingPayment?.eventId
+            if result.success {
+                if pendingPayment?.sessionId == sessionId {
+                    PendingPayment.clear()
+                    pendingPayment = nil
+                }
+                await refreshEventState(session: authSession, participantEventId: refreshEventId)
+                return .success
+            }
+            if (result.spotTaken ?? false) || (result.autoRefunded ?? false) {
+                if pendingPayment?.sessionId == sessionId {
+                    PendingPayment.clear()
+                    pendingPayment = nil
+                }
+                await refreshEventState(session: authSession, participantEventId: refreshEventId)
                 return .spotTaken(result.message ?? "Il posto è stato assegnato a un altro partecipante. Rimani in lista d'attesa.")
             }
             return .error(result.error ?? "Pagamento non ancora confermato")
@@ -547,13 +659,43 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func dismissPendingPaymentBanner() {
+        PendingPayment.clear()
+        pendingPayment = nil
+    }
+
+    func updateRegistrationDetails(registrationId: String, event: Event, meetingPointId: String?, carAvailability: String?, additionalResponses: [String: String]) async -> Bool {
+        do {
+            guard event.calendarStartDate.map({ $0 > Date() }) != false else {
+                throw AppError.message("Non è più possibile modificare l'iscrizione dopo l'inizio dell'evento")
+            }
+            let authSession = try await authenticatedSession()
+            try await api.updateRegistrationDetails(
+                registrationId: registrationId,
+                meetingPointId: meetingPointId,
+                carAvailability: carAvailability,
+                additionalResponses: additionalResponses,
+                session: authSession
+            )
+            await refreshEventState(session: authSession, participantEventId: event.id)
+            return true
+        } catch {
+            report(error)
+            return false
+        }
+    }
+
     func loadParticipants(eventId: String) async {
         await refreshParticipants(eventId: eventId, session: session)
     }
 
     func loadOrganizerProfile(organizerId: String?) async {
-        guard let organizerId = organizerId?.nilIfBlank, organizerProfiles[organizerId] == nil else { return }
-        if let profile = try? await api.fetchOrganizerContactProfile(userId: organizerId, session: session) {
+        guard let organizerId = organizerId?.nilIfBlank, organizerPublicProfiles[organizerId] == nil else { return }
+        if let organizer = try? await api.fetchOrganizerPublicProfile(userId: organizerId, session: session) {
+            organizerPublicProfiles[organizerId] = organizer
+            organizerProfiles[organizerId] = organizer.profile
+        } else if organizerProfiles[organizerId] == nil,
+                  let profile = try? await api.fetchOrganizerContactProfile(userId: organizerId, session: session) {
             organizerProfiles[organizerId] = profile
         }
     }
@@ -709,6 +851,27 @@ final class AppStore: ObservableObject {
         do {
             let authSession = try await authenticatedSession()
             return try await api.fetchOrganizerRegistrations(eventId: eventId, session: authSession)
+        } catch {
+            report(error, when: reportingErrors)
+            return []
+        }
+    }
+
+    func fetchOrganizerRegistrations(eventIds: [String], reportingErrors: Bool = true) async -> [OrganizerRegistration] {
+        guard !eventIds.isEmpty else { return [] }
+        do {
+            let authSession = try await authenticatedSession()
+            return try await api.fetchOrganizerRegistrations(eventIds: eventIds, session: authSession)
+        } catch {
+            report(error, when: reportingErrors)
+            return []
+        }
+    }
+
+    func fetchParticipantRegistrationHistory(userIds: [String], reportingErrors: Bool = true) async -> [ParticipantRegistrationHistoryRow] {
+        do {
+            let authSession = try await authenticatedSession()
+            return try await api.fetchParticipantRegistrationHistory(userIds: userIds, session: authSession)
         } catch {
             report(error, when: reportingErrors)
             return []
@@ -1224,7 +1387,68 @@ final class AppStore: ObservableObject {
 }
 
 struct EventNavigationTarget: Identifiable, Hashable, Sendable {
+    let eventId: String
+    let opensParticipants: Bool
+
+    var id: String {
+        opensParticipants ? "\(eventId)#participants" : eventId
+    }
+
+    init(id eventId: String, opensParticipants: Bool = false) {
+        self.eventId = eventId
+        self.opensParticipants = opensParticipants
+    }
+}
+
+struct OrganizerNavigationTarget: Identifiable, Hashable, Sendable {
     let id: String
+}
+
+struct OrganizerDashboardRoute: Identifiable, Hashable, Sendable {
+    enum Destination: Hashable, Sendable {
+        case create
+        case manage(String)
+        case edit(String)
+    }
+
+    let destination: Destination
+
+    var id: String {
+        switch destination {
+        case .create:
+            return "create"
+        case .manage(let eventId):
+            return "manage-\(eventId)"
+        case .edit(let eventId):
+            return "edit-\(eventId)"
+        }
+    }
+}
+
+struct ContentPageRoute: Identifiable, Hashable, Sendable {
+    let slug: String
+    let fallbackTitle: String
+
+    var id: String { slug }
+
+    init(slug: String, fallbackTitle: String? = nil) {
+        self.slug = slug
+        self.fallbackTitle = fallbackTitle ?? Self.title(for: slug)
+    }
+
+    private static func title(for slug: String) -> String {
+        switch slug {
+        case "privacy-policy": "Informativa Privacy"
+        case "termini-di-servizio": "Termini di Servizio"
+        case "guida-difficolta-trekking": "Guida difficoltà trekking"
+        case "chi-siamo": "Chi siamo"
+        case "faq": "FAQ"
+        default:
+            slug
+                .replacingOccurrences(of: "-", with: " ")
+                .capitalized
+        }
+    }
 }
 
 struct NotificationNavigationRequest: Identifiable, Equatable, Sendable {
@@ -1240,6 +1464,32 @@ enum ProfileScrollTarget: Hashable, Sendable {
     case badges
     case activity
     case help
+}
+
+struct HomeDiscoveryRequest: Identifiable, Equatable, Sendable {
+    let id = UUID()
+    let category: String?
+    let quickFilter: QuickFilter?
+
+    init(category: String? = nil, quickFilter: QuickFilter? = nil) {
+        self.category = category
+        self.quickFilter = quickFilter
+    }
+
+    init(mission: MissionCardModel) {
+        let missionCategory = mission.missions?.category?.nilIfBlank
+        let action = (mission.missions?.targetAction ?? "").lowercased()
+        let type = (mission.missions?.type ?? "").lowercased()
+        let quickFilter: QuickFilter?
+        if action == "limited_spots" {
+            quickFilter = .lastSpots
+        } else if type == "weekly" {
+            quickFilter = .thisWeek
+        } else {
+            quickFilter = nil
+        }
+        self.init(category: missionCategory, quickFilter: quickFilter)
+    }
 }
 
 enum NotificationDestination: Equatable, Sendable {
@@ -1573,6 +1823,7 @@ struct SupabaseAPI {
     private static let priceOptionSelect = "id,name,price,sort_order,original_price,eligible_group,is_promotional,promo_start,promo_end,payment_type,deposit_amount,balance_amount,balance_payment_mode,has_dedicated_spots,dedicated_spots,spots_taken,waitlist_enabled"
     private static let eventSelect = "id,title,date,time,location,location_label,status,price,deposit,payment_type,balance_payment_mode,image_url,difficulty,distance,elevation,duration,spots_total,spots_taken,reserved_spots,featured,event_badges,organizer_id,organizer_name,description,cancellation_policy,equipment_list,additional_fields,visibility,gallery_images,access_rules,event_categories(name,icon),event_meeting_points(id,name,location,time,notes),event_price_options(\(priceOptionSelect))"
     private static let registrationSelect = "*,events(\(eventSelect)),meeting_point:event_meeting_points(id,name,location,time)"
+    private static let organizerRegistrationSelect = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,sport_level,amount_paid,refund_amount,last_balance_reminder_sent_at,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,avatar_url,total_points,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade,interests,birth_date),price_option:event_price_options(\(priceOptionSelect))"
 
     private let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
@@ -1937,9 +2188,26 @@ struct SupabaseAPI {
     }
 
     func fetchOrganizerRegistrations(eventId: String, session: AuthSession) async throws -> [OrganizerRegistration] {
-        let select = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,sport_level,last_balance_reminder_sent_at,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,avatar_url,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade),price_option:event_price_options(\(Self.priceOptionSelect))"
+        let select = Self.organizerRegistrationSelect
         let path = "/rest/v1/event_registrations?select=\(select.urlEncoded)&event_id=eq.\(eventId.urlEncoded)&order=created_at.asc"
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [OrganizerRegistration].self)
+    }
+
+    func fetchOrganizerRegistrations(eventIds: [String], session: AuthSession) async throws -> [OrganizerRegistration] {
+        guard !eventIds.isEmpty else { return [] }
+        let select = Self.organizerRegistrationSelect
+        let ids = eventIds.map(\.urlEncoded).joined(separator: ",")
+        let path = "/rest/v1/event_registrations?select=\(select.urlEncoded)&event_id=in.(\(ids))&order=created_at.asc"
+        return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [OrganizerRegistration].self)
+    }
+
+    func fetchParticipantRegistrationHistory(userIds: [String], session: AuthSession) async throws -> [ParticipantRegistrationHistoryRow] {
+        let ids = Array(Set(userIds.compactMap { $0.nilIfBlank })).sorted()
+        guard !ids.isEmpty else { return [] }
+        let encodedIds = ids.map(\.urlEncoded).joined(separator: ",")
+        let select = "user_id,event_id,status,checked_in,created_at"
+        let path = "/rest/v1/event_registrations?select=\(select.urlEncoded)&user_id=in.(\(encodedIds))&order=created_at.desc"
+        return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [ParticipantRegistrationHistoryRow].self)
     }
 
     func searchProfiles(query rawQuery: String, session: AuthSession) async throws -> [OrganizerSearchProfile] {
@@ -2027,6 +2295,20 @@ struct SupabaseAPI {
         return profile
     }
 
+    func fetchOrganizerPublicProfile(userId: String, session: AuthSession?) async throws -> OrganizerPublicProfile? {
+        guard let profile = try await fetchOrganizerContactProfile(userId: userId, session: session) else { return nil }
+        let eventsPath = "/rest/v1/events?select=\(Self.eventSelect.urlEncoded)&organizer_id=eq.\(userId.urlEncoded)&visibility=eq.public&order=date.asc"
+        let events = try await request(path: eventsPath, method: "GET", bodyData: nil, auth: session, decode: [Event].self)
+
+        let countPath = "/rest/v1/events?select=id&organizer_id=eq.\(userId.urlEncoded)"
+        let countRows = try? await request(path: countPath, method: "GET", bodyData: nil, auth: session, decode: [InsertedEvent].self)
+        return OrganizerPublicProfile(
+            profile: profile,
+            eventCount: countRows?.count ?? events.count,
+            events: events
+        )
+    }
+
     private func fetchPublicProfiles(userIds: [String], session: AuthSession?) async throws -> [String: PublicProfile] {
         guard !userIds.isEmpty else { return [:] }
         let body: [String: JSONValue] = ["profile_ids": .array(userIds.map { .string($0) })]
@@ -2058,7 +2340,7 @@ struct SupabaseAPI {
     }
 
     func fetchRewards(session: AuthSession) async throws -> [Reward] {
-        let select = "*,missions(title,icon,category)"
+        let select = "*,missions(title,icon,category),source_reward:mission_rewards!user_rewards_source_mission_reward_id_fkey(title,reward_kind,badges(name,icon,description))"
         let path = "/rest/v1/user_rewards?select=\(select.urlEncoded)&user_id=eq.\(session.user.id)&order=created_at.desc"
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [Reward].self)
     }
@@ -2090,7 +2372,7 @@ struct SupabaseAPI {
             decode: [UserMissionProgress].self
         )
         async let activeTask: [ActiveMissionDefinition] = request(
-            path: "/rest/v1/missions?select=id,title,description,target_value,reward_points,type,icon,reward_type,reward_value,category,target_action,expires_at&is_active=eq.true&status=eq.active&visibility=eq.visible&is_archived=eq.false&order=sort_order.asc&order=created_at.asc",
+            path: "/rest/v1/missions?select=id,title,description,target_value,reward_points,type,icon,reward_type,reward_value,category,target_action,expires_at,mission_rewards(id,reward_kind,points_value,title,sort_order,visible_on_profile,badges(name,icon))&is_active=eq.true&status=eq.active&visibility=eq.visible&is_archived=eq.false&order=sort_order.asc&order=created_at.asc",
             method: "GET",
             bodyData: nil,
             auth: session,
@@ -2127,7 +2409,8 @@ struct SupabaseAPI {
                     rewardValue: mission.rewardValue,
                     category: mission.category,
                     targetAction: mission.targetAction,
-                    expiresAt: mission.expiresAt
+                    expiresAt: mission.expiresAt,
+                    missionRewards: mission.missionRewards
                 )
             )
         }
@@ -2295,6 +2578,9 @@ struct SupabaseAPI {
         if updates.hasMeetingPointUpdate {
             payload["meeting_point_id"] = updates.meetingPointId.map { .string($0) } ?? .null
         }
+        if updates.hasPriceOptionUpdate {
+            payload["price_option_id"] = updates.priceOptionId.map { .string($0) } ?? .null
+        }
         guard !payload.isEmpty else { return }
         let data = try JSONEncoder().encode(payload)
         let _: EmptyResponse = try await request(path: "/rest/v1/event_registrations?id=eq.\(id.urlEncoded)", method: "PATCH", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
@@ -2394,7 +2680,6 @@ struct SupabaseAPI {
 
     private func replacePriceOptions(eventId: String, options: [OrganizerPriceOptionDraft], session: AuthSession) async throws {
         let validOptions = options.filter { $0.name.nilIfBlank != nil }
-        guard !validOptions.isEmpty else { return }
         let existingOptions = try await fetchEventPriceOptions(eventId: eventId, session: session)
         let retainedServerIds = Set(validOptions.compactMap(\.serverId))
         let removedOptions = existingOptions.filter { !retainedServerIds.contains($0.id) }
@@ -2405,10 +2690,12 @@ struct SupabaseAPI {
             let _: EmptyResponse = try await request(path: "/rest/v1/event_price_options?id=eq.\(removed.id.urlEncoded)", method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
         }
 
+        guard !validOptions.isEmpty else { return }
+
         for (index, option) in validOptions.enumerated() {
             let eligibleGroup = option.badgeIds.isEmpty ? (option.eligibleGroup.nilIfBlank ?? "all") : "badge:\(option.badgeIds.joined(separator: ","))"
             let resolvedPrice = option.paymentType == "free" ? 0 : option.price
-            let resolvedBalance = max(option.balanceAmount, resolvedPrice - option.depositAmount)
+            let resolvedBalance = max(0, resolvedPrice - option.depositAmount)
             let payload: [String: JSONValue] = [
                 "event_id": JSONValue.string(eventId),
                 "name": .string(option.name),
@@ -2452,10 +2739,10 @@ struct SupabaseAPI {
 
     func deleteOrganizerEvent(eventId: String, session: AuthSession) async throws {
         let _: EmptyResponse = try await request(path: "/rest/v1/event_special_badges?event_id=eq.\(eventId.urlEncoded)", method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
-        let _: EmptyResponse = try await request(path: "/rest/v1/event_price_options?event_id=eq.\(eventId.urlEncoded)", method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
         let _: EmptyResponse = try await request(path: "/rest/v1/event_broadcasts?event_id=eq.\(eventId.urlEncoded)", method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
-        let _: EmptyResponse = try await request(path: "/rest/v1/event_registrations?event_id=eq.\(eventId.urlEncoded)", method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
         let _: EmptyResponse = try await request(path: "/rest/v1/event_meeting_points?event_id=eq.\(eventId.urlEncoded)", method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
+        let _: EmptyResponse = try await request(path: "/rest/v1/event_registrations?event_id=eq.\(eventId.urlEncoded)", method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
+        let _: EmptyResponse = try await request(path: "/rest/v1/event_price_options?event_id=eq.\(eventId.urlEncoded)", method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
         let _: EmptyResponse = try await request(path: "/rest/v1/events?id=eq.\(eventId.urlEncoded)", method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
     }
 
@@ -2465,14 +2752,14 @@ struct SupabaseAPI {
     }
 
     func sendOrganizerBroadcast(eventId: String, eventTitle: String, message: String, channel: String, senderId: String, recipients: [OrganizerRegistration], session: AuthSession) async throws -> Int {
-        let activeRecipientIds = Array(Set(recipients.compactMap { registration -> String? in
-            guard registration.isActive, !registration.isManual else { return nil }
-            return registration.userId?.nilIfBlank
-        }))
-        guard !activeRecipientIds.isEmpty else { throw AppError.message("Nessun partecipante a cui inviare il messaggio") }
+        let activeRecipients = recipients.filter { $0.isActive && !$0.isManual }
+        let notificationRecipientIds = Array(Set(activeRecipients.compactMap { $0.userId?.nilIfBlank }))
+        let whatsappPhones = Array(Set(activeRecipients.compactMap { $0.profiles?.phone?.whatsAppPhone }))
+        let recipientsCount: Int
 
         if channel == "notification" {
-            let notificationRows = activeRecipientIds.map { userId in
+            guard !notificationRecipientIds.isEmpty else { throw AppError.message("Nessun partecipante a cui inviare il messaggio") }
+            let notificationRows = notificationRecipientIds.map { userId in
                 [
                     "user_id": JSONValue.string(userId),
                     "type": .string("broadcast"),
@@ -2484,6 +2771,10 @@ struct SupabaseAPI {
             }
             let notificationData = try JSONEncoder().encode(notificationRows)
             let _: EmptyResponse = try await request(path: "/rest/v1/notifications", method: "POST", bodyData: notificationData, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
+            recipientsCount = notificationRecipientIds.count
+        } else {
+            guard !whatsappPhones.isEmpty else { throw AppError.message("Nessun numero WhatsApp disponibile") }
+            recipientsCount = whatsappPhones.count
         }
 
         let broadcastPayload: [String: JSONValue] = [
@@ -2491,13 +2782,13 @@ struct SupabaseAPI {
             "sender_id": .string(senderId),
             "message": .string(message),
             "channel": .string(channel),
-            "recipients_count": .number(Double(activeRecipientIds.count))
+            "recipients_count": .number(Double(recipientsCount))
         ]
         let broadcastData = try JSONEncoder().encode(broadcastPayload)
         let _: EmptyResponse = try await request(path: "/rest/v1/event_broadcasts", method: "POST", bodyData: broadcastData, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
 
         if channel == "notification" {
-            for userId in activeRecipientIds {
+            for userId in notificationRecipientIds {
                 let _: EmptyObject? = try? await function(
                     name: "send-push-notification",
                     body: [
@@ -2511,12 +2802,16 @@ struct SupabaseAPI {
                 )
             }
         }
-        return activeRecipientIds.count
+        return recipientsCount
     }
 
     func sendBalanceReminders(event: Event, recipients: [OrganizerRegistration], session: AuthSession) async throws -> Int {
         let candidates = recipients.filter { registration in
-            registration.normalizedStatus == "deposit_paid" && !registration.isManual && registration.userId?.nilIfBlank != nil
+            guard registration.normalizedStatus == "deposit_paid",
+                  !registration.isManual,
+                  registration.userId?.nilIfBlank != nil
+            else { return false }
+            return (registration.priceOption?.effectiveBalancePaymentMode(fallback: event) ?? event.balancePaymentMode ?? "online") == "online"
         }
         guard !candidates.isEmpty else { throw AppError.message("Nessun partecipante da sollecitare") }
         let message = "Completa il saldo per confermare definitivamente la partecipazione"
@@ -2582,7 +2877,9 @@ struct SupabaseAPI {
         }
 
         let status: String
-        if shouldWaitlist {
+        if input.requestApproval {
+            status = "pending_approval"
+        } else if shouldWaitlist {
             status = "waitlist"
         } else if requiresOnlinePayment {
             status = "pending_payment"
@@ -2598,8 +2895,14 @@ struct SupabaseAPI {
         ]
         if let meetingPointId = input.meetingPointId { payload["meeting_point_id"] = .string(meetingPointId) }
         if let priceOptionId = input.priceOptionId { payload["price_option_id"] = .string(priceOptionId) }
-        if let car = input.carAvailability { payload["car_availability"] = .string(car) }
-        if let sportLevel = input.sportLevel { payload["sport_level"] = .string(sportLevel) }
+        if let car = input.carAvailability?.nilIfBlank { payload["car_availability"] = .string(car) }
+        if let sportLevel = input.sportLevel?.nilIfBlank { payload["sport_level"] = .string(sportLevel) }
+        let additionalResponses = input.additionalResponses.reduce(into: [String: JSONValue]()) { result, pair in
+            if let cleanValue = pair.value.nilIfBlank, pair.key.nilIfBlank != nil {
+                result[pair.key] = .string(cleanValue)
+            }
+        }
+        if !additionalResponses.isEmpty { payload["additional_responses"] = .object(additionalResponses) }
 
         let data = try JSONEncoder().encode(payload)
         let registrations: [InsertedRegistration] = try await request(path: "/rest/v1/event_registrations?select=id", method: "POST", bodyData: data, auth: session, decode: [InsertedRegistration].self, prefer: "return=representation")
@@ -2671,7 +2974,34 @@ struct SupabaseAPI {
             "cancelled_at": .string(ISO8601DateFormatter().string(from: Date()))
         ]
         let data = try JSONEncoder().encode(payload)
-        let path = "/rest/v1/event_registrations?event_id=eq.\(eventId.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)&or=(status.is.null,status.in.(registered,deposit_paid,paid,pending_payment,waitlist))"
+        let path = "/rest/v1/event_registrations?event_id=eq.\(eventId.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)&or=(status.is.null,status.in.(registered,deposit_paid,paid,pending_payment,pending_approval,waitlist))"
+        let _: EmptyResponse = try await request(path: path, method: "PATCH", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
+    }
+
+    func updateRegistrationDetails(registrationId: String, meetingPointId: String?, carAvailability: String?, additionalResponses: [String: String], session: AuthSession) async throws {
+        var payload: [String: JSONValue] = [
+            "meeting_point_id": meetingPointId?.nilIfBlank.map { .string($0) } ?? .null,
+            "car_availability": carAvailability?.nilIfBlank.map { .string($0) } ?? .null
+        ]
+        let cleanedResponses = additionalResponses.reduce(into: [String: JSONValue]()) { result, pair in
+            if let key = pair.key.nilIfBlank, let value = pair.value.nilIfBlank {
+                result[key] = .string(value)
+            }
+        }
+        payload["additional_responses"] = cleanedResponses.isEmpty ? .null : .object(cleanedResponses)
+
+        let data = try JSONEncoder().encode(payload)
+        let path = "/rest/v1/event_registrations?id=eq.\(registrationId.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)"
+        let _: EmptyResponse = try await request(path: path, method: "PATCH", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
+    }
+
+    func completeWaitlistRegistration(registrationId: String, eventId: String, paymentStatus: String, session: AuthSession) async throws {
+        let payload: [String: JSONValue] = [
+            "status": .string("registered"),
+            "payment_status": .string(paymentStatus)
+        ]
+        let data = try JSONEncoder().encode(payload)
+        let path = "/rest/v1/event_registrations?id=eq.\(registrationId.urlEncoded)&event_id=eq.\(eventId.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)"
         let _: EmptyResponse = try await request(path: path, method: "PATCH", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
     }
 
@@ -2879,6 +3209,31 @@ struct AuthResponse: Decodable {
 struct AuthUser: Codable, Identifiable {
     let id: String
     let email: String?
+    let appMetadata: AuthAppMetadata?
+    let identities: [AuthIdentity]?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case email
+        case appMetadata = "app_metadata"
+        case identities
+    }
+
+    var usesEmailProvider: Bool {
+        if appMetadata?.provider == "email" { return true }
+        if appMetadata?.providers?.contains("email") == true { return true }
+        if identities?.contains(where: { $0.provider == "email" }) == true { return true }
+        return appMetadata == nil && identities == nil
+    }
+}
+
+struct AuthAppMetadata: Codable {
+    let provider: String?
+    let providers: [String]?
+}
+
+struct AuthIdentity: Codable {
+    let provider: String?
 }
 
 struct AuthUpdateResponse: Decodable {
@@ -3002,7 +3357,7 @@ struct PasswordRecoveryLink: Identifiable {
         let claims = jwtClaims(accessToken)
         let id = (claims["sub"] as? String) ?? (claims["user_id"] as? String) ?? ""
         let email = claims["email"] as? String
-        return AuthUser(id: id, email: email)
+        return AuthUser(id: id, email: email, appMetadata: AuthAppMetadata(provider: "email", providers: ["email"]), identities: nil)
     }
 
     private static func jwtClaims(_ token: String) -> [String: Any] {
@@ -3070,6 +3425,21 @@ struct Profile: Codable, Identifiable {
 
     var membershipExpiryShortSlashes: String {
         DateFormatter.membershipSlashesItalian.string(from: membershipExpiryDate)
+    }
+
+    var hasCompleteMembershipProfile: Bool {
+        missingMembershipFieldLabels.isEmpty
+    }
+
+    var missingMembershipFieldLabels: [String] {
+        var labels: [String] = []
+        if birthDate?.nilIfBlank == nil { labels.append("Data di nascita") }
+        if birthPlace?.nilIfBlank == nil { labels.append("Luogo di nascita") }
+        if provinceOfBirth?.nilIfBlank == nil { labels.append("Provincia di nascita") }
+        if residentialAddress?.nilIfBlank == nil { labels.append("Indirizzo di residenza") }
+        if cityOfResidence?.nilIfBlank == nil { labels.append("Città di residenza") }
+        if provinceOfResidence?.nilIfBlank == nil { labels.append("Provincia di residenza") }
+        return labels
     }
 }
 
@@ -3141,9 +3511,7 @@ struct Event: Codable, Identifiable, Hashable {
         return displayPrice
     }
     var attendeeSpotsTaken: Int {
-        let taken = spotsTaken ?? 0
-        guard taken > 0 else { return 0 }
-        return max(0, taken - organizerSpotOffset)
+        max(spotsTaken ?? 0, 0)
     }
     var availableSpots: Int { max(0, (spotsTotal ?? 0) - attendeeSpotsTaken) }
     var bookableSpots: Int { max(0, (spotsTotal ?? 0) - (spotsTaken ?? 0)) }
@@ -3203,9 +3571,348 @@ struct Event: Codable, Identifiable, Hashable {
         guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return false }
         return eventDate < Calendar.current.startOfDay(for: Date())
     }
+    var registrationDeadlineText: String? {
+        guard let raw = additionalFields?.string(at: "registration_deadline")?.nilIfBlank else { return nil }
+        if let date = DateFormatter.eventDate.date(from: String(raw.prefix(10))) ?? raw.iso8601Date {
+            return DateFormatter.birthDateItalianSlashes.string(from: date)
+        }
+        return raw
+    }
 
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
     static func == (lhs: Event, rhs: Event) -> Bool { lhs.id == rhs.id }
+}
+
+struct CheckoutCustomField: Identifiable, Hashable {
+    let id: String
+    let label: String
+    let type: String
+    let placeholder: String
+    let required: Bool
+    let options: [String]
+
+    init?(json: JSONValue, index: Int) {
+        guard let label = json.string(at: "label")?.nilIfBlank else { return nil }
+        self.id = "\(index)-\(label)"
+        self.label = label
+        self.type = json.string(at: "type")?.nilIfBlank?.lowercased() ?? "text"
+        self.placeholder = json.string(at: "placeholder") ?? ""
+        self.required = json.bool(at: "required") ?? false
+
+        if let optionValues = json["options"]?.arrayValue {
+            self.options = optionValues.compactMap { $0.stringValue?.nilIfBlank }
+        } else if let optionString = json.string(at: "options") {
+            self.options = optionString
+                .split(separator: ",")
+                .compactMap { String($0).nilIfBlank }
+        } else {
+            self.options = []
+        }
+    }
+}
+
+struct EventAccessRule: Identifiable, Hashable {
+    let id = UUID()
+    let type: String
+    let value: String?
+    let badgeIds: [String]
+    let badgeName: String?
+    let message: String?
+    let enforcement: String?
+    let interests: [String]
+
+    init(json: JSONValue) {
+        type = json.string(at: "type")?.nilIfBlank ?? ""
+        if let number = json.double(at: "value") {
+            value = String(Int(number))
+        } else {
+            value = json.string(at: "value")?.nilIfBlank
+        }
+        badgeIds = json.stringArray(at: "badge_ids") ?? json.string(at: "badge_id").map { [$0] } ?? []
+        badgeName = json.string(at: "badge_name")?.nilIfBlank
+        message = json.string(at: "message")?.nilIfBlank
+        enforcement = json.string(at: "enforcement")?.nilIfBlank
+        interests = json.stringArray(at: "interests") ?? []
+    }
+
+    var numericValue: Int {
+        Int(value ?? "") ?? 1
+    }
+
+    var effectiveEnforcement: String {
+        if type == "manual_approval" { return "hard" }
+        if type == "interests" { return "soft" }
+        return enforcement ?? "hard"
+    }
+}
+
+struct EventAccessCheck: Equatable {
+    let failedReasons: [String]
+    let softWarnings: [String]
+    let requiresApproval: Bool
+    let restrictionMessage: String?
+
+    var hasAccess: Bool { failedReasons.isEmpty }
+    var isBlocking: Bool { !failedReasons.isEmpty }
+    var hasWarnings: Bool { !softWarnings.isEmpty }
+
+    static let open = EventAccessCheck(failedReasons: [], softWarnings: [], requiresApproval: false, restrictionMessage: nil)
+
+    static func evaluate(event: Event, profile: Profile?, badges: [UserBadge], registrations: [Registration]) -> EventAccessCheck {
+        let rules = event.accessRulesList
+        if rules.isEmpty {
+            return difficultyFallback(event: event, profile: profile, registrations: registrations)
+        }
+
+        guard let profile else {
+            let failed = rules
+                .filter { $0.effectiveEnforcement == "hard" }
+                .map { $0.message ?? "Devi effettuare il login" }
+            return EventAccessCheck(
+                failedReasons: failed,
+                softWarnings: [],
+                requiresApproval: false,
+                restrictionMessage: event.accessRules?.string(at: "restriction_message") ?? "Devi effettuare il login per verificare i requisiti di accesso."
+            )
+        }
+
+        var failed: [String] = []
+        var warnings: [String] = []
+        var requiresApproval = false
+        let completedBadgeIds = Set(badges.filter(\.isCompleted).compactMap(\.badgeId).map { $0.lowercased() })
+        let completedBadgeNames = Set(badges.filter(\.isCompleted).map { $0.displayName.lowercased() })
+
+        func add(_ message: String, for rule: EventAccessRule) {
+            if rule.effectiveEnforcement == "soft" {
+                warnings.append(message)
+            } else {
+                failed.append(message)
+            }
+        }
+
+        for rule in rules {
+            switch rule.type {
+            case "require_membership":
+                if !profile.hasActiveMembership {
+                    add(rule.message ?? "Questo evento richiede una membership attiva.", for: rule)
+                }
+            case "min_trekking_events":
+                let minCount = rule.numericValue
+                if trekkingAttendanceCount(in: registrations) < minCount {
+                    add(rule.message ?? "Questo evento richiede almeno \(minCount) esperienze di trekking completate.", for: rule)
+                }
+            case "min_attended_events":
+                let minCount = rule.numericValue
+                if attendedEventCount(in: registrations) < minCount {
+                    add(rule.message ?? "Questo evento richiede almeno \(minCount) presenze totali.", for: rule)
+                }
+            case "require_badge":
+                let requiredIds = badgeIds(for: rule)
+                let hasRequiredId = !requiredIds.isEmpty && requiredIds.contains { completedBadgeIds.contains($0.lowercased()) }
+                let hasRequiredName = rule.badgeName.map { completedBadgeNames.contains($0.lowercased()) } ?? false
+                if !hasRequiredId && !hasRequiredName {
+                    add(rule.message ?? "Questo evento richiede uno dei badge richiesti.", for: rule)
+                }
+            case "manual_approval":
+                requiresApproval = true
+            case "min_activities":
+                let minCount = rule.numericValue
+                if attendedEventCount(in: registrations) < minCount {
+                    add(rule.message ?? "Questo evento richiede almeno \(minCount) attività completate.", for: rule)
+                }
+            case "min_level":
+                let requiredLevel = rule.numericValue
+                if levelValue(profile.selfLevel) < requiredLevel {
+                    add(rule.message ?? "Questo evento richiede almeno un livello \(levelLabel(requiredLevel)).", for: rule)
+                }
+            case "min_experience":
+                let requiredExperience = rule.numericValue
+                if experienceValue(profile.trekkingExperience) < requiredExperience {
+                    add(rule.message ?? "Questo evento richiede almeno \(experienceLabel(requiredExperience)).", for: rule)
+                }
+            case "min_activity_frequency":
+                let requiredFrequency = rule.numericValue
+                if frequencyValue(profile.activityFrequency) < requiredFrequency {
+                    add(rule.message ?? "Questo evento richiede una frequenza di attività minima: \(frequencyLabel(requiredFrequency)).", for: rule)
+                }
+            case "interests":
+                let userInterests = Set((profile.interests ?? []).map { $0.lowercased() })
+                let eventInterests = rule.interests.map { $0.lowercased() }
+                if !eventInterests.isEmpty && eventInterests.allSatisfy({ !userInterests.contains($0) }) {
+                    warnings.append(rule.message ?? "Questo evento potrebbe non essere perfettamente in linea con i tuoi interessi.")
+                }
+            default:
+                continue
+            }
+        }
+
+        return EventAccessCheck(
+            failedReasons: failed,
+            softWarnings: warnings,
+            requiresApproval: requiresApproval,
+            restrictionMessage: failed.isEmpty ? nil : (event.accessRules?.string(at: "restriction_message") ?? failed.first)
+        )
+    }
+
+    private static func badgeIds(for rule: EventAccessRule) -> [String] {
+        if !rule.badgeIds.isEmpty { return rule.badgeIds }
+        if let value = rule.value?.nilIfBlank { return [value] }
+        return []
+    }
+
+    private static func difficultyFallback(event: Event, profile: Profile?, registrations: [Registration]) -> EventAccessCheck {
+        guard let rawDifficulty = event.difficulty?.nilIfBlank,
+              let difficulty = Int(rawDifficulty),
+              difficulty >= 3,
+              let profile else {
+            return .open
+        }
+
+        if (profile.experienceGrade ?? 0) >= difficulty * 2 || profileMatchesDifficulty(profile, difficulty: difficulty) {
+            return .open
+        }
+
+        let attended = uniqueAttendedRegistrations(in: registrations)
+        let easyCount = attended.filter { registration in
+            guard let raw = registration.event?.difficulty, let value = Int(raw) else { return false }
+            return value <= 2
+        }.count
+        let intermediateCount = attended.filter { registration in
+            guard let raw = registration.event?.difficulty, let value = Int(raw) else { return false }
+            return value >= 3
+        }.count
+
+        if difficulty == 3 && easyCount >= 3 { return .open }
+        if difficulty >= 4 && intermediateCount >= 3 { return .open }
+
+        let reason = difficulty >= 4
+            ? "Questo evento è riservato a escursionisti esperti con livello avanzato e buona preparazione fisica."
+            : "Per questo evento è consigliata esperienza intermedia e attività fisica regolare."
+        return EventAccessCheck(failedReasons: [], softWarnings: [reason], requiresApproval: false, restrictionMessage: nil)
+    }
+
+    private static func profileMatchesDifficulty(_ profile: Profile, difficulty: Int) -> Bool {
+        if difficulty == 3 {
+            let levelOk = profile.selfLevel == "intermediate" || profile.selfLevel == "advanced"
+            let experienceOk = profile.trekkingExperience == "3_5" || profile.trekkingExperience == "5_plus" || profile.trekkingExperience == "5+"
+            let fitnessOk = profile.activityFrequency == "medium" || profile.activityFrequency == "high" || profile.activityFrequency == "1-2/week" || profile.activityFrequency == ">2/week"
+            return (levelOk || experienceOk) && fitnessOk
+        }
+        let levelOk = profile.selfLevel == "advanced"
+        let experienceOk = profile.trekkingExperience == "5_plus" || profile.trekkingExperience == "5+"
+        let fitnessOk = profile.activityFrequency == "high" || profile.activityFrequency == ">2/week"
+        return levelOk && experienceOk && fitnessOk
+    }
+
+    private static func uniqueAttendedRegistrations(in registrations: [Registration]) -> [Registration] {
+        var seen = Set<String>()
+        return registrations
+            .filter { $0.checkedIn == true || $0.normalizedStatus == "attended" }
+            .filter { registration in
+                guard let key = registration.eventId ?? registration.event?.id else { return false }
+                return seen.insert(key).inserted
+            }
+    }
+
+    private static func attendedEventCount(in registrations: [Registration]) -> Int {
+        uniqueAttendedRegistrations(in: registrations).count
+    }
+
+    private static func trekkingAttendanceCount(in registrations: [Registration]) -> Int {
+        uniqueAttendedRegistrations(in: registrations).filter { registration in
+            let category = registration.event?.category?.name?.lowercased() ?? ""
+            return category.contains("trekking") || category.contains("escursion")
+        }.count
+    }
+
+    private static func levelValue(_ value: String?) -> Int {
+        switch value {
+        case "beginner": 1
+        case "intermediate": 2
+        case "advanced": 3
+        default: 0
+        }
+    }
+
+    private static func experienceValue(_ value: String?) -> Int {
+        switch value {
+        case "0_2": 1
+        case "3_5": 2
+        case "5_plus", "5+": 3
+        default: 0
+        }
+    }
+
+    private static func frequencyValue(_ value: String?) -> Int {
+        switch value {
+        case "low", "0-1/week": 1
+        case "medium", "1-2/week": 2
+        case "high", ">2/week": 3
+        default: 0
+        }
+    }
+
+    private static func levelLabel(_ value: Int) -> String {
+        switch value {
+        case 1: "Principiante"
+        case 2: "Intermedio"
+        case 3: "Avanzato"
+        default: "richiesto"
+        }
+    }
+
+    private static func experienceLabel(_ value: Int) -> String {
+        switch value {
+        case 1: "0-2 escursioni"
+        case 2: "3-5 escursioni"
+        case 3: "5+ escursioni"
+        default: "l'esperienza richiesta"
+        }
+    }
+
+    private static func frequencyLabel(_ value: Int) -> String {
+        switch value {
+        case 1: "Bassa (0-1/settimana)"
+        case 2: "Media (1-2/settimana)"
+        case 3: "Alta (>2/settimana)"
+        default: "richiesta"
+        }
+    }
+}
+
+extension Event {
+    var accessRulesList: [EventAccessRule] {
+        accessRules?.array(at: "rules")?.map(EventAccessRule.init(json:)) ?? []
+    }
+
+    var checkoutCustomFields: [CheckoutCustomField] {
+        let rawFields: [JSONValue]
+        if let fields = additionalFields?.array(at: "fields") {
+            rawFields = fields
+        } else if let fields = additionalFields?.arrayValue {
+            rawFields = fields
+        } else {
+            rawFields = []
+        }
+        return rawFields.enumerated().compactMap { index, value in
+            CheckoutCustomField(json: value, index: index)
+        }
+    }
+
+    var asksCarAvailability: Bool {
+        additionalFields?.bool(at: "car_availability_enabled") == true ||
+        additionalFields?.bool(at: "ask_car_availability") == true
+    }
+
+    var isSportCategory: Bool {
+        category?.name?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "sport & movimento"
+    }
+
+    var requiresManualApproval: Bool {
+        if accessRules?.bool(at: "manual_approval") == true { return true }
+        if accessRules?.string(at: "type") == "manual_approval" { return true }
+        return accessRulesList.contains { $0.type == "manual_approval" }
+    }
 }
 
 struct EventCategory: Codable, Identifiable, Hashable {
@@ -3511,6 +4218,11 @@ struct EventBroadcast: Codable, Identifiable, Hashable {
     var channelColor: Color {
         channel == "whatsapp" ? Color(red: 0.12, green: 0.84, blue: 0.38) : Brand.primary
     }
+
+    var displayDateTime: String? {
+        guard let date = createdAt?.isoDate else { return nil }
+        return DateFormatter.broadcastHistoryItalian.string(from: date)
+    }
 }
 
 enum IOSPushEnvironment: String, Codable, Hashable {
@@ -3672,18 +4384,38 @@ struct OrganizerParticipantProfile: Codable, Hashable {
     let lastName: String?
     let phone: String?
     let avatarUrl: String?
+    let totalPoints: Int?
     let membershipId: Int?
     let membershipStatus: String?
     let selfLevel: String?
     let trekkingExperience: String?
     let activityFrequency: String?
     let experienceGrade: Int?
+    let interests: [String]?
+    let birthDate: String?
 
     var displayName: String {
         [firstName, lastName]
             .compactMap { $0?.nilIfBlank }
             .joined(separator: " ")
             .nilIfBlank ?? "Partecipante"
+    }
+}
+
+struct ParticipantRegistrationHistoryRow: Codable, Hashable {
+    let userId: String?
+    let eventId: String?
+    let status: String?
+    let checkedIn: Bool?
+    let createdAt: String?
+
+    var normalizedStatus: String {
+        status?.nilIfBlank?.lowercased() ?? "registered"
+    }
+
+    var isCompleted: Bool {
+        ["registered", "deposit_paid", "paid", "attended"].contains(normalizedStatus) &&
+        (checkedIn == true || normalizedStatus == "attended")
     }
 }
 
@@ -3697,6 +4429,8 @@ struct OrganizerRegistration: Codable, Identifiable, Hashable {
     var checkedIn: Bool?
     let createdAt: String?
     let sportLevel: String?
+    let amountPaid: Double?
+    let refundAmount: Double?
     let lastBalanceReminderSentAt: String?
     let profiles: OrganizerParticipantProfile?
     let priceOption: PriceOption?
@@ -3723,7 +4457,8 @@ struct OrganizerRegistration: Codable, Identifiable, Hashable {
     }
 
     var isActive: Bool {
-        ["registered", "deposit_paid", "paid", "attended", "no_show"].contains(normalizedStatus)
+        ["registered", "deposit_paid", "paid", "attended", "no_show"].contains(normalizedStatus) &&
+        paymentStatus?.nilIfBlank?.lowercased() != "pending"
     }
 
     var statusLabel: String {
@@ -3742,6 +4477,17 @@ struct OrganizerRegistration: Codable, Identifiable, Hashable {
         if normalizedStatus == "waitlist" || normalizedStatus == "pending_approval" || normalizedStatus == "pending_payment" { return Brand.warning }
         if normalizedStatus == "cancelled" || normalizedStatus == "no_show" { return Brand.destructive }
         return Brand.primary
+    }
+
+    func webParticipantPaymentLabel(for event: Event) -> String? {
+        guard let payment = paymentStatus?.nilIfBlank, payment != "not_required" else { return nil }
+        if normalizedStatus == "deposit_paid" || payment == "deposit_paid" {
+            let balanceMode = priceOption?.effectiveBalancePaymentMode(fallback: event) ?? event.balancePaymentMode ?? "online"
+            return balanceMode == "on_site"
+                ? "Acconto pagato - saldo sul posto"
+                : "Acconto pagato - saldo da completare"
+        }
+        return payment
     }
 }
 
@@ -3781,6 +4527,8 @@ struct OrganizerRegistrationUpdate {
     var checkedIn: Bool?
     var meetingPointId: String?
     var hasMeetingPointUpdate = false
+    var priceOptionId: String?
+    var hasPriceOptionUpdate = false
 }
 
 struct OrganizerMeetingPointDraft: Identifiable, Equatable {
@@ -3811,7 +4559,7 @@ struct OrganizerPriceOptionDraft: Identifiable, Equatable {
     var balancePaymentMode = "online"
     var hasDedicatedSpots = false
     var dedicatedSpots = 0
-    var waitlistEnabled = true
+    var waitlistEnabled = false
     var eligibleGroup = "all"
     var badgeIds: [String] = []
     var originalPrice: Double?
@@ -3830,7 +4578,7 @@ struct OrganizerPriceOptionDraft: Identifiable, Equatable {
         balancePaymentMode = event.balancePaymentMode ?? "online"
         hasDedicatedSpots = false
         dedicatedSpots = 0
-        waitlistEnabled = true
+        waitlistEnabled = false
     }
 
     init(option: PriceOption) {
@@ -3843,7 +4591,7 @@ struct OrganizerPriceOptionDraft: Identifiable, Equatable {
         balancePaymentMode = option.balancePaymentMode ?? "online"
         hasDedicatedSpots = option.hasDedicatedSpots ?? false
         dedicatedSpots = option.dedicatedSpots ?? 0
-        waitlistEnabled = option.waitlistEnabled ?? true
+        waitlistEnabled = option.waitlistEnabled ?? false
         eligibleGroup = option.eligibleGroup ?? "all"
         if let group = option.eligibleGroup, group.hasPrefix("badge:") {
             badgeIds = group.replacingOccurrences(of: "badge:", with: "").split(separator: ",").map(String.init)
@@ -3897,7 +4645,15 @@ struct OrganizerAdditionalFieldDraft: Identifiable, Equatable {
         label = json.string(at: "label") ?? ""
         type = json.string(at: "type") ?? "text"
         required = json.bool(at: "required") ?? false
-        options = json.stringArray(at: "options") ?? []
+        if let optionValues = json["options"]?.arrayValue {
+            options = optionValues.compactMap { $0.stringValue?.nilIfBlank }
+        } else if let optionString = json.string(at: "options") {
+            options = optionString
+                .split(separator: ",")
+                .compactMap { String($0).nilIfBlank }
+        } else {
+            options = []
+        }
     }
 
     var jsonValue: JSONValue {
@@ -3996,18 +4752,13 @@ struct OrganizerEventDraft: Equatable {
     var additionalFields: [OrganizerAdditionalFieldDraft] = []
     var accessRules: [OrganizerAccessRuleDraft] = []
 
-    init() {
-        var defaultOption = OrganizerPriceOptionDraft()
-        defaultOption.name = "Partecipazione"
-        defaultOption.paymentType = "free"
-        priceOptions = [defaultOption]
-    }
+    init() {}
 
     init(event: Event, meetingPoints: [MeetingPoint] = [], priceOptions: [PriceOption] = [], specialBadgeIds: [String] = [], duplicate: Bool = false) {
         title = duplicate ? "Copia di \(event.title)" : event.title
         description = event.description ?? ""
-        date = duplicate ? DateFormatter.eventDate.string(from: Date()) : (event.date ?? DateFormatter.eventDate.string(from: Date()))
-        time = String((event.time ?? "09:00").prefix(5))
+        date = duplicate ? "" : (event.date ?? DateFormatter.eventDate.string(from: Date()))
+        time = duplicate ? "" : String((event.time ?? "09:00").prefix(5))
         location = event.location ?? ""
         locationLabel = event.locationLabel ?? ""
         categoryId = event.categoryId ?? event.category?.id ?? ""
@@ -4025,25 +4776,39 @@ struct OrganizerEventDraft: Equatable {
         cancellationPolicy = Self.normalizedCancellationPolicy(event.cancellationPolicy)
         imageUrl = event.imageUrl ?? ""
         visibility = duplicate ? "private" : (event.visibility ?? "public")
-        status = duplicate ? "draft" : (event.status ?? "published")
+        status = duplicate ? "published" : (event.status ?? "published")
         galleryImageURLs = event.gallery.compactMap(\.url)
         manualBadges = (event.eventBadges ?? []).filter { OrganizerEventDraft.manualBadgeOptions.map(\.id).contains($0) }
         customBadge = (event.eventBadges ?? []).first { !OrganizerEventDraft.manualBadgeOptions.map(\.id).contains($0) } ?? ""
-        self.specialBadgeIds = specialBadgeIds
+        self.specialBadgeIds = duplicate ? [] : specialBadgeIds
         fitScoreMainCategory = event.additionalFields?.string(at: "fit_score_main_category") ?? ""
-        fitScoreSecondaryCategories = event.additionalFields?.stringArray(at: "fit_score_secondary_categories") ?? []
-        closingSentence = event.additionalFields?.string(at: "closing_sentence") ?? ""
+        fitScoreSecondaryCategories = Array((event.additionalFields?.stringArray(at: "fit_score_secondary_categories") ?? [])
+            .filter { $0 != fitScoreMainCategory }
+            .prefix(2))
+        closingSentence = duplicate
+            ? deterministicClosingSentence(seed: UUID().uuidString)
+            : (event.additionalFields?.string(at: "closing_sentence")?.normalizedClosingSentence ?? "")
         askCarAvailability = event.additionalFields?.bool(at: "ask_car_availability") ?? false
         weatherOverrideCondition = event.additionalFields?.string(at: "weather_override_condition") ?? ""
         weatherOverrideTempMin = event.additionalFields?.double(at: "weather_override_temp_min").map { $0.cleanInputString } ?? ""
         weatherOverrideTempMax = event.additionalFields?.double(at: "weather_override_temp_max").map { $0.cleanInputString } ?? ""
-        weatherOverrideTempAvg = event.additionalFields?.double(at: "weather_override_temp_avg").map { $0.cleanInputString } ?? ""
+        weatherOverrideTempAvg = (
+            event.additionalFields?.double(at: "weather_override_temp_avg")
+                ?? event.additionalFields?.double(at: "weather_override_temp")
+        ).map { $0.cleanInputString } ?? ""
         exclusivityLabel = event.accessRules?.string(at: "exclusivity_label") ?? ""
         restrictionMessage = event.accessRules?.string(at: "restriction_message") ?? ""
         self.meetingPoints = meetingPoints.map(OrganizerMeetingPointDraft.init(point:))
-        self.priceOptions = priceOptions.isEmpty ? [OrganizerPriceOptionDraft(legacyEvent: event)] : priceOptions.map(OrganizerPriceOptionDraft.init(option:))
+        self.priceOptions = priceOptions.map { option in
+            var draft = OrganizerPriceOptionDraft(option: option)
+            if duplicate {
+                draft.serverId = nil
+            }
+            return draft
+        }
         equipmentItems = event.equipmentItems.map(OrganizerEquipmentItemDraft.init(item:))
-        additionalFields = event.additionalFields?.array(at: "fields")?.map(OrganizerAdditionalFieldDraft.init(json:)) ?? []
+        additionalFields = (event.additionalFields?.array(at: "fields") ?? event.additionalFields?.arrayValue)?
+            .map(OrganizerAdditionalFieldDraft.init(json:)) ?? []
         accessRules = event.accessRules?.array(at: "rules")?.map(OrganizerAccessRuleDraft.init(json:)) ?? []
     }
 
@@ -4056,7 +4821,7 @@ struct OrganizerEventDraft: Equatable {
         locationLabel = proposal.locationLabel ?? ""
         categoryId = proposal.categoryId ?? ""
         spotsTotal = proposal.maxParticipants ?? 20
-        status = "draft"
+        status = "published"
         visibility = "private"
     }
 
@@ -4103,20 +4868,29 @@ struct OrganizerEventDraft: Equatable {
     }
 
     var validationMessage: String? {
-        if title.nilIfBlank == nil { return "Inserisci il titolo dell'evento." }
-        if date.nilIfBlank == nil { return "Inserisci una data valida." }
-        if time.nilIfBlank == nil { return "Inserisci un orario." }
-        if location.nilIfBlank == nil { return "Inserisci il luogo dell'evento." }
-        if imageUrl.nilIfBlank == nil { return "Inserisci un'immagine di copertina." }
-        if fitScoreMainCategory.nilIfBlank == nil { return "Seleziona la categoria principale del fit score." }
-        if spotsTotal < 1 { return "La capienza deve essere almeno 1." }
+        validationMessages.first
+    }
+
+    var validationMessages: [String] {
+        var messages: [String] = []
+        if title.nilIfBlank == nil { messages.append("Titolo evento") }
+        if date.nilIfBlank == nil { messages.append("Data evento") }
+        if time.nilIfBlank == nil { messages.append("Ora evento") }
+        if location.nilIfBlank == nil { messages.append("Luogo evento") }
+        if imageUrl.nilIfBlank == nil { messages.append("Immagine di copertina") }
+        if fitScoreMainCategory.nilIfBlank == nil { messages.append("Categoria principale fit score") }
+        if spotsTotal < 1 { messages.append("Capienza almeno 1 posto") }
         let validOptions = priceOptions.filter { $0.name.nilIfBlank != nil }
-        if validOptions.isEmpty { return "Aggiungi almeno un'opzione di partecipazione." }
-        if validOptions.contains(where: { $0.paymentType != "free" && $0.paymentType != "location" && $0.price <= 0 }) { return "Inserisci un prezzo per ogni opzione a pagamento online." }
-        if validOptions.contains(where: { $0.paymentType == "deposit" && $0.depositAmount <= 0 }) { return "Inserisci l'acconto per le opzioni con acconto." }
-        if validOptions.contains(where: { $0.paymentType == "deposit" && $0.balanceAmount <= 0 }) { return "Inserisci il saldo per le opzioni con acconto." }
-        if validOptions.contains(where: { $0.hasDedicatedSpots && $0.dedicatedSpots < 1 }) { return "Inserisci i posti dedicati per le opzioni con limite attivo." }
-        return nil
+        if validOptions.isEmpty {
+            if paymentType != "free" && paymentType != "location" && price <= 0 { messages.append("Prezzo totale evento") }
+            if paymentType == "deposit" && deposit <= 0 { messages.append("Acconto evento") }
+            if paymentType == "deposit" && price - deposit <= 0 { messages.append("Saldo evento maggiore di zero") }
+        }
+        if validOptions.contains(where: { $0.paymentType != "free" && $0.paymentType != "location" && $0.price <= 0 }) { messages.append("Prezzo per ogni opzione a pagamento online") }
+        if validOptions.contains(where: { $0.paymentType == "deposit" && $0.depositAmount <= 0 }) { messages.append("Acconto per le opzioni con acconto") }
+        if validOptions.contains(where: { $0.paymentType == "deposit" && ($0.price - $0.depositAmount) <= 0 }) { messages.append("Saldo per le opzioni con acconto") }
+        if validOptions.contains(where: { $0.hasDedicatedSpots && $0.dedicatedSpots < 1 }) { messages.append("Posti dedicati per le opzioni con limite attivo") }
+        return messages
     }
 
     func eventPayload(organizerId: String, organizerName: String, includeOrganizerFields: Bool = true) -> [String: JSONValue] {
@@ -4341,6 +5115,12 @@ struct PublicProfile: Codable {
     let bio: String?
 }
 
+struct OrganizerPublicProfile {
+    let profile: PublicProfile
+    let eventCount: Int
+    let events: [Event]
+}
+
 struct OrganizerContactFields: Codable {
     let phone: String?
     let bio: String?
@@ -4357,6 +5137,10 @@ struct Registration: Codable, Identifiable, Hashable {
     let id: String
     let eventId: String?
     let userId: String?
+    let priceOptionId: String?
+    let meetingPointId: String?
+    let carAvailability: String?
+    let additionalResponses: [String: String]?
     var status: String?
     var paymentStatus: String?
     var checkedIn: Bool?
@@ -4370,7 +5154,7 @@ struct Registration: Codable, Identifiable, Hashable {
     var normalizedStatus: String { status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "registered" }
     var isCancelled: Bool { normalizedStatus == "cancelled" }
     var canCancel: Bool {
-        ["registered", "deposit_paid", "paid", "pending_payment", "waitlist"].contains(normalizedStatus) ||
+        ["registered", "deposit_paid", "paid", "pending_payment", "pending_approval", "waitlist"].contains(normalizedStatus) ||
         (status == nil && checkedIn != true)
     }
     var isActive: Bool { !["cancelled", "no_show", "failed", "expired"].contains(normalizedStatus) }
@@ -4388,6 +5172,7 @@ struct Registration: Codable, Identifiable, Hashable {
         if checkedIn == true || normalizedStatus == "attended" { return "Partecipato" }
         if paymentStatus == "deposit_paid" { return "Acconto pagato" }
         if paymentStatus == "pending" || normalizedStatus == "pending_payment" { return "Pagamento in sospeso" }
+        if normalizedStatus == "pending_approval" { return "In approvazione" }
         if normalizedStatus == "waitlist" { return "In attesa" }
         return "Iscritto"
     }
@@ -4395,7 +5180,7 @@ struct Registration: Codable, Identifiable, Hashable {
         if isCancelled || normalizedStatus == "no_show" {
             return (Brand.destructive.opacity(0.12), Brand.destructive)
         }
-        if paymentStatus == "pending" || normalizedStatus == "pending_payment" || normalizedStatus == "waitlist" {
+        if paymentStatus == "pending" || normalizedStatus == "pending_payment" || normalizedStatus == "pending_approval" || normalizedStatus == "waitlist" {
             return (Brand.warning.opacity(0.16), Brand.warning)
         }
         return (Brand.success.opacity(0.12), Brand.success)
@@ -4405,6 +5190,109 @@ struct Registration: Codable, Identifiable, Hashable {
 private extension Registration {
     var eventKey: String? {
         event?.id ?? eventId
+    }
+
+    func priceOption(in event: Event) -> PriceOption? {
+        priceOptionId.flatMap { optionId in
+            event.priceOptions.first { $0.id == optionId }
+        }
+    }
+
+    func paymentType(in event: Event) -> String {
+        priceOption(in: event)?.effectivePaymentType(fallback: event) ?? event.paymentType ?? "free"
+    }
+
+    func requiresOnlinePayment(in event: Event) -> Bool {
+        let type = paymentType(in: event)
+        return type == "paid" || type == "deposit"
+    }
+
+    func waitlistSpotAvailable(in event: Event) -> Bool {
+        guard normalizedStatus == "waitlist" else { return false }
+        if let option = priceOption(in: event) {
+            return option.isBookable(in: event)
+        }
+        return event.bookableSpots > 0
+    }
+
+    func hasOnlineBalanceDue(in event: Event) -> Bool {
+        guard normalizedStatus == "deposit_paid" || paymentStatus == "deposit_paid" else { return false }
+        let option = priceOption(in: event)
+        let mode = option?.effectiveBalancePaymentMode(fallback: event) ?? event.balancePaymentMode ?? "online"
+        let balance = balanceDueAmount ?? option?.effectiveBalanceAmount(fallback: event) ?? max(0, (event.price ?? 0) - (event.deposit ?? 0))
+        return mode == "online" && balance > 0
+    }
+
+    func canResumePayment(in event: Event) -> Bool {
+        guard normalizedStatus != "cancelled" else { return false }
+        if waitlistSpotAvailable(in: event) { return true }
+        if hasOnlineBalanceDue(in: event) { return true }
+        guard normalizedStatus != "waitlist" else { return false }
+        return normalizedStatus == "pending_payment" || paymentStatus == "pending"
+    }
+
+    func resumeActionTitle(in event: Event) -> String {
+        if waitlistSpotAvailable(in: event) { return "Completa prenotazione" }
+        if hasOnlineBalanceDue(in: event) { return "Completa il saldo" }
+        return "Completa pagamento"
+    }
+
+    func displayStatusLabel(in event: Event) -> String {
+        if waitlistSpotAvailable(in: event) { return "Posto disponibile" }
+        if normalizedStatus == "deposit_paid" || paymentStatus == "deposit_paid" {
+            let mode = priceOption(in: event)?.effectiveBalancePaymentMode(fallback: event) ?? event.balancePaymentMode ?? "online"
+            if mode == "on_site" { return "Acconto pagato - saldo sul posto" }
+            if hasOnlineBalanceDue(in: event) { return "Acconto pagato - saldo da completare" }
+            return "Acconto pagato"
+        }
+        return statusLabel
+    }
+
+    func displayStatusStyle(in event: Event) -> (background: Color, foreground: Color) {
+        if waitlistSpotAvailable(in: event) {
+            return (Brand.success.opacity(0.12), Brand.success)
+        }
+        if normalizedStatus == "deposit_paid" || paymentStatus == "deposit_paid" || hasOnlineBalanceDue(in: event) {
+            return (Brand.warning.opacity(0.16), Brand.warning)
+        }
+        return statusStyle
+    }
+
+    func priceOptionLine(in event: Event) -> String? {
+        guard let option = priceOption(in: event) else { return nil }
+        return "\(option.displayName) · \(option.paymentSummary(in: event))"
+    }
+
+    var paymentProgressLine: String? {
+        var parts: [String] = []
+        if let amountPaid, amountPaid > 0 {
+            parts.append("Pagato €\(money(amountPaid))")
+        }
+        if let balanceDueAmount, balanceDueAmount > 0 {
+            parts.append("Saldo €\(money(balanceDueAmount))")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    var hasPaidCancellationContext: Bool {
+        paymentStatus == "paid" ||
+        paymentStatus == "deposit_paid" ||
+        normalizedStatus == "paid" ||
+        normalizedStatus == "deposit_paid" ||
+        (amountPaid ?? 0) > 0
+    }
+
+    func cancellationDialogMessage(for event: Event) -> String {
+        guard hasPaidCancellationContext else {
+            return "La tua iscrizione verrà annullata."
+        }
+
+        let policy = CancellationPolicyInfo(raw: event.cancellationPolicy)
+        guard policy.isRefundEligible(for: event) else {
+            return "Secondo la policy di questo evento non è previsto alcun rimborso."
+        }
+
+        return "Riceverai il rimborso dell'importo versato, escluso il costo del servizio di 1€."
     }
 
     func isForEvent(_ eventId: String) -> Bool {
@@ -4455,16 +5343,69 @@ private extension UserNotification {
         NotificationDestination(type: type, eventId: eventId)
     }
 
+    var displayTitle: String {
+        localizedCopy.title
+    }
+
     var displayMessage: String {
-        message.replacingOccurrences(
-            of: #"\b(alle\s+\d{1,2}:\d{2}):\d{2}(?:\.\d+)?"#,
+        localizedCopy.message.replacingOccurrences(
+            of: #"(\d{1,2}:\d{2}):\d{2}(?:\.\d+)?"#,
             with: "$1",
             options: .regularExpression
         )
     }
 
+    var isDetailedReminder: Bool {
+        ["event_reminder_24h", "event_reminder_3h"].contains(type?.notificationTypeKey)
+    }
+
+    var reminderParts: [NotificationReminderPart] {
+        NotificationReminderPart.parts(from: displayMessage)
+    }
+
     var canExpandInline: Bool {
         destination == nil
+    }
+
+    private var localizedCopy: (title: String, message: String) {
+        if let copy = issueResolvedCopy {
+            return copy
+        }
+
+        if title.trimmingCharacters(in: .whitespacesAndNewlines) == "Thanks for subscribing!" ||
+            title.trimmingCharacters(in: .whitespacesAndNewlines) == "Grazie per esserti iscritto!" {
+            return (
+                "Grazie per esserti iscritto!",
+                message.nilIfBlank ?? "Riceverai gli aggiornamenti di Scampagnate direttamente nelle notifiche."
+            )
+        }
+
+        if isDetailedReminder {
+            return (
+                title,
+                message.replacingOccurrences(of: "🗺️ Open navigation:", with: "🗺️ Apri navigazione:")
+            )
+        }
+
+        return (title, message)
+    }
+
+    private var issueResolvedCopy: (title: String, message: String)? {
+        let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let issueTitle = message.firstRegexCapture(#"^Your reported issue "(.+)" has been resolved\. Thank you for helping us improve!$"#)
+        guard cleanTitle == "Issue Resolved" || issueTitle != nil else { return nil }
+
+        if let issueTitle {
+            return (
+                "Problema risolto",
+                "Il problema che hai segnalato \"\(issueTitle)\" è stato risolto. Grazie per averci aiutato a migliorare!"
+            )
+        }
+
+        return (
+            "Problema risolto",
+            "Il problema che hai segnalato è stato risolto. Grazie per averci aiutato a migliorare!"
+        )
     }
 }
 
@@ -4481,11 +5422,22 @@ struct MerchProduct: Codable, Identifiable, Hashable {
     let galleryImages: [String]?
     let whatsappNumber: String?
 
-    var displayName: String { nameIt ?? name ?? "Prodotto" }
-    var displayDescription: String { descriptionIt ?? description ?? "" }
+    var displayName: String { nameIt?.nilIfBlank ?? name?.nilIfBlank ?? "Prodotto" }
+    var displayDescription: String { descriptionIt?.nilIfBlank ?? description?.nilIfBlank ?? "" }
     var displayBadge: String? {
         let value = (badgeIt ?? badge)?.trimmingCharacters(in: .whitespacesAndNewlines)
         return value?.isEmpty == false ? value : nil
+    }
+    var productImages: [String] {
+        var values: [String] = []
+        if let image = imageUrl?.nilIfBlank {
+            values.append(image)
+        }
+        for image in galleryImages ?? [] {
+            guard let image = image.nilIfBlank, !values.contains(image) else { continue }
+            values.append(image)
+        }
+        return values
     }
 }
 
@@ -4522,12 +5474,25 @@ struct Reward: Codable, Identifiable {
     let expiryDate: String?
     let createdAt: String?
     let missions: MissionInfo?
+    let sourceReward: SourceMissionReward?
 }
 
 struct MissionInfo: Codable {
     let title: String?
     let icon: String?
     let category: String?
+}
+
+struct SourceMissionReward: Codable {
+    let title: String?
+    let rewardKind: String?
+    let badges: RewardBadgeInfo?
+}
+
+struct RewardBadgeInfo: Codable {
+    let name: String?
+    let icon: String?
+    let description: String?
 }
 
 private extension Reward {
@@ -4610,10 +5575,13 @@ private extension Reward {
         case .points:
             return pointValueLabel ?? cleanTitle ?? "Punti guadagnati"
         case .badge:
-            if let title = cleanTitle, title.lowercased() != "badge" {
+            if isGenericBadgeTitle, let badgeName = sourceReward?.badges?.name?.nilIfBlank {
+                return badgeName
+            }
+            if let title = cleanTitle, !Self.genericBadgeTitles.contains(title.lowercased()) {
                 return title
             }
-            return missions?.title?.nilIfBlank ?? "Badge sbloccato"
+            return sourceReward?.badges?.name?.nilIfBlank ?? value?.nilIfBlank ?? missions?.title?.nilIfBlank ?? "Badge sbloccato"
         case .coupon:
             return cleanTitle ?? "Coupon disponibile"
         case .physical:
@@ -4628,6 +5596,12 @@ private extension Reward {
         case .points:
             return missions?.title?.nilIfBlank ?? "Punti accreditati"
         case .badge:
+            if let description = sourceReward?.badges?.description?.nilIfBlank {
+                return description
+            }
+            if let badgeName = sourceReward?.badges?.name?.nilIfBlank, badgeName != displayTitle {
+                return badgeName
+            }
             if let missionTitle = missions?.title?.nilIfBlank, missionTitle != displayTitle {
                 return missionTitle
             }
@@ -4642,6 +5616,10 @@ private extension Reward {
         case .other:
             return missions?.title?.nilIfBlank ?? value?.nilIfBlank ?? "Ricompensa ottenuta"
         }
+    }
+
+    var badgeIconValue: String? {
+        kind == .badge ? sourceReward?.badges?.icon?.nilIfBlank : nil
     }
 
     var categoryLabel: String {
@@ -4731,11 +5709,18 @@ private extension Reward {
         title?.nilIfBlank
     }
 
+    private var isGenericBadgeTitle: Bool {
+        guard let title = cleanTitle?.lowercased() else { return true }
+        return Self.genericBadgeTitles.contains(title)
+    }
+
     private var looksLikePointsReward: Bool {
         [title, value]
             .compactMap { $0?.nilIfBlank?.lowercased() }
             .contains { $0.contains("punt") }
     }
+
+    private static let genericBadgeTitles: Set<String> = ["badge", "badge missione"]
 
     private static func displayCategory(_ raw: String) -> String {
         switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
@@ -4860,6 +5845,7 @@ struct ActiveMissionDefinition: Codable, Identifiable {
     let category: String?
     let targetAction: String?
     let expiresAt: String?
+    let missionRewards: [MissionRewardDefinition]?
 }
 
 struct MissionCardModel: Codable, Identifiable {
@@ -4883,6 +5869,17 @@ struct MissionDetail: Codable {
     let category: String?
     let targetAction: String?
     let expiresAt: String?
+    let missionRewards: [MissionRewardDefinition]?
+}
+
+struct MissionRewardDefinition: Codable, Identifiable {
+    let id: String
+    let rewardKind: String?
+    let pointsValue: Int?
+    let title: String?
+    let sortOrder: Int?
+    let visibleOnProfile: Bool?
+    let badges: RewardBadgeInfo?
 }
 
 private extension MissionCardModel {
@@ -4931,10 +5928,37 @@ private extension MissionCardModel {
 
     var rewardLabels: [(icon: String, text: String)] {
         var labels: [(icon: String, text: String)] = []
+        let configuredRewards = (missions?.missionRewards ?? [])
+            .filter { $0.visibleOnProfile != false }
+            .sorted { ($0.sortOrder ?? 0) < ($1.sortOrder ?? 0) }
+
+        if !configuredRewards.isEmpty {
+            for reward in configuredRewards {
+                let kind = reward.rewardKind?.nilIfBlank?.lowercased()
+                switch kind {
+                case "points":
+                    if let points = reward.pointsValue, points > 0 {
+                        labels.append(("star", "+\(points) punti"))
+                    }
+                case "coupon", "discount":
+                    labels.append(("ticket", "Sblocca uno sconto"))
+                case "badge":
+                    labels.append(("trophy", "Sblocca un badge"))
+                case "physical", "prize":
+                    labels.append(("gift", reward.title?.nilIfBlank ?? "Premio al completamento"))
+                default:
+                    if let title = reward.title?.nilIfBlank {
+                        labels.append(("gift", title))
+                    }
+                }
+            }
+            return labels
+        }
+
         let rewardType = missions?.rewardType?.nilIfBlank?.lowercased()
         let rewardValue = missions?.rewardValue?.nilIfBlank
         if rewardType == "coupon" || rewardType == "discount" {
-            labels.append(("ticket", "Sblocca un coupon"))
+            labels.append(("ticket", "Sblocca uno sconto"))
         }
         if rewardType == "badge" {
             labels.append(("trophy", rewardValue ?? "Sblocca un badge"))
@@ -5019,8 +6043,23 @@ struct PendingPayment: Codable {
     let eventId: String
     let registrationId: String
     let checkoutURL: URL
+    let createdAt: Date?
 
     private static let storageKey = "scampagnate.pendingPayment"
+    private static let maxAge: TimeInterval = 45 * 60
+
+    init(sessionId: String, eventId: String, registrationId: String, checkoutURL: URL, createdAt: Date = Date()) {
+        self.sessionId = sessionId
+        self.eventId = eventId
+        self.registrationId = registrationId
+        self.checkoutURL = checkoutURL
+        self.createdAt = createdAt
+    }
+
+    var isFresh: Bool {
+        guard let createdAt else { return false }
+        return Date().timeIntervalSince(createdAt) <= Self.maxAge
+    }
 
     func save() {
         if let data = try? JSONEncoder().encode(self) {
@@ -5030,7 +6069,13 @@ struct PendingPayment: Codable {
 
     static func load() -> PendingPayment? {
         guard let data = UserDefaults.standard.data(forKey: storageKey) else { return nil }
-        return try? JSONDecoder().decode(PendingPayment.self, from: data)
+        guard let payment = try? JSONDecoder().decode(PendingPayment.self, from: data),
+              payment.isFresh
+        else {
+            clear()
+            return nil
+        }
+        return payment
     }
 
     static func clear() {
@@ -5044,6 +6089,8 @@ struct RegistrationInput {
     var asWaitlist: Bool = false
     var carAvailability: String?
     var sportLevel: String?
+    var additionalResponses: [String: String] = [:]
+    var requestApproval: Bool = false
     var discountCodeId: String?
     var paymentChoice: String = "deposit"
 }
@@ -5315,6 +6362,13 @@ extension JSONValue {
         return nil
     }
 
+    var arrayValue: [JSONValue]? {
+        if case .array(let values) = self {
+            return values
+        }
+        return nil
+    }
+
     var doubleValue: Double? {
         switch self {
         case .number(let value): return value
@@ -5366,12 +6420,19 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var selectedTab: AppTab = .home
     @State private var showAuth = false
+    @State private var authInitialMode: AuthMode = .login
     @State private var showOnboarding = false
+    @State private var onboardingMode: OnboardingView.Mode = .onboarding
     @State private var showPushPrompt = false
     @State private var showNotifications = false
     @State private var paymentFeedback: AppFeedback?
-    @State private var routedEventId: String?
+    @State private var routedEvent: EventNavigationTarget?
+    @State private var routedProductId: String?
+    @State private var routedOrganizerDashboardRoute: OrganizerDashboardRoute?
+    @State private var routedOrganizerProfile: OrganizerNavigationTarget?
+    @State private var routedContentPage: ContentPageRoute?
     @State private var profileScrollTarget: ProfileScrollTarget?
+    @State private var routedRewards = false
     @State private var profileTabAvatarImage: UIImage?
     @State private var passwordRecoveryLink: PasswordRecoveryLink?
 
@@ -5385,27 +6446,27 @@ struct RootView: View {
                     }
                     .tag(AppTab.home)
 
-                MyEventsView(showAuth: $showAuth, routedEventId: $routedEventId)
+                MyEventsView(showAuth: $showAuth, routedEvent: $routedEvent)
                     .tabItem {
                         Label(AppTab.events.title, systemImage: AppTab.events.systemImage)
                     }
                     .tag(AppTab.events)
 
                 if store.isOrganizer {
-                    OrganizerDashboardView(showAuth: $showAuth)
+                    OrganizerDashboardView(showAuth: $showAuth, routedRoute: $routedOrganizerDashboardRoute)
                         .tabItem {
                             Label(AppTab.organizer.title, systemImage: AppTab.organizer.systemImage)
                         }
                         .tag(AppTab.organizer)
                 }
 
-                ShopView()
+                ShopView(routedProductId: $routedProductId)
                     .tabItem {
                         Label(AppTab.shop.title, systemImage: AppTab.shop.systemImage)
                     }
                     .tag(AppTab.shop)
 
-                ProfileView(showAuth: $showAuth, scrollTarget: $profileScrollTarget)
+                ProfileView(showAuth: $showAuth, scrollTarget: $profileScrollTarget, openRewards: $routedRewards)
                     .tabItem {
                         profileTabItem
                     }
@@ -5419,18 +6480,8 @@ struct RootView: View {
         .overlay(alignment: .top) {
             StatusBarShield()
         }
-        .overlay(alignment: .top) {
-            if store.pendingPayment != nil {
-                PendingPaymentBanner { status in
-                    paymentFeedback = AppFeedback(paymentStatus: status)
-                }
-                    .padding(.horizontal)
-                    .safeAreaPadding(.top, AppChrome.topSafeAreaClearance)
-                    .padding(.top, 8)
-            }
-        }
         .sheet(isPresented: $showAuth) {
-            AuthView()
+            AuthView(initialMode: authInitialMode)
         }
         .sheet(isPresented: $showNotifications) {
             NotificationsView { destination in
@@ -5438,7 +6489,7 @@ struct RootView: View {
             }
         }
         .fullScreenCover(isPresented: $showOnboarding) {
-            OnboardingView()
+            OnboardingView(mode: onboardingMode)
         }
         .alert("Scampagnate", isPresented: Binding(get: { store.errorMessage != nil }, set: { if !$0 { store.errorMessage = nil } })) {
             Button("OK") { store.errorMessage = nil }
@@ -5452,6 +6503,20 @@ struct RootView: View {
         .sheet(item: $passwordRecoveryLink) { recovery in
             PasswordRecoveryView(recovery: recovery)
                 .presentationDetents([.large])
+        }
+        .sheet(item: $routedContentPage) { route in
+            NavigationStack {
+                HelpContentView(slug: route.slug, fallbackTitle: route.fallbackTitle)
+            }
+        }
+        .fullScreenCover(item: $routedOrganizerProfile) { target in
+            OrganizerProfileView(
+                organizerId: target.id,
+                fallbackName: nil,
+                profile: store.organizerProfiles[target.id],
+                showAuth: $showAuth
+            )
+            .environmentObject(store)
         }
         .alert("Vuoi attivare le notifiche?", isPresented: $showPushPrompt) {
             Button("Non ora", role: .cancel) {
@@ -5467,6 +6532,7 @@ struct RootView: View {
         }
         .onChange(of: store.needsOnboarding) { _, needs in
             if needs {
+                onboardingMode = .onboarding
                 showOnboarding = true
             }
             updatePushPromptVisibility()
@@ -5485,6 +6551,10 @@ struct RootView: View {
                 selectedTab = .home
             }
         }
+        .onChange(of: store.homeDiscoveryRequest?.id) { _, requestId in
+            guard requestId != nil else { return }
+            selectedTab = .home
+        }
         .onChange(of: pushNotifications.authorizationStatus) { _, _ in
             updatePushPromptVisibility()
         }
@@ -5497,6 +6567,9 @@ struct RootView: View {
             Task { await store.refreshUserData(reportingErrors: false) }
         }
         .task {
+            if store.needsOnboarding {
+                onboardingMode = .onboarding
+            }
             showOnboarding = store.needsOnboarding
             await pushNotifications.refreshAuthorizationStatus()
             updatePushPromptVisibility()
@@ -5569,7 +6642,7 @@ struct RootView: View {
         case .event(let eventId):
             selectedTab = .events
             routeAfterSheetDismissal {
-                routedEventId = eventId
+                routedEvent = EventNavigationTarget(id: eventId)
             }
         case .events:
             selectedTab = .events
@@ -5595,6 +6668,199 @@ struct RootView: View {
         if let message = PasswordRecoveryLink.errorMessage(from: url) {
             showAuth = false
             store.errorMessage = message
+            return
+        }
+
+        if routeWebCompatibleURL(url) {
+            return
+        }
+
+        guard url.scheme == "scampagnate" else { return }
+
+        if url.isScampagnatePaymentCancellation {
+            paymentFeedback = AppFeedback(title: "Pagamento annullato", message: "Non è stato addebitato nulla. Puoi riprendere quando vuoi.", icon: "xmark.circle.fill", tone: .warning)
+            return
+        }
+
+        if url.host == "payment-success" || url.path.contains("payment-success") {
+            verifyEventPaymentReturn(url)
+            return
+        }
+
+        if url.host == "membership-success" || url.path.contains("membership-success") {
+            verifyMembershipPaymentReturn(url)
+        }
+    }
+
+    private func routeWebCompatibleURL(_ url: URL) -> Bool {
+        guard let route = webRouteComponents(from: url) else { return false }
+        guard let first = route.first else {
+            selectedTab = .home
+            return true
+        }
+
+        switch first {
+        case "auth", "login", "register":
+            authInitialMode = first == "register" || url.queryValue(named: "mode") == "register" ? .register : .login
+            showAuth = true
+            return true
+        case "reset-password":
+            authInitialMode = .reset
+            showAuth = true
+            return true
+        case "profile-setup":
+            if store.isAuthenticated {
+                onboardingMode = url.queryValue(named: "mode") == "edit" ? .preferencesEdit : .onboarding
+                showOnboarding = true
+            } else {
+                showAuth = true
+            }
+            return true
+        case "payment-success":
+            verifyEventPaymentReturn(url)
+            return true
+        case "membership-success":
+            verifyMembershipPaymentReturn(url)
+            return true
+        case "event":
+            guard let eventId = route.dropFirst().first?.nilIfBlank ?? url.queryValue(named: "id") ?? url.queryValue(named: "event_id") else { return false }
+            let opensParticipants = route.dropFirst(2).first?.lowercased() == "participants"
+            selectedTab = .events
+            routeAfterSheetDismissal {
+                routedEvent = EventNavigationTarget(id: eventId, opensParticipants: opensParticipants)
+            }
+            return true
+        case "my-events":
+            selectedTab = .events
+            return true
+        case "shop", "merch":
+            selectedTab = .shop
+            if let productId = route.dropFirst().first?.nilIfBlank ?? url.queryValue(named: "id") {
+                routedProductId = productId
+            }
+            return true
+        case "profile":
+            selectedTab = .profile
+            if let target = profileTarget(from: url.queryValue(named: "section")) {
+                profileScrollTarget = target
+            }
+            return true
+        case "notifications":
+            showNotifications = true
+            return true
+        case "rewards":
+            if store.isAuthenticated {
+                selectedTab = .profile
+                routeAfterSheetDismissal {
+                    routedRewards = true
+                }
+            } else {
+                showAuth = true
+            }
+            return true
+        case "privacy":
+            routedContentPage = ContentPageRoute(slug: "privacy-policy", fallbackTitle: "Informativa Privacy")
+            return true
+        case "terms":
+            routedContentPage = ContentPageRoute(slug: "termini-di-servizio", fallbackTitle: "Termini di Servizio")
+            return true
+        case "page":
+            guard let slug = route.dropFirst().first?.nilIfBlank else { return false }
+            routedContentPage = ContentPageRoute(slug: slug)
+            return true
+        case "guida-difficolta-trekking":
+            routedContentPage = ContentPageRoute(slug: "guida-difficolta-trekking")
+            return true
+        case "organizer":
+            let segments = Array(route.dropFirst())
+            if segments.first == "events" {
+                selectedTab = .organizer
+                routeAfterSheetDismissal {
+                    routedOrganizerDashboardRoute = organizerDashboardRoute(from: Array(segments.dropFirst()))
+                }
+            } else if let organizerId = segments.first?.nilIfBlank {
+                routedOrganizerProfile = OrganizerNavigationTarget(id: organizerId)
+            } else if store.isOrganizer {
+                selectedTab = .organizer
+            }
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func profileTarget(from section: String?) -> ProfileScrollTarget? {
+        switch section?.lowercased() {
+        case "profile", "account": .profile
+        case "membership", "tessera": .membership
+        case "missions", "missioni": .missions
+        case "rewards", "ricompense": .rewards
+        case "badges", "badge": .badges
+        case "activity", "attivita", "attività": .activity
+        case "help", "support", "assistenza": .help
+        default: nil
+        }
+    }
+
+    private func organizerDashboardRoute(from segments: [String]) -> OrganizerDashboardRoute? {
+        guard let first = segments.first?.nilIfBlank else {
+            return nil
+        }
+        if first == "new" {
+            return OrganizerDashboardRoute(destination: .create)
+        }
+        if segments.dropFirst().first?.lowercased() == "edit" {
+            return OrganizerDashboardRoute(destination: .edit(first))
+        }
+        return OrganizerDashboardRoute(destination: .manage(first))
+    }
+
+    private func webRouteComponents(from url: URL) -> [String]? {
+        let scheme = (url.scheme ?? "").lowercased()
+        if scheme == "http" || scheme == "https" {
+            guard let host = url.host?.lowercased(),
+                  ["scampagnate.com", "www.scampagnate.com", "127.0.0.1", "localhost"].contains(host)
+            else { return nil }
+            return url.path.split(separator: "/").map(String.init)
+        }
+
+        guard scheme == "scampagnate" else { return nil }
+        var components: [String] = []
+        if let host = url.host?.nilIfBlank {
+            components.append(host)
+        }
+        components.append(contentsOf: url.path.split(separator: "/").map(String.init))
+        return components
+    }
+
+    private func verifyEventPaymentReturn(_ url: URL) {
+        guard let sessionId = url.stripeCheckoutSessionId ?? store.pendingPayment?.sessionId else {
+            paymentFeedback = AppFeedback(title: "Verifica non riuscita", message: "Non ho ricevuto l'identificativo del checkout. Apri I miei eventi per controllare lo stato dell'iscrizione.", icon: "exclamationmark.triangle.fill", tone: .error)
+            return
+        }
+        paymentFeedback = AppFeedback(title: "Verifico il pagamento", message: "Sto aggiornando iscrizione e profilo.", icon: "clock.fill", tone: .warning)
+        Task {
+            let status = await store.verifyEventPayment(sessionId: sessionId, eventId: url.queryValue(named: "event_id") ?? url.queryValue(named: "eventId"))
+            paymentFeedback = AppFeedback(paymentStatus: status)
+            if case .success = status {
+                selectedTab = .events
+            }
+        }
+    }
+
+    private func verifyMembershipPaymentReturn(_ url: URL) {
+        guard let sessionId = url.stripeCheckoutSessionId else {
+            paymentFeedback = AppFeedback(title: "Verifica non riuscita", message: "Non ho ricevuto l'identificativo del checkout tessera.", icon: "exclamationmark.triangle.fill", tone: .error)
+            return
+        }
+        paymentFeedback = AppFeedback(title: "Verifico la tessera", message: "Sto aggiornando il tuo profilo.", icon: "clock.fill", tone: .warning)
+        Task {
+            let status = await store.verifyMembershipPayment(sessionId: sessionId)
+            paymentFeedback = AppFeedback(paymentStatus: status)
+            if case .membershipSuccess = status {
+                selectedTab = .profile
+                profileScrollTarget = .membership
+            }
         }
     }
 
@@ -5751,26 +7017,40 @@ struct PendingPaymentBanner: View {
                     .foregroundStyle(Brand.mutedForeground)
             }
             Spacer()
-            Button {
-                Task {
-                    verifying = true
-                    onStatus(await store.verifyPendingPayment())
-                    verifying = false
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    if verifying {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .tint(.white)
+            HStack(spacing: 8) {
+                Button {
+                    Task {
+                        verifying = true
+                        onStatus(await store.verifyPendingPayment())
+                        verifying = false
                     }
-                    Text(verifying ? "Verifico" : "Verifica")
+                } label: {
+                    HStack(spacing: 6) {
+                        if verifying {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(.white)
+                        }
+                        Text(verifying ? "Verifico" : "Verifica")
+                    }
                 }
+                .font(.caption.weight(.bold))
+                .buttonStyle(.borderedProminent)
+                .tint(Brand.primary)
+                .disabled(verifying)
+
+                Button {
+                    store.dismissPendingPaymentBanner()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.mutedForeground)
+                        .frame(width: 30, height: 30)
+                        .background(Brand.muted.opacity(0.5), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Nascondi pagamento in corso")
             }
-            .font(.caption.weight(.bold))
-            .buttonStyle(.borderedProminent)
-            .tint(Brand.primary)
-            .disabled(verifying)
         }
         .padding(12)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
@@ -6058,6 +7338,10 @@ struct AuthView: View {
     @State private var consents = RegistrationConsents()
     @State private var feedback: String?
 
+    init(initialMode: AuthMode = .login) {
+        _mode = State(initialValue: initialMode)
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -6091,6 +7375,10 @@ struct AuthView: View {
                             PasswordField(password: $password, showPassword: $showPassword, labelFont: authFieldLabelFont, textFont: authFieldTextFont, height: authFieldHeight, cornerRadius: authFieldRadius)
                         }
 
+                        if mode == .register, !password.isEmpty {
+                            PasswordStrengthView(strength: AuthPasswordStrength(password: password))
+                        }
+
                         if mode == .login {
                             HStack {
                                 Spacer()
@@ -6103,20 +7391,20 @@ struct AuthView: View {
                         if mode == .register {
                             LegalConsentToggle(isOn: $consents.terms)
                             ConsentToggle(
-                                title: "Confermo di avere almeno 18 anni",
-                                subtitle: "La partecipazione alle attività è riservata a persone maggiorenni.",
+                                title: "Confermo di avere almeno 18 anni e di partecipare alle attività sotto la mia responsabilità",
+                                subtitle: "",
                                 required: true,
                                 isOn: $consents.age
                             )
                             ConsentToggle(
-                                title: "Tienimi aggiornato sulle prossime scampagnate",
-                                subtitle: "Niente spam, promesso: solo eventi, posti che si liberano e novità davvero utili.",
+                                title: "Tienimi aggiornato sulle prossime scampagnate 🌿",
+                                subtitle: "Riceverai info su nuovi eventi, posti che si liberano e novità della community (email / WhatsApp)",
                                 required: false,
                                 isOn: $consents.marketing
                             )
                             ConsentToggle(
-                                title: "Ok a comparire nei momenti Scampagnate",
-                                subtitle: "Potremmo condividere foto e video delle attività sui nostri canali, sempre con buon senso.",
+                                title: "Ok a comparire nei momenti Scampagnate 📸",
+                                subtitle: "Possiamo condividere foto e video delle esperienze sui nostri canali (Instagram, sito, ecc.)",
                                 required: false,
                                 isOn: $consents.media
                             )
@@ -6161,6 +7449,24 @@ struct AuthView: View {
                         .foregroundStyle(store.isLoading ? Brand.mutedForeground : Brand.primary)
                         .padding(.top, 4)
                         .disabled(store.isLoading)
+
+                        if mode == .register {
+                            NavigationLink {
+                                HelpContentView(slug: "guida-difficolta-trekking", fallbackTitle: "Guida difficoltà trekking")
+                            } label: {
+                                VStack(spacing: 4) {
+                                    Label("Che livello sei?", systemImage: "info.circle")
+                                        .font(.subheadline.weight(.semibold))
+                                        .foregroundStyle(Brand.secondary)
+                                    Text("Scopri quale esperienza è giusta per te")
+                                        .font(.caption)
+                                        .foregroundStyle(Brand.mutedForeground)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.top, 12)
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
                 }
                 .padding(22)
@@ -6265,6 +7571,9 @@ struct PasswordRecoveryView: View {
                             text: $password,
                             isVisible: $showPassword
                         )
+                        if !password.isEmpty {
+                            PasswordStrengthView(strength: AuthPasswordStrength(password: password))
+                        }
                         RecoveryPasswordField(
                             title: "Conferma password",
                             text: $confirmPassword,
@@ -6292,7 +7601,7 @@ struct PasswordRecoveryView: View {
                             }
                         }
                         .buttonStyle(PrimaryButtonStyle(height: 54))
-                        .disabled(isSubmitting || password.isEmpty || confirmPassword.isEmpty)
+                        .disabled(isSubmitting || password.count < 6 || confirmPassword.isEmpty)
                         .padding(.top, 4)
                     }
                 }
@@ -6406,6 +7715,115 @@ enum AuthMode {
     }
 }
 
+private struct AuthPasswordStrength {
+    let length: Bool
+    let uppercase: Bool
+    let lowercase: Bool
+    let number: Bool
+    let special: Bool
+
+    init(password: String) {
+        length = password.count >= 8
+        uppercase = password.range(of: #"[A-Z]"#, options: .regularExpression) != nil
+        lowercase = password.range(of: #"[a-z]"#, options: .regularExpression) != nil
+        number = password.range(of: #"\d"#, options: .regularExpression) != nil
+        special = password.range(of: #"[^A-Za-z0-9]"#, options: .regularExpression) != nil
+    }
+
+    var score: Int {
+        [length, uppercase, lowercase, number, special].filter { $0 }.count
+    }
+
+    var label: String {
+        switch score {
+        case 0...1: "Debole"
+        case 2...3: "Media"
+        case 4: "Buona"
+        default: "Forte"
+        }
+    }
+
+    var progress: CGFloat {
+        CGFloat(score) / 5
+    }
+
+    var color: Color {
+        switch score {
+        case 0...1: Brand.destructive
+        case 2...3: Brand.warning
+        case 4: Brand.primary
+        default: Brand.success
+        }
+    }
+
+    var requirements: [AuthPasswordRequirement] {
+        [
+            AuthPasswordRequirement(text: "Almeno 8 caratteri", isMet: length),
+            AuthPasswordRequirement(text: "Una lettera maiuscola", isMet: uppercase),
+            AuthPasswordRequirement(text: "Una lettera minuscola", isMet: lowercase),
+            AuthPasswordRequirement(text: "Un numero", isMet: number),
+            AuthPasswordRequirement(text: "Un carattere speciale", isMet: special)
+        ]
+    }
+}
+
+private struct AuthPasswordRequirement: Identifiable {
+    let text: String
+    let isMet: Bool
+
+    var id: String { text }
+}
+
+private struct PasswordStrengthView: View {
+    let strength: AuthPasswordStrength
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(Brand.muted)
+                        Capsule()
+                            .fill(strength.color)
+                            .frame(width: max(8, proxy.size.width * strength.progress))
+                    }
+                }
+                .frame(height: 8)
+
+                Text(strength.label)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Brand.mutedForeground)
+                    .frame(width: 58, alignment: .trailing)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(strength.requirements) { requirement in
+                    PasswordRequirementRow(text: requirement.text, isMet: requirement.isMet)
+                }
+            }
+        }
+        .padding(.top, -2)
+    }
+}
+
+private struct PasswordRequirementRow: View {
+    let text: String
+    let isMet: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: isMet ? "checkmark" : "xmark")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(isMet ? Brand.success : Brand.mutedForeground.opacity(0.55))
+                .frame(width: 12)
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(isMet ? Brand.foreground : Brand.mutedForeground)
+        }
+    }
+}
+
 // MARK: - Home
 
 struct HomeView: View {
@@ -6416,6 +7834,8 @@ struct HomeView: View {
     @State private var selectedCategory: String?
     @State private var searchOpen = false
     @State private var activeQuickFilters: Set<QuickFilter> = []
+    @State private var selectedDateFilter: Date?
+    @State private var priceFilter: HomePriceFilter = .all
     @State private var selectedEvent: Event?
     @State private var showProposal = false
     @FocusState private var searchFocused: Bool
@@ -6428,10 +7848,19 @@ struct HomeView: View {
 
     var filteredEvents: [Event] {
         upcomingEvents.filter { event in
-            let matchesQuery = query.isEmpty || event.title.localizedCaseInsensitiveContains(query) || event.displayLocation.localizedCaseInsensitiveContains(query)
+            let normalizedQuery = query.normalizedSearchText
+            let matchesQuery = normalizedQuery.isEmpty || [
+                event.title,
+                event.displayLocation,
+                event.location ?? "",
+                event.description ?? "",
+                event.category?.name ?? ""
+            ].contains { $0.normalizedSearchText.contains(normalizedQuery) }
             let matchesCategory = selectedCategory == nil || event.category?.name == selectedCategory
             let matchesQuickFilter = activeQuickFilters.allSatisfy { $0.matches(event) }
-            return matchesQuery && matchesCategory && matchesQuickFilter
+            let matchesDate = selectedDateFilter.map { event.date == DateFormatter.eventDate.string(from: $0) } ?? true
+            let matchesPrice = priceFilter.matches(event)
+            return matchesQuery && matchesCategory && matchesQuickFilter && matchesDate && matchesPrice
         }
     }
 
@@ -6439,8 +7868,24 @@ struct HomeView: View {
         upcomingEvents.first(where: { $0.featured == true }) ?? upcomingEvents.first
     }
 
-    var recommendedEvents: [Event] {
-        Array(upcomingEvents.filter { $0.id != featured?.id }.prefix(6))
+    var recommendedItems: [PersonalizedEventRecommendation] {
+        PersonalizedEventRecommendation.items(
+            events: upcomingEvents.filter { $0.id != featured?.id },
+            profile: store.profile,
+            registrations: store.myEvents
+        )
+    }
+
+    var hasActiveDiscoveryFilters: Bool {
+        !query.normalizedSearchText.isEmpty ||
+        selectedCategory != nil ||
+        !activeQuickFilters.isEmpty ||
+        selectedDateFilter != nil ||
+        priceFilter != .all
+    }
+
+    var listTitle: String {
+        hasActiveDiscoveryFilters ? "Risultati ricerca (\(filteredEvents.count))" : "Prossimi eventi"
     }
 
     var body: some View {
@@ -6452,9 +7897,16 @@ struct HomeView: View {
 
                         if searchOpen {
                             SearchField(query: $query, isFocused: $searchFocused)
+                            HomeSearchFilters(
+                                selectedDate: $selectedDateFilter,
+                                priceFilter: $priceFilter,
+                                hasActiveFilters: selectedDateFilter != nil || priceFilter != .all
+                            ) {
+                                clearSearchFilters()
+                            }
                         }
 
-                        if query.isEmpty && selectedCategory == nil && activeQuickFilters.isEmpty, let featured {
+                        if !hasActiveDiscoveryFilters, let featured {
                             FeaturedEventCard(event: featured)
                                 .onTapGesture { selectedEvent = featured }
                         }
@@ -6464,31 +7916,45 @@ struct HomeView: View {
                             QuickFilterStrip(selected: $activeQuickFilters)
                         }
 
-                        if store.isAuthenticated && !recommendedEvents.isEmpty && query.isEmpty && activeQuickFilters.isEmpty {
+                        if store.isAuthenticated && !recommendedItems.isEmpty && !hasActiveDiscoveryFilters {
                             RecommendedEventsSection(
-                                events: recommendedEvents,
+                                recommendations: recommendedItems,
                                 availableWidth: max(proxy.size.width - 32, 0),
                                 selectedEvent: $selectedEvent
                             )
                         }
 
-                        Text(query.isEmpty && selectedCategory == nil && activeQuickFilters.isEmpty ? "Prossimi eventi" : "Risultati ricerca")
+                        Text(listTitle)
                             .font(.system(.title3, design: .rounded, weight: .bold))
                             .foregroundStyle(Brand.foreground)
                             .padding(.top, 6)
 
-                        LazyVStack(spacing: 12) {
-                            ForEach(filteredEvents) { event in
-                                EventCard(event: event)
-                                    .onTapGesture { selectedEvent = event }
+                        if filteredEvents.isEmpty {
+                            HomeEventsEmptyState(hasActiveFilters: hasActiveDiscoveryFilters) {
+                                if hasActiveDiscoveryFilters {
+                                    clearAllDiscoveryFilters()
+                                } else if store.isAuthenticated {
+                                    showProposal = true
+                                } else {
+                                    showAuth = true
+                                }
+                            }
+                        } else {
+                            LazyVStack(spacing: 12) {
+                                ForEach(filteredEvents) { event in
+                                    EventCard(event: event)
+                                        .onTapGesture { selectedEvent = event }
+                                }
                             }
                         }
 
-                        ProposalCard {
-                            if store.isAuthenticated {
-                                showProposal = true
-                            } else {
-                                showAuth = true
+                        if !filteredEvents.isEmpty {
+                            ProposalCard {
+                                if store.isAuthenticated {
+                                    showProposal = true
+                                } else {
+                                    showAuth = true
+                                }
                             }
                         }
                     }
@@ -6512,8 +7978,13 @@ struct HomeView: View {
                     }
                 } else {
                     query = ""
+                    selectedDateFilter = nil
+                    priceFilter = .all
                     searchFocused = false
                 }
+            }
+            .onChange(of: store.homeDiscoveryRequest?.id) { _, _ in
+                applyHomeDiscoveryRequest()
             }
             .task {
                 await store.refreshEventData(reportingErrors: false)
@@ -6531,6 +8002,29 @@ struct HomeView: View {
                 if store.isAuthenticated { await store.refreshUserData() }
             }
         }
+    }
+
+    private func clearSearchFilters() {
+        selectedDateFilter = nil
+        priceFilter = .all
+    }
+
+    private func clearAllDiscoveryFilters() {
+        query = ""
+        selectedCategory = nil
+        activeQuickFilters.removeAll()
+        clearSearchFilters()
+    }
+
+    private func applyHomeDiscoveryRequest() {
+        guard let request = store.homeDiscoveryRequest else { return }
+        query = ""
+        selectedCategory = request.category
+        activeQuickFilters = Set(request.quickFilter.map { [$0] } ?? [])
+        selectedDateFilter = nil
+        priceFilter = .all
+        searchOpen = false
+        searchFocused = false
     }
 }
 
@@ -6622,6 +8116,116 @@ struct SearchField: View {
     }
 }
 
+enum HomePriceFilter: String, CaseIterable, Identifiable {
+    case all
+    case free
+    case paid
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .all: "Tutti i prezzi"
+        case .free: "Gratis"
+        case .paid: "A pagamento"
+        }
+    }
+
+    func matches(_ event: Event) -> Bool {
+        switch self {
+        case .all:
+            return true
+        case .free:
+            return (event.price ?? 0) <= 0
+        case .paid:
+            return (event.price ?? 0) > 0
+        }
+    }
+}
+
+struct HomeSearchFilters: View {
+    @Binding var selectedDate: Date?
+    @Binding var priceFilter: HomePriceFilter
+    let hasActiveFilters: Bool
+    let onClear: () -> Void
+
+    private var dateSelection: Binding<Date> {
+        Binding {
+            selectedDate ?? Date()
+        } set: { value in
+            selectedDate = Calendar.current.startOfDay(for: value)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                DatePicker(
+                    selectedDate.map { DateFormatter.shortItalian.string(from: $0) } ?? "Data",
+                    selection: dateSelection,
+                    in: Date()...,
+                    displayedComponents: .date
+                )
+                .datePickerStyle(.compact)
+                .environment(\.locale, Locale(identifier: "it_IT"))
+                .labelsHidden()
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                if selectedDate != nil {
+                    Button {
+                        selectedDate = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.headline)
+                            .foregroundStyle(Brand.mutedForeground)
+                            .frame(width: 34, height: 34)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Cancella filtro data")
+                }
+            }
+
+            Picker("Prezzo", selection: $priceFilter) {
+                ForEach(HomePriceFilter.allCases) { filter in
+                    Text(filter.title).tag(filter)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            if hasActiveFilters {
+                Button(action: onClear) {
+                    Label("Cancella filtri ricerca", systemImage: "xmark")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.destructive)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(12)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+    }
+}
+
+struct HomeEventsEmptyState: View {
+    let hasActiveFilters: Bool
+    let action: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            EmptyState(
+                icon: hasActiveFilters ? "magnifyingglass" : "calendar.badge.plus",
+                title: hasActiveFilters ? "Nessun risultato" : "Nessun evento in programma",
+                message: hasActiveFilters ? "Prova a cambiare filtri o ricerca." : "Puoi proporre un'attività alla community."
+            )
+
+            Button(hasActiveFilters ? "Mostra tutto" : "Proponi un'attività", action: action)
+                .buttonStyle(SecondaryButtonStyle())
+        }
+        .padding(.vertical, 8)
+    }
+}
+
 struct CategoryStrip: View {
     let categories: [EventCategory]
     @Binding var selected: String?
@@ -6645,7 +8249,7 @@ struct CategoryStrip: View {
     }
 }
 
-enum QuickFilter: String, CaseIterable, Identifiable {
+enum QuickFilter: String, CaseIterable, Identifiable, Sendable {
     case featured
     case lastSpots
     case thisWeek
@@ -6821,9 +8425,13 @@ struct FeaturedEventCard: View {
 }
 
 struct EventCard: View {
+    @EnvironmentObject private var store: AppStore
     let event: Event
 
-    var status: EventStatusStyle { event.statusStyle }
+    var registration: Registration? {
+        store.myEvents.mostRecent(forEventId: event.id)
+    }
+    var status: EventStatusStyle { event.cardStatusStyle(registration: registration) }
     var fillPercent: Double {
         let total = event.spotsTotal ?? 0
         guard total > 0 else { return 0 }
@@ -6936,8 +8544,125 @@ struct EventCardPillLabel: View {
     }
 }
 
+struct PersonalizedEventRecommendation: Identifiable {
+    let event: Event
+    let score: Int
+    let whyText: String
+
+    var id: String { event.id }
+
+    static func items(events: [Event], profile: Profile?, registrations: [Registration]) -> [PersonalizedEventRecommendation] {
+        guard let profile else { return [] }
+
+        let registeredEventIds = Set(registrations.filter(\.blocksNewRegistration).compactMap { $0.eventId ?? $0.event?.id })
+        let normalizedInterests = Set((profile.interests ?? []).compactMap(normalizeInterestCategory))
+        let historyCounts = joinedCategoryCounts(from: registrations)
+        let maxHistoryCount = max(0, historyCounts.values.max() ?? 0)
+
+        return events
+            .filter { !registeredEventIds.contains($0.id) }
+            .compactMap { event in
+                let categories = recommendationCategories(for: event)
+                let fitScore = EventFitScoreResult(profile: profile, event: event)
+                let interestScore = bestInterestScore(profileInterests: normalizedInterests, eventCategories: categories).score
+                let historyScore: Int = {
+                    guard maxHistoryCount > 0 else { return 0 }
+                    let bestCount = categories.map { historyCounts[$0] ?? 0 }.max() ?? 0
+                    return Int(round(Double(bestCount) / Double(maxHistoryCount) * 100))
+                }()
+                let exactPreferenceScore = categories.contains { normalizedInterests.contains($0) } ? 100 : 0
+                let fitValue = fitScore.hidden || fitScore.profileIncomplete ? 0 : fitScore.score
+
+                let signals: [(value: Int, weight: Double)] = [
+                    (fitValue, 4),
+                    (interestScore, 3.5),
+                    (historyScore, maxHistoryCount > 0 ? 3.5 : 0),
+                    (exactPreferenceScore, 2)
+                ].filter { $0.value > 0 && $0.weight > 0 }
+
+                guard !signals.isEmpty else { return nil }
+                let weighted = signals.reduce(0) { $0 + Double($1.value) * $1.weight }
+                let weight = signals.reduce(0) { $0 + $1.weight }
+                let score = Int(round(weighted / weight))
+                guard score >= 45 else { return nil }
+
+                return PersonalizedEventRecommendation(
+                    event: event,
+                    score: score,
+                    whyText: reasonText(
+                        categories: categories,
+                        profileInterests: normalizedInterests,
+                        historyCounts: historyCounts,
+                        fitScore: fitScore
+                    )
+                )
+            }
+            .sorted { lhs, rhs in
+                if lhs.score != rhs.score { return lhs.score > rhs.score }
+                return (lhs.event.date ?? "") < (rhs.event.date ?? "")
+            }
+            .prefix(6)
+            .map { $0 }
+    }
+
+    private static func joinedCategoryCounts(from registrations: [Registration]) -> [String: Int] {
+        var counts: [String: Int] = [:]
+        let joinedStatuses = Set(["registered", "paid", "waitlist", "attended", "deposit_paid"])
+        for registration in registrations where joinedStatuses.contains(registration.normalizedStatus) || registration.checkedIn == true {
+            guard let event = registration.event else { continue }
+            for category in recommendationCategories(for: event) {
+                counts[category, default: 0] += 1
+            }
+        }
+        return counts
+    }
+
+    private static func recommendationCategories(for event: Event) -> [String] {
+        ([event.additionalFields?.string(at: "fit_score_main_category") ?? event.category?.name] +
+         (event.additionalFields?.stringArray(at: "fit_score_secondary_categories") ?? []))
+            .compactMap(normalizeInterestCategory)
+            .removingDuplicates()
+    }
+
+    private static func bestInterestScore(profileInterests: Set<String>, eventCategories: [String]) -> (score: Int, interest: String?) {
+        var bestScore = 0
+        var bestInterest: String?
+        for interest in profileInterests {
+            for category in eventCategories {
+                let score = interestAffinity[category]?[interest] ?? 0
+                if score > bestScore {
+                    bestScore = score
+                    bestInterest = interest
+                }
+            }
+        }
+        return (bestScore, bestInterest)
+    }
+
+    private static func reasonText(categories: [String], profileInterests: Set<String>, historyCounts: [String: Int], fitScore: EventFitScoreResult) -> String {
+        if categories.contains(where: { (historyCounts[$0] ?? 0) > 0 }) {
+            return "Perché hai partecipato a eventi simili"
+        }
+
+        let bestMatch = bestInterestScore(profileInterests: profileInterests, eventCategories: categories)
+        if bestMatch.score >= 50, let interest = bestMatch.interest {
+            return "Perché ti piace \(interest.recommendationLabel)"
+        }
+
+        if !fitScore.hidden, !fitScore.profileIncomplete, fitScore.score >= 60 {
+            return "Perché è in linea con il tuo profilo"
+        }
+
+        if let first = categories.first {
+            return "Perché potrebbe piacerti \(first.recommendationLabel)"
+        }
+
+        return "Perché potrebbe piacerti"
+    }
+}
+
 struct RecommendedEventsSection: View {
-    let events: [Event]
+    let recommendations: [PersonalizedEventRecommendation]
     let availableWidth: CGFloat
     @Binding var selectedEvent: Event?
     private let cardWidth: CGFloat = 300
@@ -6962,9 +8687,9 @@ struct RecommendedEventsSection: View {
 
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: 12) {
-                    ForEach(events) { event in
-                        RecommendedEventCard(event: event, width: cardWidth)
-                            .onTapGesture { selectedEvent = event }
+                    ForEach(recommendations) { recommendation in
+                        RecommendedEventCard(recommendation: recommendation, width: cardWidth)
+                            .onTapGesture { selectedEvent = recommendation.event }
                     }
                 }
                 .scrollTargetLayout()
@@ -6979,8 +8704,17 @@ struct RecommendedEventsSection: View {
 }
 
 struct RecommendedEventCard: View {
-    let event: Event
+    @EnvironmentObject private var store: AppStore
+    let recommendation: PersonalizedEventRecommendation
     let width: CGFloat
+
+    private var event: Event { recommendation.event }
+    private var registration: Registration? {
+        store.myEvents.mostRecent(forEventId: event.id)
+    }
+    private var status: EventStatusStyle {
+        event.cardStatusStyle(registration: registration)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -6988,7 +8722,7 @@ struct RecommendedEventCard: View {
                 RemoteImage(urlString: event.imageUrl)
                     .frame(width: width, height: 132)
                     .clipShape(UnevenRoundedRectangle(topLeadingRadius: 18, topTrailingRadius: 18))
-                EventCardPillLabel(text: event.statusStyle.label, color: event.statusStyle.background, foreground: event.statusStyle.foreground)
+                EventCardPillLabel(text: status.label, color: status.background, foreground: status.foreground)
                     .padding(10)
             }
             .frame(width: width, height: 132)
@@ -7017,10 +8751,10 @@ struct RecommendedEventCard: View {
                     }
                 }
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("PERCHE LO VEDI")
+                    Text("PERCHÉ LO VEDI")
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(Brand.mutedForeground)
-                    Text("Perche ti piace \(event.category?.name?.lowercased() ?? "la community")")
+                    Text(recommendation.whyText)
                         .font(.caption)
                         .foregroundStyle(Brand.foreground.opacity(0.85))
                         .lineLimit(2)
@@ -7068,6 +8802,112 @@ struct ProposalCard: View {
     }
 }
 
+struct EventAccessWarningSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let check: EventAccessCheck
+    let canContactOrganizer: Bool
+    let onProceed: () -> Void
+    let onRequestApproval: () -> Void
+    let onContactOrganizer: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Text("Requisiti di accesso")
+                        .font(.system(.title2, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+
+                    if !check.failedReasons.isEmpty {
+                        EventAccessMessageCard(
+                            icon: "lock.fill",
+                            title: "Non soddisfi i requisiti minimi per partecipare a questo evento.",
+                            messages: check.failedReasons,
+                            tint: Brand.destructive
+                        )
+                    }
+
+                    if !check.softWarnings.isEmpty {
+                        EventAccessMessageCard(
+                            icon: "exclamationmark.triangle.fill",
+                            title: "Questo evento potrebbe non essere perfettamente in linea con il tuo profilo.",
+                            messages: check.softWarnings,
+                            tint: Brand.warning
+                        )
+                    }
+
+                    VStack(spacing: 10) {
+                        if check.failedReasons.isEmpty {
+                            Button {
+                                onProceed()
+                            } label: {
+                                Text("Procedi con la registrazione")
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+                        } else {
+                            Button {
+                                onRequestApproval()
+                            } label: {
+                                Text("Richiedi approvazione manuale")
+                            }
+                            .buttonStyle(PrimaryButtonStyle())
+
+                            if canContactOrganizer {
+                                Button {
+                                    onContactOrganizer()
+                                } label: {
+                                    Label("Contatta organizzatore", systemImage: "message.fill")
+                                }
+                                .buttonStyle(SecondaryButtonStyle())
+                            }
+                        }
+
+                        Button("Chiudi") {
+                            dismiss()
+                        }
+                        .buttonStyle(SecondaryButtonStyle())
+                    }
+                }
+                .padding(20)
+            }
+            .background(Brand.background)
+        }
+    }
+}
+
+struct EventAccessMessageCard: View {
+    let icon: String
+    let title: String
+    let messages: [String]
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(title, systemImage: icon)
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(tint)
+                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(messages.enumerated()), id: \.offset) { _, message in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "shield.lefthalf.filled")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(tint)
+                            .padding(.top, 2)
+                        Text(message)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(Brand.foreground)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+        }
+        .padding()
+        .background(tint.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(tint.opacity(0.28), lineWidth: 1))
+    }
+}
+
 // MARK: - Event Detail
 
 struct EventDetailView: View {
@@ -7075,6 +8915,7 @@ struct EventDetailView: View {
     @EnvironmentObject private var store: AppStore
     @Binding var showAuth: Bool
     let eventId: String
+    let openParticipantsOnAppear: Bool
     @State private var showCheckout = false
     @State private var showCancelConfirm = false
     @State private var feedback: AppFeedback?
@@ -7086,15 +8927,20 @@ struct EventDetailView: View {
     @State private var savingEvent = false
     @State private var showShare = false
     @State private var showCalendar = false
+    @State private var showAccessWarning = false
+    @State private var requestApprovalOverride = false
     @State private var showOrganizerContact = false
     @State private var showOrganizerProfile = false
     @State private var showDirectionsOptions = false
     @State private var directionsDestination = ""
+    @State private var paymentLoading = false
     @State private var scrollOffset: CGFloat = 0
+    @State private var didOpenInitialParticipants = false
 
-    init(eventId: String, showAuth: Binding<Bool>) {
+    init(eventId: String, showAuth: Binding<Bool>, openParticipantsOnAppear: Bool = false) {
         self.eventId = eventId
         self._showAuth = showAuth
+        self.openParticipantsOnAppear = openParticipantsOnAppear
     }
 
     var event: Event? {
@@ -7129,6 +8975,10 @@ struct EventDetailView: View {
 
     var activeParticipantCount: Int {
         attendeeParticipants.isEmpty ? (event?.attendeeSpotsTaken ?? 0) : attendeeParticipants.count
+    }
+
+    private func accessCheck(for event: Event) -> EventAccessCheck {
+        EventAccessCheck.evaluate(event: event, profile: store.profile, badges: store.badges, registrations: store.myEvents)
     }
 
     var body: some View {
@@ -7176,18 +9026,29 @@ struct EventDetailView: View {
                     }
                     .animation(.easeOut(duration: 0.18), value: showOrganizerContact)
                     .sheet(isPresented: $showCheckout) {
-                        RegistrationCheckoutSheet(event: event) { result in
+                        RegistrationCheckoutSheet(event: event, requestApprovalOverride: requestApprovalOverride) { result in
                             if result.free {
-                                feedback = AppFeedback(title: "Iscrizione confermata", message: "Ci sei. Abbiamo aggiornato i tuoi eventi.", icon: "checkmark.seal.fill", tone: .success)
+                                feedback = AppFeedback(
+                                    title: requestApprovalOverride || event.requiresManualApproval ? "Richiesta inviata" : "Iscrizione confermata",
+                                    message: requestApprovalOverride || event.requiresManualApproval ? "La richiesta è stata inviata agli organizzatori." : "Ci sei. Abbiamo aggiornato i tuoi eventi.",
+                                    icon: "checkmark.seal.fill",
+                                    tone: .success
+                                )
                             }
                             if let url = result.url {
                                 activeCheckout = ActiveCheckout(url: url, sessionId: result.sessionId, kind: result.kind)
                             }
+                            requestApprovalOverride = false
                         }
                         .presentationDetents([.large])
                     }
+                    .onChange(of: showCheckout) { _, isPresented in
+                        if !isPresented {
+                            requestApprovalOverride = false
+                        }
+                    }
                     .sheet(isPresented: $showCancelConfirm) {
-                        CancelRegistrationSheet(event: event, feedback: $feedback)
+                        CancelRegistrationSheet(event: event, registration: registration, feedback: $feedback)
                             .presentationDetents([.height(360)])
                     }
                     .fullScreenCover(item: $activeCheckout) { checkout in
@@ -7213,6 +9074,27 @@ struct EventDetailView: View {
                     .sheet(isPresented: $showCalendar) {
                         CalendarEventEditView(event: event)
                     }
+                    .sheet(isPresented: $showAccessWarning) {
+                        EventAccessWarningSheet(
+                            check: accessCheck(for: event),
+                            canContactOrganizer: organizerProfile?.phone?.nilIfBlank != nil,
+                            onProceed: {
+                                showAccessWarning = false
+                                requestApprovalOverride = false
+                                showCheckout = true
+                            },
+                            onRequestApproval: {
+                                showAccessWarning = false
+                                requestApprovalOverride = true
+                                showCheckout = true
+                            },
+                            onContactOrganizer: {
+                                showAccessWarning = false
+                                showOrganizerContact = true
+                            }
+                        )
+                        .presentationDetents([.medium, .large])
+                    }
                     .confirmationDialog("Apri indicazioni con", isPresented: $showDirectionsOptions, titleVisibility: .visible) {
                         ForEach(DirectionsApp.allCases) { app in
                             Button(app.title) {
@@ -7224,7 +9106,7 @@ struct EventDetailView: View {
                         Text(directionsDestination)
                     }
                     .fullScreenCover(isPresented: $showOrganizerProfile) {
-                        OrganizerProfileView(organizerId: event.organizerId, fallbackName: event.organizerName, profile: organizerProfile)
+                        OrganizerProfileView(organizerId: event.organizerId, fallbackName: event.organizerName, profile: organizerProfile, showAuth: $showAuth)
                             .environmentObject(store)
                     }
                 }
@@ -7238,6 +9120,7 @@ struct EventDetailView: View {
         .task(id: eventId) {
             await store.refreshEventData(reportingErrors: false)
             await store.loadParticipants(eventId: eventId)
+            openInitialParticipantsIfNeeded()
         }
         .task(id: event?.organizerId ?? "") {
             await store.loadOrganizerProfile(organizerId: event?.organizerId)
@@ -7446,7 +9329,7 @@ struct EventDetailView: View {
                 EquipmentSection(items: event.equipmentItems)
             }
 
-            if !event.meetingPoints.isEmpty {
+            if canViewMeetingPoints(for: event), !event.meetingPoints.isEmpty {
                 DisclosureGroup {
                     VStack(alignment: .leading, spacing: 12) {
                         ForEach(event.meetingPoints) { point in
@@ -7489,56 +9372,88 @@ struct EventDetailView: View {
     }
 
     private func bottomBar(_ event: Event) -> some View {
-        HStack(spacing: 16) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(event.displayPrice(profile: store.profile, badges: store.badges, registrations: store.myEvents))
-                    .font(.title2.weight(.bold))
-                    .foregroundStyle(Brand.foreground)
-                Text(event.availabilityLabel)
-                    .font(.caption)
-                    .foregroundStyle(Brand.mutedForeground)
-                if registration?.paymentStatus == "deposit_paid" {
-                    Text("Acconto pagato")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Brand.mutedForeground)
-                }
+        let check = accessCheck(for: event)
+        return VStack(spacing: 0) {
+            if store.isAuthenticated, check.isBlocking {
+                Text(check.restrictionMessage ?? check.failedReasons.first ?? "Non soddisfi i requisiti per partecipare a questo evento.")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Brand.destructive)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(Brand.destructive.opacity(0.08))
             }
-            Spacer()
-            if let registration {
-                Text(registration.statusLabel + (registration.isActive ? " ✓" : ""))
-                    .font(.headline.weight(.bold))
-                    .foregroundStyle(registration.statusStyle.foreground)
-                    .padding(.horizontal, 22)
-                    .frame(height: 50)
-                    .background(registration.statusStyle.background, in: RoundedRectangle(cornerRadius: 18))
-            } else if !event.acceptsRegistrations {
-                Text(event.statusStyle.label)
-                    .font(.headline.weight(.bold))
-                    .foregroundStyle(event.statusStyle.foreground)
-                    .padding(.horizontal, 22)
-                    .frame(height: 50)
-                    .background(event.statusStyle.background, in: RoundedRectangle(cornerRadius: 18))
-            } else if event.isFull && !event.hasWaitlistParticipationOption {
-                Text("Sold out")
-                    .font(.headline.weight(.bold))
-                    .foregroundStyle(event.statusStyle.foreground)
-                    .padding(.horizontal, 22)
-                    .frame(height: 50)
-                    .background(event.statusStyle.background, in: RoundedRectangle(cornerRadius: 18))
-            } else {
-                Button(event.isFull ? "Lista d'attesa" : "Partecipa") {
-                    if store.isAuthenticated {
-                        showCheckout = true
-                    } else {
-                        showAuth = true
+
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(event.displayPrice(profile: store.profile, badges: store.badges, registrations: store.myEvents))
+                        .font(.title2.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                    Text(event.availabilityLabel)
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                    if let registration, registration.normalizedStatus == "deposit_paid" || registration.paymentStatus == "deposit_paid" {
+                        Text(registration.displayStatusLabel(in: event))
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Brand.mutedForeground)
+                    }
+                    if let deadline = event.registrationDeadlineText {
+                        Text("Iscrizioni fino al \(deadline)")
+                            .font(.caption2)
+                            .foregroundStyle(Brand.mutedForeground)
                     }
                 }
-                .buttonStyle(PrimaryButtonStyle(width: 170))
+                Spacer()
+                if let registration {
+                    if registration.canResumePayment(in: event) {
+                        Button(paymentLoading ? "Attendere..." : registration.resumeActionTitle(in: event)) {
+                            Task { await continueRegistration(registration, event: event) }
+                        }
+                        .buttonStyle(PrimaryButtonStyle(width: 170))
+                        .disabled(paymentLoading)
+                    } else {
+                        let statusStyle = registration.displayStatusStyle(in: event)
+                        Text(registration.displayStatusLabel(in: event) + (registration.isActive ? " ✓" : ""))
+                            .font(.headline.weight(.bold))
+                            .foregroundStyle(statusStyle.foreground)
+                            .padding(.horizontal, 22)
+                            .frame(height: 50)
+                            .background(statusStyle.background, in: RoundedRectangle(cornerRadius: 18))
+                    }
+                } else if !event.acceptsRegistrations {
+                    Text(event.statusStyle.label)
+                        .font(.headline.weight(.bold))
+                        .foregroundStyle(event.statusStyle.foreground)
+                        .padding(.horizontal, 22)
+                        .frame(height: 50)
+                        .background(event.statusStyle.background, in: RoundedRectangle(cornerRadius: 18))
+                } else if event.isFull && !event.hasWaitlistParticipationOption {
+                    Text("Sold out")
+                        .font(.headline.weight(.bold))
+                        .foregroundStyle(event.statusStyle.foreground)
+                        .padding(.horizontal, 22)
+                        .frame(height: 50)
+                        .background(event.statusStyle.background, in: RoundedRectangle(cornerRadius: 18))
+                } else {
+                    Button(check.isBlocking ? "Requisiti" : (event.isFull ? "Lista d'attesa" : "Partecipa")) {
+                        if !store.isAuthenticated {
+                            showAuth = true
+                        } else if check.isBlocking || check.hasWarnings {
+                            showAccessWarning = true
+                        } else {
+                            requestApprovalOverride = false
+                            showCheckout = true
+                        }
+                    }
+                    .buttonStyle(PrimaryButtonStyle(width: 170))
+                }
             }
+            .padding(.horizontal, 18)
+            .padding(.top, 10)
+            .padding(.bottom, 8)
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 10)
-        .padding(.bottom, 8)
         .background(.thinMaterial)
     }
 
@@ -7557,6 +9472,31 @@ struct EventDetailView: View {
         return metrics
     }
 
+    private func canViewMeetingPoints(for event: Event) -> Bool {
+        store.isAuthenticated && (registration != nil || store.session?.user.id == event.organizerId || store.isAdmin)
+    }
+
+    private func continueRegistration(_ registration: Registration, event: Event) async {
+        guard !paymentLoading else { return }
+        paymentLoading = true
+        defer { paymentLoading = false }
+
+        if registration.waitlistSpotAvailable(in: event), !registration.requiresOnlinePayment(in: event) {
+            if await store.completeWaitlistBooking(for: registration) {
+                feedback = AppFeedback(title: "Prenotazione completata", message: "Il posto è tuo. Abbiamo aggiornato i tuoi eventi.", icon: "checkmark.seal.fill", tone: .success)
+            }
+            return
+        }
+
+        if let result = await store.resumeCheckout(for: registration) {
+            if result.free {
+                feedback = AppFeedback(title: "Prenotazione completata", message: "Abbiamo aggiornato i tuoi eventi.", icon: "checkmark.seal.fill", tone: .success)
+            } else if let url = result.url {
+                activeCheckout = ActiveCheckout(url: url, sessionId: result.sessionId, kind: result.kind)
+            }
+        }
+    }
+
     private func toggleSaved(_ event: Event) async {
         guard store.isAuthenticated else {
             showAuth = true
@@ -7572,6 +9512,14 @@ struct EventDetailView: View {
         var items: [Any] = ["\(event.title)\n\(formatLongDate(event.date))"]
         if let url = event.webURL { items.append(url) }
         return items
+    }
+
+    private func openInitialParticipantsIfNeeded() {
+        guard openParticipantsOnAppear, !didOpenInitialParticipants else { return }
+        didOpenInitialParticipants = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            showParticipants = true
+        }
     }
 
     private func presentDirectionsOptions(for destination: String) {
@@ -7647,10 +9595,15 @@ private enum DirectionsApp: CaseIterable, Identifiable {
 }
 
 struct EventPillsRow: View {
+    @EnvironmentObject private var store: AppStore
     let event: Event
 
     var body: some View {
         HStack(spacing: 6) {
+            if shouldShowStatusPill {
+                CompactEventPill(text: event.statusStyle.label, color: event.statusStyle.background, foreground: event.statusStyle.foreground)
+            }
+
             if let difficulty = event.difficultyLabel {
                 CompactEventPill(text: difficulty.text, color: difficulty.background, foreground: difficulty.foreground)
                     .overlay(Capsule().stroke(difficulty.foreground.opacity(0.55), lineWidth: 1))
@@ -7665,9 +9618,64 @@ struct EventPillsRow: View {
             if event.price == 0 {
                 CompactEventPill(text: "Gratis", color: Brand.success.opacity(0.85), foreground: .white)
             }
+
+            ForEach(EventAccessPill.pills(for: event)) { pill in
+                CompactEventPill(text: pill.label, color: pill.background, foreground: pill.foreground)
+            }
+
+            if (store.isOrganizer || store.isAdmin), let visibilityPill {
+                CompactEventPill(text: visibilityPill.label, color: visibilityPill.background, foreground: visibilityPill.foreground)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 1)
+    }
+
+    private var shouldShowStatusPill: Bool {
+        event.normalizedStatus != "open" || event.isFull || event.isPastOrCancelled
+    }
+
+    private var visibilityPill: EventAccessPill? {
+        switch event.visibility?.nilIfBlank?.lowercased() {
+        case "private":
+            EventAccessPill(label: "Privato", background: Brand.warning.opacity(0.15), foreground: Brand.warning)
+        case "hidden":
+            EventAccessPill(label: "Nascosto", background: Brand.foreground.opacity(0.78), foreground: .white)
+        default:
+            nil
+        }
+    }
+}
+
+struct EventAccessPill: Identifiable {
+    let id = UUID()
+    let label: String
+    let background: Color
+    let foreground: Color
+
+    static func pills(for event: Event) -> [EventAccessPill] {
+        let rules = event.accessRulesList
+        guard !rules.isEmpty else { return [] }
+
+        if let customLabel = event.accessRules?.string(at: "exclusivity_label")?.nilIfBlank, customLabel.lowercased() != "auto" {
+            return [EventAccessPill(label: customLabel, background: Brand.secondary.opacity(0.14), foreground: Brand.secondary)]
+        }
+
+        let ruleTypes = Set(rules.map(\.type))
+        if ruleTypes.contains("require_membership") {
+            return [EventAccessPill(label: "Solo membri", background: Brand.primary.opacity(0.12), foreground: Brand.primary)]
+        }
+
+        let experienceRules: Set<String> = ["min_trekking_events", "min_attended_events", "min_activities", "min_level", "min_experience", "min_activity_frequency"]
+        if !ruleTypes.isDisjoint(with: experienceRules) {
+            return [EventAccessPill(label: "Esperienza richiesta", background: Brand.warning.opacity(0.14), foreground: Brand.warning)]
+        }
+
+        if ruleTypes.contains("manual_approval") {
+            return [EventAccessPill(label: "Evento esclusivo", background: Brand.secondary.opacity(0.14), foreground: Brand.secondary)]
+        }
+
+        return [EventAccessPill(label: "Accesso limitato", background: Brand.primary.opacity(0.10), foreground: Brand.primary)]
     }
 }
 
@@ -7846,12 +9854,29 @@ struct OrganizerProfileView: View {
     let organizerId: String?
     let fallbackName: String?
     let profile: PublicProfile?
+    @Binding var showAuth: Bool
+    @State private var selectedEvent: Event?
+
+    private var organizerData: OrganizerPublicProfile? {
+        organizerId.flatMap { store.organizerPublicProfiles[$0] }
+    }
+
+    private var displayProfile: PublicProfile? {
+        organizerData?.profile ?? profile
+    }
 
     private var organizerName: String {
-        profile?.firstName.nilIfBlank ?? fallbackName ?? "Organizzatore"
+        displayProfile?.firstName.nilIfBlank ?? fallbackName ?? "Organizzatore"
     }
 
     private var organizerEvents: [Event] {
+        if let events = organizerData?.events {
+            return events.sorted { lhs, rhs in
+                let left = lhs.date.flatMap(DateFormatter.eventDate.date(from:)) ?? .distantFuture
+                let right = rhs.date.flatMap(DateFormatter.eventDate.date(from:)) ?? .distantFuture
+                return left < right
+            }
+        }
         guard let organizerId else { return [] }
         return store.events
             .filter { $0.organizerId == organizerId && $0.visibility != "private" }
@@ -7867,7 +9892,7 @@ struct OrganizerProfileView: View {
             ScrollView {
                 VStack(spacing: 24) {
                     VStack(spacing: 16) {
-                        OrganizerAvatar(name: organizerName, avatarUrl: profile?.avatarUrl, size: 112)
+                        OrganizerAvatar(name: organizerName, avatarUrl: displayProfile?.avatarUrl, size: 112)
                             .overlay(alignment: .bottomTrailing) {
                                 Text("Organizer")
                                     .font(.system(size: 10, weight: .bold, design: .rounded))
@@ -7885,14 +9910,16 @@ struct OrganizerProfileView: View {
                                 .foregroundStyle(Brand.foreground)
 
                             HStack(spacing: 14) {
-                                Label("\(organizerEvents.count) eventi", systemImage: "calendar")
-                                Label("\(upcomingEvents.count) in programma", systemImage: "star")
+                                Label("\(organizerData?.eventCount ?? organizerEvents.count) eventi creati", systemImage: "calendar")
+                                if !upcomingEvents.isEmpty {
+                                    Label("\(upcomingEvents.count) in programma", systemImage: "star")
+                                }
                             }
                             .font(.system(.caption, design: .rounded, weight: .semibold))
                             .foregroundStyle(Brand.mutedForeground)
                         }
 
-                        if let bio = profile?.bio?.nilIfBlank {
+                        if let bio = displayProfile?.bio?.nilIfBlank {
                             Text(bio)
                                 .font(.system(.subheadline, design: .rounded))
                                 .foregroundStyle(Brand.mutedForeground)
@@ -7901,7 +9928,15 @@ struct OrganizerProfileView: View {
                                 .padding(.top, 4)
                         }
 
-                        if let phone = profile?.phone?.nilIfBlank {
+                        if !store.isAuthenticated {
+                            Button {
+                                requestAuth()
+                            } label: {
+                                Label("Accedi per contattare l'organizzatore", systemImage: "lock")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(SecondaryPillButtonStyle())
+                        } else if let phone = displayProfile?.phone?.nilIfBlank {
                             HStack(spacing: 10) {
                                 Button {
                                     openOrganizerWhatsApp(phone: phone, message: "Ciao \(organizerName)!")
@@ -7921,6 +9956,11 @@ struct OrganizerProfileView: View {
                                 }
                                 .buttonStyle(PrimaryPillButtonStyle(background: Brand.primary.opacity(0.14), foreground: Brand.primary))
                             }
+                        } else {
+                            Label("Nessun contatto disponibile", systemImage: "info.circle")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(Brand.mutedForeground)
+                                .padding(.vertical, 4)
                         }
                     }
                     .padding(24)
@@ -7929,11 +9969,22 @@ struct OrganizerProfileView: View {
                     .overlay(RoundedRectangle(cornerRadius: 24).stroke(Brand.muted.opacity(0.7), lineWidth: 1))
 
                     VStack(alignment: .leading, spacing: 14) {
-                        Text("Eventi pubblici")
-                            .font(.system(.title3, design: .rounded, weight: .bold))
-                            .foregroundStyle(Brand.foreground)
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text("Eventi pubblici")
+                                .font(.system(.title3, design: .rounded, weight: .bold))
+                                .foregroundStyle(Brand.foreground)
+                            if !organizerEvents.isEmpty {
+                                Text("(\(organizerEvents.count))")
+                                    .font(.system(.subheadline, design: .rounded, weight: .medium))
+                                    .foregroundStyle(Brand.mutedForeground)
+                            }
+                        }
 
-                        if organizerEvents.isEmpty {
+                        if !store.isAuthenticated {
+                            OrganizerProfileSignInGate {
+                                requestAuth()
+                            }
+                        } else if organizerEvents.isEmpty {
                             Text("Nessun evento pubblico organizzato.")
                                 .font(.system(.subheadline, design: .rounded))
                                 .foregroundStyle(Brand.mutedForeground)
@@ -7941,8 +9992,21 @@ struct OrganizerProfileView: View {
                                 .padding(.vertical, 28)
                                 .background(Brand.muted.opacity(0.22), in: RoundedRectangle(cornerRadius: 18))
                         } else {
-                            ForEach(organizerEvents.prefix(8)) { event in
-                                OrganizerProfileEventRow(event: event)
+                            if !upcomingEvents.isEmpty {
+                                OrganizerProfileEventGroupLabel("In programma")
+                                ForEach(upcomingEvents) { event in
+                                    OrganizerProfileEventRow(event: event)
+                                        .onTapGesture { selectedEvent = event }
+                                }
+                            }
+
+                            if !pastEvents.isEmpty {
+                                OrganizerProfileEventGroupLabel("Eventi passati")
+                                    .padding(.top, upcomingEvents.isEmpty ? 0 : 4)
+                                ForEach(pastEvents) { event in
+                                    OrganizerProfileEventRow(event: event, isPast: true)
+                                        .onTapGesture { selectedEvent = event }
+                                }
                             }
                         }
                     }
@@ -7964,25 +10028,52 @@ struct OrganizerProfileView: View {
                     }
                 }
             }
+            .navigationDestination(item: $selectedEvent) { event in
+                EventDetailView(eventId: event.id, showAuth: $showAuth)
+            }
+            .task(id: organizerId ?? "") {
+                await store.loadOrganizerProfile(organizerId: organizerId)
+            }
         }
     }
 
     private var upcomingEvents: [Event] {
-        organizerEvents.filter { event in
-            guard let date = event.date.flatMap(DateFormatter.eventDate.date(from:)) else { return false }
-            return date >= Calendar.current.startOfDay(for: Date())
+        organizerEvents.filter { !$0.organizerIsPastByDate }
+    }
+
+    private var pastEvents: [Event] {
+        organizerEvents.filter(\.organizerIsPastByDate)
+    }
+
+    private func requestAuth() {
+        dismiss()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            showAuth = true
         }
     }
 }
 
 struct OrganizerProfileEventRow: View {
     let event: Event
+    var isPast = false
 
     var body: some View {
         HStack(spacing: 12) {
-            RemoteImage(urlString: event.imageUrl)
-                .frame(width: 74, height: 74)
-                .clipShape(RoundedRectangle(cornerRadius: 14))
+            ZStack(alignment: .topLeading) {
+                RemoteImage(urlString: event.imageUrl)
+                    .frame(width: 78, height: 78)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+
+                if let difficulty = event.difficultyLabel {
+                    Text(compactDifficultyText(difficulty))
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(difficulty.foreground)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(difficulty.background, in: Capsule())
+                        .padding(5)
+                }
+            }
 
             VStack(alignment: .leading, spacing: 5) {
                 Text(event.category?.name ?? "Evento")
@@ -8002,12 +10093,98 @@ struct OrganizerProfileEventRow: View {
                 }
                 .font(.system(size: 11, design: .rounded))
                 .foregroundStyle(Brand.mutedForeground)
+
+                HStack(spacing: 10) {
+                    Text(event.displayPrice)
+                        .font(.system(.subheadline, design: .rounded, weight: .heavy))
+                        .foregroundStyle(Brand.foreground)
+                    if let total = event.spotsTotal {
+                        Label("\(event.spotsTaken ?? event.attendeeSpotsTaken)/\(total)", systemImage: "person.2")
+                            .labelStyle(.titleAndIcon)
+                    }
+                }
+                .font(.system(size: 11, design: .rounded))
+                .foregroundStyle(Brand.mutedForeground)
+
+                if let warning = event.organizerCapacityWarning {
+                    Label(warning.text, systemImage: warning.icon)
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundStyle(warning.color)
+                }
             }
             Spacer()
+
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(Brand.primary)
+                .frame(width: 26, height: 26)
+                .background(Brand.primary.opacity(0.10), in: Circle())
         }
         .padding(10)
-        .background(Brand.card, in: RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Brand.muted.opacity(0.5), lineWidth: 1))
+        .background(isPast ? Brand.muted.opacity(0.20) : Brand.card, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(isPast ? Brand.muted.opacity(0.32) : Brand.muted.opacity(0.5), lineWidth: 1))
+        .opacity(isPast ? 0.72 : 1)
+        .contentShape(RoundedRectangle(cornerRadius: 18))
+    }
+}
+
+struct OrganizerProfileEventGroupLabel: View {
+    let text: String
+
+    init(_ text: String) {
+        self.text = text
+    }
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 10, weight: .bold, design: .rounded))
+            .textCase(.uppercase)
+            .tracking(1.4)
+            .foregroundStyle(Brand.mutedForeground)
+            .padding(.top, 2)
+    }
+}
+
+struct OrganizerProfileSignInGate: View {
+    let onSignIn: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "lock")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(Brand.primary)
+                .frame(width: 48, height: 48)
+                .background(Brand.primary.opacity(0.10), in: Circle())
+            VStack(spacing: 4) {
+                Text("Solo per utenti registrati")
+                    .font(.system(.headline, design: .rounded, weight: .bold))
+                    .foregroundStyle(Brand.foreground)
+                Text("Accedi per vedere i prossimi eventi dell'organizzatore.")
+                    .font(.caption)
+                    .foregroundStyle(Brand.mutedForeground)
+                    .multilineTextAlignment(.center)
+            }
+            Button("Accedi ora", action: onSignIn)
+                .buttonStyle(SecondaryPillButtonStyle())
+        }
+        .frame(maxWidth: .infinity)
+        .padding(24)
+        .background(Brand.muted.opacity(0.18), in: RoundedRectangle(cornerRadius: 20))
+        .overlay(RoundedRectangle(cornerRadius: 20).stroke(Brand.muted.opacity(0.48), style: StrokeStyle(lineWidth: 1, dash: [5, 5])))
+    }
+}
+
+struct SecondaryPillButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(.subheadline, design: .rounded, weight: .bold))
+            .foregroundStyle(Brand.primary)
+            .padding(.vertical, 13)
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity)
+            .background(Brand.primary.opacity(0.10), in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.primary.opacity(0.22), lineWidth: 1))
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
     }
 }
 
@@ -8144,6 +10321,10 @@ struct WeatherDisplay: Equatable {
     private static func geocodingCandidates(location: String, displayLocation: String?) -> [String] {
         let parts = location.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         var candidates: [String] = []
+        if parts.count >= 2, let geoLocation = parts.last?.nilIfBlank {
+            candidates.append(geoLocation)
+        }
+        candidates.append(location)
         if let displayLocation = displayLocation?.nilIfBlank {
             candidates.append(displayLocation)
         }
@@ -8159,7 +10340,6 @@ struct WeatherDisplay: Equatable {
                 candidates.append(cleaned)
             }
         }
-        candidates.append(location)
         return candidates.removingDuplicates()
     }
 
@@ -8184,14 +10364,28 @@ struct WeatherDisplay: Equatable {
         case 1: "Prevalentemente sereno"
         case 2: "Parzialmente nuvoloso"
         case 3: "Nuvoloso"
-        case 45, 48: "Nebbia"
-        case 51, 53, 55: "Pioggerella"
+        case 45: "Nebbia"
+        case 48: "Nebbia gelata"
+        case 51: "Pioggerella leggera"
+        case 53: "Pioggerella"
+        case 55: "Pioggerella intensa"
         case 61: "Pioggia leggera"
         case 63: "Pioggia"
         case 65: "Pioggia intensa"
-        case 71, 73, 75, 77, 85, 86: "Neve"
-        case 80, 81, 82: "Rovesci"
-        case 95, 96, 99: "Temporale"
+        case 66: "Pioggia gelata"
+        case 67: "Pioggia gelata intensa"
+        case 71: "Neve leggera"
+        case 73: "Neve"
+        case 75: "Neve intensa"
+        case 77: "Granuli di neve"
+        case 80: "Rovesci leggeri"
+        case 81: "Rovesci"
+        case 82: "Rovesci intensi"
+        case 85: "Rovesci di neve"
+        case 86: "Rovesci di neve intensi"
+        case 95: "Temporale"
+        case 96: "Temporale con grandine"
+        case 99: "Temporale con grandine intensa"
         default: "Meteo"
         }
     }
@@ -8213,7 +10407,8 @@ struct WeatherDisplay: Equatable {
         case 2: return "cloud.sun"
         case 3: return "cloud"
         case 45, 48: return "cloud.fog"
-        case 51, 53, 55, 61, 63, 65, 80, 81, 82: return "cloud.rain"
+        case 51, 53, 55: return "cloud.drizzle"
+        case 61, 63, 65, 66, 67, 80, 81, 82: return "cloud.rain"
         case 71, 73, 75, 77, 85, 86: return "snowflake"
         case 95, 96, 99: return "cloud.bolt.rain"
         default: return "cloud"
@@ -8323,9 +10518,17 @@ struct ParticipantsSheet: View {
     let eventId: String
     let fallbackCount: Int
     @Binding var showAuth: Bool
+    @State private var organizerRegistrations: [OrganizerRegistration] = []
+    @State private var registrationHistoryByUserId: [String: [ParticipantRegistrationHistoryRow]] = [:]
 
     private var participants: [EventParticipant] {
         store.eventParticipants[eventId] ?? []
+    }
+
+    private var event: Event? {
+        store.events.first { $0.id == eventId }
+            ?? store.organizerEvents.first { $0.id == eventId }
+            ?? store.myEvents.compactMap(\.event).first { $0.id == eventId }
     }
 
     private var organizer: EventParticipant {
@@ -8344,8 +10547,12 @@ struct ParticipantsSheet: View {
         store.isAuthenticated && store.profile != nil && !store.needsOnboarding
     }
 
+    private var canViewOrganizerDetails: Bool {
+        store.isAdmin || (store.isOrganizer && event?.organizerId == store.session?.user.id)
+    }
+
     private var loadKey: String {
-        "\(eventId)-\(store.session?.user.id ?? "anon")-\(store.needsOnboarding)"
+        "\(eventId)-\(store.session?.user.id ?? "anon")-\(store.needsOnboarding)-\(store.isAdmin)-\(store.isOrganizer)"
     }
 
     private var counterText: String {
@@ -8354,6 +10561,12 @@ struct ParticipantsSheet: View {
 
     private var previewRows: Int {
         min(max(attendeeCount, 0), 4)
+    }
+
+    private var previewParticipants: [EventParticipant?] {
+        let visibleParticipants = attendeeParticipants.prefix(previewRows).map(Optional.some)
+        let placeholders = Array<EventParticipant?>(repeating: nil, count: max(previewRows - visibleParticipants.count, 0))
+        return visibleParticipants + placeholders
     }
 
     var body: some View {
@@ -8375,7 +10588,17 @@ struct ParticipantsSheet: View {
                         } else {
                             VStack(alignment: .leading, spacing: 18) {
                                 ForEach(attendeeParticipants) { participant in
-                                    ParticipantPersonRow(participant: participant, levels: store.communityLevels, mode: .details)
+                                    if canViewOrganizerDetails, let event {
+                                        OrganizerPublicParticipantDetailRow(
+                                            participant: participant,
+                                            registration: organizerRegistration(for: participant),
+                                            event: event,
+                                            levels: store.communityLevels,
+                                            history: history(for: participant)
+                                        )
+                                    } else {
+                                        ParticipantPersonRow(participant: participant, levels: store.communityLevels, mode: .details)
+                                    }
                                 }
                             }
                         }
@@ -8383,8 +10606,8 @@ struct ParticipantsSheet: View {
                         ParticipantsEmptyState(title: "Ancora nessun partecipante", message: "Quando qualcuno si iscriverà, lo vedrai qui.")
                     } else {
                         VStack(alignment: .leading, spacing: 18) {
-                            ForEach(0..<previewRows, id: \.self) { _ in
-                                ParticipantPrivacyPreviewRow()
+                            ForEach(Array(previewParticipants.enumerated()), id: \.offset) { _, participant in
+                                ParticipantPrivacyPreviewRow(participant: participant)
                             }
                         }
                     }
@@ -8404,6 +10627,7 @@ struct ParticipantsSheet: View {
         .background(Brand.background)
         .task(id: loadKey) {
             await store.loadParticipants(eventId: eventId)
+            await loadOrganizerDetailsIfNeeded()
         }
     }
 
@@ -8442,6 +10666,38 @@ struct ParticipantsSheet: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
             showAuth = true
         }
+    }
+
+    @MainActor
+    private func loadOrganizerDetailsIfNeeded() async {
+        guard canViewOrganizerDetails else {
+            organizerRegistrations = []
+            registrationHistoryByUserId = [:]
+            return
+        }
+        let registrations = await store.fetchOrganizerRegistrations(eventId: eventId, reportingErrors: false)
+        organizerRegistrations = registrations
+
+        let userIds = registrations
+            .filter { !$0.isManual }
+            .compactMap(\.userId)
+            .removingDuplicates()
+        let history = await store.fetchParticipantRegistrationHistory(userIds: userIds, reportingErrors: false)
+        registrationHistoryByUserId = Dictionary(grouping: history, by: { $0.userId ?? "" })
+            .filter { !$0.key.isEmpty }
+    }
+
+    private func organizerRegistration(for participant: EventParticipant) -> OrganizerRegistration? {
+        if let directMatch = organizerRegistrations.first(where: { $0.id == participant.id }) {
+            return directMatch
+        }
+        guard let userId = participant.userId?.nilIfBlank else { return nil }
+        return organizerRegistrations.first { $0.userId == userId && !$0.isManual }
+    }
+
+    private func history(for participant: EventParticipant) -> [ParticipantRegistrationHistoryRow] {
+        guard let userId = participant.userId?.nilIfBlank else { return [] }
+        return registrationHistoryByUserId[userId] ?? []
     }
 }
 
@@ -8526,32 +10782,212 @@ struct ParticipantPersonRow: View {
     }
 }
 
-struct ParticipantPrivacyPreviewRow: View {
-    var body: some View {
-        HStack(spacing: 14) {
-            Circle()
-                .fill(Brand.muted)
-                .frame(width: 56, height: 56)
-                .overlay {
-                    Circle()
-                        .fill(Brand.primary.opacity(0.12))
-                        .blur(radius: 8)
+struct OrganizerPublicParticipantDetailRow: View {
+    let participant: EventParticipant
+    let registration: OrganizerRegistration?
+    let event: Event
+    let levels: [CommunityLevelDefinition]
+    let history: [ParticipantRegistrationHistoryRow]
+
+    private var displayProfile: OrganizerParticipantProfile? {
+        registration?.isManual == true ? nil : registration?.profiles
+    }
+
+    private var displayName: String {
+        let baseName = registration?.displayName.nilIfBlank ?? participant.displayName
+        if let age = participant.age ?? displayProfile?.birthDate.flatMap({ calculateAge(from: $0) }) {
+            return "\(baseName), \(age)"
+        }
+        return baseName
+    }
+
+    private var points: Int {
+        displayProfile?.totalPoints ?? participant.totalPoints ?? 0
+    }
+
+    private var level: CommunityLevelDefinition? {
+        CommunityLevelDefinition.currentLevel(points: points, levels: levels)
+    }
+
+    private var levelColor: Color {
+        level.flatMap { Color(hex: $0.color) } ?? Brand.primary
+    }
+
+    private var fitScore: EventFitScoreResult? {
+        guard registration?.isManual != true, let displayProfile else { return nil }
+        let result = EventFitScoreResult(organizerProfile: displayProfile, event: event)
+        return result.hidden || result.profileIncomplete ? nil : result
+    }
+
+    private var dedupedHistory: [ParticipantRegistrationHistoryRow] {
+        var byEvent: [String: ParticipantRegistrationHistoryRow] = [:]
+        for row in history {
+            guard let key = row.eventId?.nilIfBlank else { continue }
+            if let current = byEvent[key] {
+                if rank(row) > rank(current) || (rank(row) == rank(current) && createdAt(row) > createdAt(current)) {
+                    byEvent[key] = row
                 }
+            } else {
+                byEvent[key] = row
+            }
+        }
+        return Array(byEvent.values)
+    }
+
+    private var completedEvents: Int {
+        dedupedHistory.filter(\.isCompleted).count
+    }
+
+    private var reliabilityLabel: String {
+        let rows = dedupedHistory
+        guard !rows.isEmpty else { return "Ottima" }
+        let noShows = rows.filter { $0.normalizedStatus == "no_show" }.count
+        let cancellations = rows.filter { $0.normalizedStatus == "cancelled" }.count
+        let score = max(0, min(100, 100 - noShows * 10 - cancellations * 3))
+        if score >= 80 { return "Ottima" }
+        if score >= 60 { return "Buona" }
+        return "Da migliorare"
+    }
+
+    private var reliabilityColor: Color {
+        switch reliabilityLabel {
+        case "Ottima":
+            Brand.success
+        case "Buona":
+            Brand.warning
+        default:
+            Brand.destructive
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 14) {
+            OrganizerProfileAvatar(profile: displayProfile, name: displayName)
 
             VStack(alignment: .leading, spacing: 8) {
-                Capsule()
-                    .fill(Brand.muted)
-                    .frame(width: 136, height: 14)
-                    .blur(radius: 3)
-                Capsule()
-                    .fill(Brand.muted.opacity(0.78))
-                    .frame(width: 188, height: 12)
-                    .blur(radius: 3)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(displayName)
+                        .font(.system(.headline, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                    if let level {
+                        HStack(spacing: 5) {
+                            SupabaseIconView(value: level.icon, size: 12, color: levelColor)
+                            Text(level.name)
+                                .font(.caption.weight(.bold))
+                        }
+                        .foregroundStyle(levelColor)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(levelColor.opacity(0.12), in: Capsule())
+                    }
+                }
+
+                FlowLayout(spacing: 6, rowSpacing: 6) {
+                    if let fitScore {
+                        ParticipantDetailChip(icon: fitScore.score >= 50 ? "checkmark.circle.fill" : "exclamationmark.triangle.fill", text: "Compatibilità \(fitScore.score)%", color: fitScore.color)
+                    }
+                    ParticipantDetailChip(icon: reliabilityLabel == "Da migliorare" ? "exclamationmark.triangle.fill" : "checkmark.circle.fill", text: "Affidabilità \(reliabilityLabel)", color: reliabilityColor)
+                    ParticipantDetailChip(icon: "checkmark.seal.fill", text: "\(completedEvents) eventi completati", color: Brand.mutedForeground)
+                    if let age = participant.age ?? displayProfile?.birthDate.flatMap({ calculateAge(from: $0) }) {
+                        ParticipantDetailChip(icon: "calendar", text: "\(age) anni", color: Brand.mutedForeground)
+                    }
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
+    }
+
+    private func rank(_ row: ParticipantRegistrationHistoryRow) -> Int {
+        if row.isCompleted { return 5 }
+        if ["registered", "deposit_paid", "paid", "attended"].contains(row.normalizedStatus) { return 4 }
+        if row.normalizedStatus == "no_show" { return 3 }
+        if row.normalizedStatus == "cancelled" { return 2 }
+        return 1
+    }
+
+    private func createdAt(_ row: ParticipantRegistrationHistoryRow) -> TimeInterval {
+        row.createdAt?.iso8601Date?.timeIntervalSince1970 ?? 0
+    }
+}
+
+struct ParticipantDetailChip: View {
+    let icon: String
+    let text: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .bold))
+            Text(text)
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .lineLimit(1)
+        }
+        .foregroundStyle(color)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(color.opacity(0.10), in: Capsule())
+    }
+}
+
+struct ParticipantPrivacyPreviewRow: View {
+    let participant: EventParticipant?
+
+    var body: some View {
+        HStack(spacing: 14) {
+            avatar
+                .frame(width: 56, height: 56)
+                .clipShape(Circle())
+                .blur(radius: 6)
+
+            VStack(alignment: .leading, spacing: 8) {
+                if let name = participant?.publicFirstName.nilIfBlank {
+                    Text(name)
+                        .font(.system(.subheadline, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                        .lineLimit(1)
+                        .frame(maxWidth: 150, alignment: .leading)
+                        .blur(radius: 4)
+                } else {
+                    Capsule()
+                        .fill(Brand.muted)
+                        .frame(width: 136, height: 14)
+                        .blur(radius: 3)
+                }
+
+                Text("Membro")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Brand.mutedForeground)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 4)
+                    .background(Brand.muted.opacity(0.82), in: Capsule())
+                    .blur(radius: 4)
             }
 
             Spacer(minLength: 0)
         }
         .accessibilityHidden(true)
+    }
+
+    @ViewBuilder
+    private var avatar: some View {
+        if let avatarUrl = participant?.avatarUrl?.nilIfBlank {
+            RemoteImage(urlString: avatarUrl)
+        } else {
+            ZStack {
+                Brand.muted
+                Circle()
+                    .fill(Brand.primary.opacity(0.12))
+                    .blur(radius: 8)
+                Text(participant?.initial ?? "?")
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(Brand.primary)
+            }
+        }
     }
 }
 
@@ -8602,14 +11038,26 @@ struct DescriptionBlock: View {
     let description: String
     @Binding var expanded: Bool
     @State private var renderedHeight: CGFloat = 1
-    private let collapsedHeight: CGFloat = 460
+    private let collapsedHeight: CGFloat = 168
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             SectionTitle("L'esperienza")
-            EventDescriptionHTMLView(html: EventDescriptionHTML.cleanStoredHTML(from: description), height: $renderedHeight)
-                .frame(height: expanded ? renderedHeight : min(renderedHeight, collapsedHeight))
-                .clipped()
+            ZStack(alignment: .bottom) {
+                EventDescriptionHTMLView(html: EventDescriptionHTML.cleanStoredHTML(from: description), height: $renderedHeight)
+                    .frame(height: expanded ? renderedHeight : min(renderedHeight, collapsedHeight))
+                    .clipped()
+
+                if isLongDescription && !expanded {
+                    LinearGradient(
+                        colors: [Brand.background.opacity(0), Brand.background],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: 46)
+                    .allowsHitTesting(false)
+                }
+            }
 
             if isLongDescription {
                 Button(expanded ? "Mostra meno" : "Leggi di più") {
@@ -8882,11 +11330,31 @@ private enum EventDescriptionHTML {
           text-decoration-thickness: 1px;
           text-underline-offset: 3px;
         }
-        h1:first-child, h2:first-child, h3:first-child, p:first-child, ul:first-child, ol:first-child { margin-top: 0; }
-        p:last-child, ul:last-child, ol:last-child, li:last-child { margin-bottom: 0; }
+        blockquote {
+          margin: 18px 0;
+          padding: 4px 0 4px 16px;
+          border-left: 3px solid #DAD5C9;
+          color: #657064;
+        }
+        hr {
+          border: 0;
+          border-top: 1px solid #DAD5C9;
+          margin: 22px 0;
+        }
+        img {
+          display: block;
+          max-width: 100%;
+          height: auto;
+          border-radius: 18px;
+          margin: 18px 0;
+        }
+        h1:first-child, h2:first-child, h3:first-child, p:first-child, ul:first-child, ol:first-child, blockquote:first-child, img:first-child { margin-top: 0; }
+        p:last-child, ul:last-child, ol:last-child, li:last-child, blockquote:last-child, img:last-child { margin-bottom: 0; }
         @media (prefers-color-scheme: dark) {
           body { color: #EBE7E0; }
           a { color: #64B48C; }
+          blockquote { color: #B8B0A4; border-left-color: #47443F; }
+          hr { border-top-color: #47443F; }
         }
         </style>
         </head>
@@ -8990,6 +11458,11 @@ private enum EventDescriptionHTML {
 
     private static func sanitizedTag(_ rawTag: String, slash: String, attributes: String) -> String {
         let isClosing = !slash.isEmpty
+        if rawTag == "img" {
+            guard !isClosing, let src = srcValue(from: attributes) else { return "" }
+            return "<img src=\"\(escapeAttribute(src))\">"
+        }
+
         let mappedTag: String
         switch rawTag {
         case "b":
@@ -8998,9 +11471,9 @@ private enum EventDescriptionHTML {
             mappedTag = "em"
         case "strike", "del":
             mappedTag = "s"
-        case "div", "blockquote":
+        case "div":
             mappedTag = "p"
-        case "h1", "h2", "h3", "p", "strong", "em", "u", "s", "ul", "ol", "li", "br", "a":
+        case "h1", "h2", "h3", "p", "strong", "em", "u", "s", "ul", "ol", "li", "br", "a", "blockquote", "hr":
             mappedTag = rawTag
         case "h4", "h5", "h6":
             mappedTag = "h3"
@@ -9008,8 +11481,8 @@ private enum EventDescriptionHTML {
             return ""
         }
 
-        if mappedTag == "br" {
-            return isClosing ? "" : "<br>"
+        if mappedTag == "br" || mappedTag == "hr" {
+            return isClosing ? "" : "<\(mappedTag)>"
         }
 
         if isClosing {
@@ -9030,6 +11503,16 @@ private enum EventDescriptionHTML {
               match.range(at: 1).location != NSNotFound else { return nil }
         let value = nsAttributes.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
         guard value.hasPrefix("http://") || value.hasPrefix("https://") || value.hasPrefix("mailto:") else { return nil }
+        return value
+    }
+
+    private static func srcValue(from attributes: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: #"(?i)src\s*=\s*["']([^"']+)["']"#) else { return nil }
+        let nsAttributes = attributes as NSString
+        guard let match = regex.firstMatch(in: attributes, range: NSRange(location: 0, length: nsAttributes.length)),
+              match.range(at: 1).location != NSNotFound else { return nil }
+        let value = nsAttributes.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value.hasPrefix("http://") || value.hasPrefix("https://") else { return nil }
         return value
     }
 
@@ -9512,10 +11995,17 @@ struct CancellationPolicyInfo {
         guard let requiredHours else { return nil }
         return "Rimborso disponibile fino a \(requiredHours)h prima"
     }
+
+    func isRefundEligible(for event: Event) -> Bool {
+        guard let requiredHours, let startDate = event.calendarStartDate else { return false }
+        let hoursUntilEvent = startDate.timeIntervalSinceNow / 3600
+        return hoursUntilEvent >= Double(requiredHours)
+    }
 }
 
 struct FitScoreSection: View {
     let result: EventFitScoreResult
+    @State private var showDetails = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -9543,31 +12033,178 @@ struct FitScoreSection: View {
                         .tint(result.color)
                     ForEach(result.reasons, id: \.self) { reason in
                         HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: reason.hasPrefix("Il livello") || reason.hasPrefix("Le categorie") || reason.hasPrefix("L'evento è abbastanza") ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                .foregroundStyle(reason.hasPrefix("Il livello") || reason.hasPrefix("Le categorie") || reason.hasPrefix("L'evento è abbastanza") ? Brand.success : Brand.warning)
-                            Text(reason)
+                            Image(systemName: reason.icon == "check" ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                .foregroundStyle(reason.icon == "check" ? Brand.success : Brand.warning)
+                            Text(reason.text)
                                 .font(.caption)
                                 .foregroundStyle(Brand.foreground.opacity(0.82))
                         }
                     }
+                    Button {
+                        showDetails = true
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text("Vedi dettagli")
+                            Image(systemName: "chevron.right")
+                                .font(.caption2.weight(.bold))
+                        }
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(result.color)
+                    }
+                    .buttonStyle(.plain)
                 }
                 .padding(14)
                 .background(result.color.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
                 .overlay(RoundedRectangle(cornerRadius: 14).stroke(result.color.opacity(0.25), lineWidth: 1))
             }
         }
+        .sheet(isPresented: $showDetails) {
+            FitScoreDetailSheet(result: result)
+                .presentationDetents([.medium, .large])
+        }
     }
+}
+
+struct FitScoreDetailSheet: View {
+    let result: EventFitScoreResult
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(result.label)
+                                .font(.title3.weight(.bold))
+                                .foregroundStyle(Brand.foreground)
+                            Spacer()
+                            Text("\(result.score)%")
+                                .font(.title.weight(.heavy))
+                                .foregroundStyle(result.color)
+                        }
+                        ProgressView(value: Double(result.score), total: 100)
+                            .tint(result.color)
+                    }
+                    .padding(14)
+                    .background(result.color.opacity(0.10), in: RoundedRectangle(cornerRadius: 16))
+
+                    if !result.breakdownRows.isEmpty {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Breakdown")
+                                .font(.headline.weight(.bold))
+                                .foregroundStyle(Brand.foreground)
+                            ForEach(result.breakdownRows) { row in
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack {
+                                        Text(row.label)
+                                            .font(.subheadline.weight(.semibold))
+                                        Spacer()
+                                        Text("\(row.value)%")
+                                            .font(.subheadline.weight(.bold))
+                                    }
+                                    ProgressView(value: Double(row.value), total: 100)
+                                        .tint(result.color)
+                                    if let weight = row.weight {
+                                        Text("Peso nel calcolo: \(weight)%")
+                                            .font(.caption)
+                                            .foregroundStyle(Brand.mutedForeground)
+                                    }
+                                }
+                                .padding(12)
+                                .background(Brand.card, in: RoundedRectangle(cornerRadius: 14))
+                                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.muted, lineWidth: 1))
+                            }
+                        }
+                    }
+
+                    if !result.reasons.isEmpty {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Perché")
+                                .font(.headline.weight(.bold))
+                                .foregroundStyle(Brand.foreground)
+                            ForEach(result.reasons, id: \.self) { reason in
+                                HStack(alignment: .top, spacing: 10) {
+                                    Image(systemName: reason.icon == "check" ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                        .foregroundStyle(reason.icon == "check" ? Brand.success : Brand.warning)
+                                    Text(reason.text)
+                                        .font(.subheadline)
+                                        .foregroundStyle(Brand.foreground)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                .padding(12)
+                                .background(Brand.card, in: RoundedRectangle(cornerRadius: 14))
+                                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.muted, lineWidth: 1))
+                            }
+                        }
+                    }
+                }
+                .padding(18)
+            }
+            .background(Brand.background)
+            .navigationTitle("Fit score")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Chiudi") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+struct EventFitScoreBreakdown: Hashable {
+    let level: Int?
+    let interests: Int?
+
+    static let empty = EventFitScoreBreakdown(level: nil, interests: nil)
+
+    func value(for component: String) -> Int? {
+        switch component {
+        case "level":
+            level
+        case "interests":
+            interests
+        default:
+            nil
+        }
+    }
+}
+
+struct EventFitScoreBreakdownRow: Identifiable, Hashable {
+    let id: String
+    let label: String
+    let value: Int
+    let weight: Int?
+}
+
+struct EventFitScoreReason: Hashable {
+    let icon: String
+    let text: String
+    let component: String
 }
 
 struct EventFitScoreResult {
     let score: Int
+    let breakdown: EventFitScoreBreakdown
+    let componentWeights: EventFitScoreBreakdown
+    let interestOnly: Bool
+    let state: String
     let label: String
     let color: Color
-    let reasons: [String]
+    let reasons: [EventFitScoreReason]
     let profileIncomplete: Bool
     let hidden: Bool
 
     init(profile: Profile?, event: Event) {
+        self.init(interests: profile?.interests, selfLevel: profile?.selfLevel, hasProfile: profile != nil, event: event)
+    }
+
+    init(organizerProfile: OrganizerParticipantProfile?, event: Event) {
+        self.init(interests: organizerProfile?.interests, selfLevel: organizerProfile?.selfLevel, hasProfile: organizerProfile != nil, event: event)
+    }
+
+    private init(interests: [String]?, selfLevel: String?, hasProfile: Bool, event: Event) {
         let categories = ([event.additionalFields?.string(at: "fit_score_main_category") ?? event.category?.name] + (event.additionalFields?.stringArray(at: "fit_score_secondary_categories") ?? [])).compactMap { normalizeInterestCategory($0) }
         let hasDifficulty = event.difficulty?.nilIfBlank != nil
         let hasCategoryData = !categories.isEmpty
@@ -9576,8 +12213,12 @@ struct EventFitScoreResult {
             self = .empty
             return
         }
-        guard let profile, (profile.interests ?? []).count >= 2, (!hasDifficulty || profile.selfLevel?.nilIfBlank != nil) else {
+        guard hasProfile, (interests ?? []).count >= 2, (!hasDifficulty || selfLevel?.nilIfBlank != nil) else {
             score = 0
+            breakdown = .empty
+            componentWeights = .empty
+            interestOnly = false
+            state = "medium"
             label = ""
             color = Brand.mutedForeground
             reasons = []
@@ -9586,8 +12227,8 @@ struct EventFitScoreResult {
             return
         }
 
-        let interestScore = Self.interestScore(userInterests: profile.interests ?? [], eventCategories: categories)
-        let levelScore = Self.levelScore(userLevel: profile.selfLevel, difficulty: event.difficulty)
+        let interestScore = Self.interestScore(userInterests: interests ?? [], eventCategories: categories)
+        let levelScore = Self.levelScore(userLevel: selfLevel, difficulty: event.difficulty)
 
         guard hasDifficulty || interestScore != nil else {
             self = .empty
@@ -9602,55 +12243,81 @@ struct EventFitScoreResult {
         }
 
         score = computedScore
+        breakdown = EventFitScoreBreakdown(level: hasDifficulty ? levelScore : nil, interests: interestScore)
+        if hasDifficulty {
+            componentWeights = EventFitScoreBreakdown(level: 70, interests: 30)
+        } else {
+            componentWeights = EventFitScoreBreakdown(level: nil, interests: 100)
+        }
+        interestOnly = !hasDifficulty
         profileIncomplete = false
-        hidden = !hasDifficulty && computedScore <= 30
+        hidden = interestOnly && computedScore <= 30
         if computedScore >= 80 {
+            state = "high"
             label = "Perfetto"
             color = Brand.success
         } else if computedScore >= 60 {
+            state = "medium"
             label = "Buon match"
             color = Brand.success
         } else if computedScore >= 40 {
+            state = "low_medium"
             label = "Così così"
             color = Brand.warning
         } else {
+            state = "low"
             label = "Poco adatto"
             color = Brand.destructive
         }
 
-        var builtReasons: [String] = []
+        var builtReasons: [EventFitScoreReason] = []
         if hasDifficulty, let levelScore {
             if levelScore == 100 {
-                builtReasons.append("Il livello richiesto è in linea con il tuo profilo.")
+                builtReasons.append(EventFitScoreReason(icon: "check", text: "Il livello richiesto è in linea con il tuo profilo.", component: "level"))
             } else if levelScore == 60 {
-                builtReasons.append("L'evento è un gradino sopra il tuo livello attuale.")
+                builtReasons.append(EventFitScoreReason(icon: "warning", text: "L'evento è un gradino sopra il tuo livello attuale.", component: "level"))
             } else {
-                builtReasons.append("L'evento richiede un livello più alto del tuo.")
+                builtReasons.append(EventFitScoreReason(icon: "warning", text: "L'evento richiede un livello più alto del tuo.", component: "level"))
             }
         }
         if let interestScore {
             if interestScore >= 75 {
-                builtReasons.append("Le categorie dell'evento combaciano bene con i tuoi interessi.")
+                builtReasons.append(EventFitScoreReason(icon: "check", text: "Le categorie dell'evento combaciano bene con i tuoi interessi.", component: "interests"))
             } else if interestScore >= 50 {
-                builtReasons.append("L'evento è abbastanza vicino a ciò che ti piace fare.")
+                builtReasons.append(EventFitScoreReason(icon: "check", text: "L'evento è abbastanza vicino a ciò che ti piace fare.", component: "interests"))
             } else if interestScore >= 25 {
-                builtReasons.append("L'affinità con i tuoi interessi è solo parziale.")
+                builtReasons.append(EventFitScoreReason(icon: "warning", text: "L'affinità con i tuoi interessi è solo parziale.", component: "interests"))
             } else {
-                builtReasons.append("Le categorie dell'evento sono lontane dai tuoi interessi abituali.")
+                builtReasons.append(EventFitScoreReason(icon: "warning", text: "Le categorie dell'evento sono lontane dai tuoi interessi abituali.", component: "interests"))
             }
         }
         reasons = builtReasons
     }
 
-    static let empty = EventFitScoreResult(score: 0, label: "", color: Brand.mutedForeground, reasons: [], profileIncomplete: false, hidden: true)
+    static let empty = EventFitScoreResult(score: 0, breakdown: .empty, componentWeights: .empty, interestOnly: false, state: "medium", label: "", color: Brand.mutedForeground, reasons: [], profileIncomplete: false, hidden: true)
 
-    private init(score: Int, label: String, color: Color, reasons: [String], profileIncomplete: Bool, hidden: Bool) {
+    private init(score: Int, breakdown: EventFitScoreBreakdown, componentWeights: EventFitScoreBreakdown, interestOnly: Bool, state: String, label: String, color: Color, reasons: [EventFitScoreReason], profileIncomplete: Bool, hidden: Bool) {
         self.score = score
+        self.breakdown = breakdown
+        self.componentWeights = componentWeights
+        self.interestOnly = interestOnly
+        self.state = state
         self.label = label
         self.color = color
         self.reasons = reasons
         self.profileIncomplete = profileIncomplete
         self.hidden = hidden
+    }
+
+    var breakdownRows: [EventFitScoreBreakdownRow] {
+        [
+            breakdown.level.map {
+                EventFitScoreBreakdownRow(id: "level", label: "Livello", value: $0, weight: componentWeights.level)
+            },
+            breakdown.interests.map {
+                EventFitScoreBreakdownRow(id: "interests", label: "Interessi", value: $0, weight: componentWeights.interests)
+            }
+        ].compactMap { $0 }
     }
 
     private static func levelScore(userLevel: String?, difficulty: String?) -> Int? {
@@ -9687,6 +12354,7 @@ struct RegistrationCheckoutSheet: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
     let event: Event
+    var requestApprovalOverride = false
     let onComplete: (CheckoutResult) -> Void
     @State private var selectedMeetingPointId: String?
     @State private var selectedPriceOptionId: String?
@@ -9696,10 +12364,18 @@ struct RegistrationCheckoutSheet: View {
     @State private var validatingDiscount = false
     @State private var discountMessage: String?
     @State private var paymentChoice = "deposit"
+    @State private var carAvailability = ""
+    @State private var sportLevel = ""
+    @State private var customResponses: [String: String] = [:]
     @State private var submitting = false
+    @State private var showMembershipProfileEditor = false
 
     var priceEligibilityContext: PriceEligibilityContext {
         PriceEligibilityContext(profile: store.profile, badges: store.badges, registrations: store.myEvents)
+    }
+
+    var customFields: [CheckoutCustomField] {
+        event.checkoutCustomFields
     }
 
     var eligiblePriceOptions: [PriceOption] {
@@ -9761,6 +12437,28 @@ struct RegistrationCheckoutSheet: View {
         event.equipmentItems.contains { $0.isMandatory == true }
     }
 
+    var hasParticipationDetails: Bool {
+        !event.meetingPoints.isEmpty || event.asksCarAvailability || event.isSportCategory || !customFields.isEmpty || hasMandatoryEquipment
+    }
+
+    var hasIncompleteRequiredCustomFields: Bool {
+        customFields.contains { field in
+            field.required && customResponses[field.label]?.nilIfBlank == nil
+        }
+    }
+
+    var shouldRequestApproval: Bool {
+        requestApprovalOverride || event.requiresManualApproval
+    }
+
+    var sportLevelOptions: [(value: String, label: String)] {
+        [
+            ("Beginner", "Principiante"),
+            ("Intermediate", "Intermedio"),
+            ("Advanced", "Avanzato")
+        ]
+    }
+
     var canUseDiscount: Bool {
         !selectedOptionIsWaitlist && selectedRequiresOnlinePayment && selectedPrice > 0
     }
@@ -9805,13 +12503,16 @@ struct RegistrationCheckoutSheet: View {
 
                     Button {
                         Task {
+                            guard ensureMembershipProfileDataIfNeeded() else { return }
                             submitting = true
                             let input = RegistrationInput(
                                 meetingPointId: selectedMeetingPointId,
                                 priceOptionId: selectedPriceOptionId,
                                 asWaitlist: selectedOptionIsWaitlist,
-                                carAvailability: nil,
-                                sportLevel: nil,
+                                carAvailability: event.asksCarAvailability ? carAvailability.nilIfBlank : nil,
+                                sportLevel: event.isSportCategory ? sportLevel.nilIfBlank : nil,
+                                additionalResponses: customResponses,
+                                requestApproval: shouldRequestApproval,
                                 discountCodeId: selectedOptionIsWaitlist ? nil : appliedDiscount?.id,
                                 paymentChoice: paymentChoice
                             )
@@ -9831,7 +12532,7 @@ struct RegistrationCheckoutSheet: View {
                         }
                     }
                     .buttonStyle(PrimaryButtonStyle())
-                    .disabled(submitting || !event.acceptsRegistrations || selectedOptionIsUnavailable || (!event.meetingPoints.isEmpty && selectedMeetingPointId == nil) || (!eligiblePriceOptions.isEmpty && selectedPriceOptionId == nil) || hasUnappliedDiscountCode || (hasMandatoryEquipment && !equipmentConfirmed))
+                    .disabled(submitting || !event.acceptsRegistrations || selectedOptionIsUnavailable || (!event.meetingPoints.isEmpty && selectedMeetingPointId == nil) || (!eligiblePriceOptions.isEmpty && selectedPriceOptionId == nil) || hasUnappliedDiscountCode || hasIncompleteRequiredCustomFields || (hasMandatoryEquipment && !equipmentConfirmed))
                 }
                 .padding(20)
             }
@@ -9851,12 +12552,19 @@ struct RegistrationCheckoutSheet: View {
             .onAppear {
                 selectDefaultPriceOptionIfNeeded()
             }
+            .sheet(isPresented: $showMembershipProfileEditor) {
+                if let profile = store.profile {
+                    ProfileEditSheet(profile: profile)
+                        .presentationDetents([.fraction(0.86), .large])
+                        .presentationDragIndicator(.hidden)
+                }
+            }
         }
     }
 
     @ViewBuilder
     private var participationSection: some View {
-        if !event.meetingPoints.isEmpty || hasMandatoryEquipment {
+        if hasParticipationDetails {
             VStack(alignment: .leading, spacing: 14) {
                 CheckoutSectionTitle("Dettagli partecipazione")
 
@@ -9877,10 +12585,81 @@ struct RegistrationCheckoutSheet: View {
                     }
                 }
 
+                ForEach(customFields) { field in
+                    CheckoutCustomFieldView(field: field, responses: $customResponses)
+                }
+
+                if event.asksCarAvailability {
+                    carAvailabilitySection
+                }
+
+                if event.isSportCategory {
+                    sportLevelSection
+                }
+
                 if hasMandatoryEquipment {
                     equipmentConfirmationRow
                 }
             }
+        }
+    }
+
+    private var carAvailabilitySection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Saresti disposto a prendere la macchina?")
+                .font(.headline.weight(.bold))
+                .foregroundStyle(Brand.foreground)
+            SelectionRow(selected: carAvailability == "yes", title: "Si", subtitle: "Posso mettere a disposizione l'auto.", trailing: "") {
+                carAvailability = "yes"
+            }
+            SelectionRow(selected: carAvailability == "prefer_not", title: "Preferirei di no", subtitle: "Posso valutare se necessario.", trailing: "") {
+                carAvailability = "prefer_not"
+            }
+            SelectionRow(selected: carAvailability == "no_car", title: "Non sono automunito", subtitle: "Partecipo senza auto.", trailing: "") {
+                carAvailability = "no_car"
+            }
+        }
+    }
+
+    private var sportLevelSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Livello sportivo")
+                .font(.headline.weight(.bold))
+                .foregroundStyle(Brand.foreground)
+
+            HStack(spacing: 8) {
+                ForEach(sportLevelOptions, id: \.value) { option in
+                    Button {
+                        sportLevel = sportLevel == option.value ? "" : option.value
+                    } label: {
+                        Text(option.label)
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(sportLevel == option.value ? .white : Brand.primary)
+                            .padding(.horizontal, 12)
+                            .frame(height: 34)
+                            .background(sportLevel == option.value ? Brand.primary : Brand.primary.opacity(0.08), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Image(systemName: "figure.run")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Brand.inputMutedForeground)
+                TextField("Oppure inserisci il livello personalizzato", text: Binding(
+                    get: {
+                        sportLevelOptions.contains { $0.value == sportLevel } ? "" : sportLevel
+                    },
+                    set: { sportLevel = $0 }
+                ))
+                .foregroundStyle(Brand.inputForeground)
+                .tint(Brand.primary)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 46)
+            .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Brand.inputBorder, lineWidth: 1))
         }
     }
 
@@ -9965,6 +12744,36 @@ struct RegistrationCheckoutSheet: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Brand.success.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
             .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.success.opacity(0.28), lineWidth: 1))
+        } else if let profile = store.profile, !profile.hasCompleteMembershipProfile {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: "person.text.rectangle")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(Brand.warning)
+                        .frame(width: 28)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Completa i dati tessera")
+                            .font(.headline.weight(.bold))
+                            .foregroundStyle(Brand.foreground)
+                        Text("Mancano: \(profile.missingMembershipFieldLabels.joined(separator: ", ")).")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(Brand.mutedForeground)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                Button {
+                    showMembershipProfileEditor = true
+                } label: {
+                    Label("Completa dati profilo", systemImage: "pencil")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(CheckoutSecondaryButtonStyle(height: 42))
+            }
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Brand.warning.opacity(0.10), in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.warning.opacity(0.30), lineWidth: 1))
         } else {
             Text("La tessera verrà aggiunta al checkout se richiesta.")
                 .font(.subheadline)
@@ -10064,7 +12873,12 @@ struct RegistrationCheckoutSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             CheckoutSectionTitle("Riepilogo")
 
-            if selectedOptionIsWaitlist {
+            if shouldRequestApproval {
+                CheckoutSummaryCard(title: "Approvazione richiesta", tone: .warning) {
+                    SummaryRow("Stato iniziale", "Da approvare")
+                    SummaryRow("Pagamento oggi", "€0", bold: true)
+                }
+            } else if selectedOptionIsWaitlist {
                 CheckoutSummaryCard(title: "Lista d'attesa", tone: .warning) {
                     SummaryRow("Pagamento oggi", "€0", bold: true)
                     SummaryRow("Opzione", selectedPriceOption?.displayName ?? "Partecipazione")
@@ -10098,16 +12912,47 @@ struct RegistrationCheckoutSheet: View {
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
             }
+
+            if let ctaHelperText {
+                Text(ctaHelperText)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Brand.mutedForeground)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+            }
         }
     }
 
     private var ctaTitle: String {
         if !event.acceptsRegistrations { return "Iscrizioni chiuse" }
         if selectedOptionIsUnavailable { return "Opzione sold out" }
+        if shouldRequestApproval { return "Invia richiesta di iscrizione" }
         if selectedOptionIsWaitlist { return "Entra in lista d'attesa" }
         if selectedPaymentType == "deposit" { return paymentChoice == "full" ? "Paga tutto e iscriviti" : "Paga acconto e iscriviti" }
         if selectedRequiresOnlinePayment || store.profile?.hasActiveMembership != true { return "Paga e completa l'iscrizione" }
         return "Conferma iscrizione"
+    }
+
+    private var ctaHelperText: String? {
+        if shouldRequestApproval { return "La richiesta verra inviata agli organizzatori per l'approvazione." }
+        if selectedOptionIsWaitlist { return "Entrerai in lista d'attesa: nessun pagamento viene avviato ora." }
+        if selectedPaymentType == "deposit", paymentChoice == "deposit" { return nil }
+        if selectedRequiresOnlinePayment || store.profile?.hasActiveMembership != true { return "Verrai reindirizzato al pagamento sicuro per completare l'iscrizione." }
+        return "L'iscrizione verra confermata subito."
+    }
+
+    private var needsMembershipProfileData: Bool {
+        store.profile?.hasActiveMembership != true && !selectedOptionIsWaitlist
+    }
+
+    private func ensureMembershipProfileDataIfNeeded() -> Bool {
+        guard needsMembershipProfileData,
+              let profile = store.profile,
+              !profile.hasCompleteMembershipProfile else {
+            return true
+        }
+        showMembershipProfileEditor = true
+        return false
     }
 
     private func selectDefaultPriceOptionIfNeeded() {
@@ -10150,6 +12995,82 @@ struct RegistrationCheckoutSheet: View {
         appliedDiscount = nil
         discountCode = ""
         discountMessage = nil
+    }
+}
+
+struct CheckoutCustomFieldView: View {
+    let field: CheckoutCustomField
+    @Binding var responses: [String: String]
+
+    private var value: Binding<String> {
+        Binding {
+            responses[field.label] ?? ""
+        } set: { newValue in
+            responses[field.label] = newValue
+        }
+    }
+
+    private var displayLabel: String {
+        field.required ? "\(field.label) *" : field.label
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(displayLabel)
+                .font(.headline.weight(.bold))
+                .foregroundStyle(Brand.foreground)
+
+            if field.type == "dropdown" || field.type == "select" {
+                dropdownField
+            } else {
+                textInputField
+                    .keyboardType(field.type == "number" ? .decimalPad : .default)
+            }
+        }
+    }
+
+    private var textInputField: some View {
+        HStack(spacing: 10) {
+            Image(systemName: field.type == "number" ? "number" : "text.cursor")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Brand.inputMutedForeground)
+            TextField(field.placeholder.nilIfBlank ?? field.label, text: value)
+                .foregroundStyle(Brand.inputForeground)
+                .tint(Brand.primary)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 46)
+        .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Brand.inputBorder, lineWidth: 1))
+    }
+
+    private var dropdownField: some View {
+        Menu {
+            ForEach(field.options, id: \.self) { option in
+                Button(option) {
+                    responses[field.label] = option
+                }
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(Brand.inputMutedForeground)
+                Text(responses[field.label]?.nilIfBlank ?? "Seleziona...")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(responses[field.label]?.nilIfBlank == nil ? Brand.inputMutedForeground : Brand.inputForeground)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Image(systemName: "chevron.down")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(Brand.inputMutedForeground)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 46)
+            .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Brand.inputBorder, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .disabled(field.options.isEmpty)
     }
 }
 
@@ -10386,7 +13307,7 @@ struct CheckoutProgressOverlay: View {
                 Text("Sto preparando l'iscrizione")
                     .font(.headline.weight(.bold))
                     .foregroundStyle(Brand.foreground)
-                Text("Creo il posto e il checkout sicuro.")
+                Text("Invio i dati e aggiorno i tuoi eventi.")
                     .font(.caption)
                     .foregroundStyle(Brand.mutedForeground)
             }
@@ -10401,6 +13322,7 @@ struct CancelRegistrationSheet: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
     let event: Event
+    let registration: Registration?
     @Binding var feedback: AppFeedback?
     @State private var isCancelling = false
 
@@ -10416,7 +13338,16 @@ struct CancelRegistrationSheet: View {
                 Text("Annullare l'iscrizione?")
                     .font(.system(.title3, design: .rounded, weight: .bold))
                     .foregroundStyle(Brand.foreground)
-                Text("La politica di rimborso segue le regole dell'evento. Aggiorniamo subito i tuoi eventi appena l'operazione è conclusa.")
+                Text(event.title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Brand.foreground)
+                    .multilineTextAlignment(.center)
+                Text(cancellationDialogMessage)
+                    .font(.caption)
+                    .foregroundStyle(Brand.mutedForeground)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 4)
+                Text("Aggiorniamo subito i tuoi eventi appena l'operazione è conclusa.")
                     .font(.subheadline)
                     .foregroundStyle(Brand.mutedForeground)
                     .multilineTextAlignment(.center)
@@ -10448,6 +13379,13 @@ struct CancelRegistrationSheet: View {
         .interactiveDismissDisabled(isCancelling)
     }
 
+    private var cancellationDialogMessage: String {
+        guard let registration else {
+            return CancellationPolicyInfo(raw: event.cancellationPolicy).description
+        }
+        return registration.cancellationDialogMessage(for: event)
+    }
+
     private func cancel() async {
         isCancelling = true
         if await store.cancelRegistration(eventId: event.id) {
@@ -10463,10 +13401,10 @@ struct CancelRegistrationSheet: View {
 struct MyEventsView: View {
     @EnvironmentObject private var store: AppStore
     @Binding var showAuth: Bool
-    @Binding var routedEventId: String?
+    @Binding var routedEvent: EventNavigationTarget?
     @State private var tab = 0
     @State private var selectedEvent: Event?
-    @State private var routedEvent: EventNavigationTarget?
+    @State private var presentedRoutedEvent: EventNavigationTarget?
 
     var latestRegistrations: [Registration] {
         store.myEvents.latestPerEvent()
@@ -10477,7 +13415,7 @@ struct MyEventsView: View {
     }
 
     var past: [Registration] {
-        latestRegistrations.filter { $0.isCancelled || ($0.event?.isPastOrCancelled ?? false) }
+        latestRegistrations.filter { $0.isActive && ($0.event?.isPastOrCancelled ?? false) }
     }
 
     var body: some View {
@@ -10505,9 +13443,24 @@ struct MyEventsView: View {
                                     .pickerStyle(.segmented)
 
                                     if tab == 0 {
-                                        EventRegistrationList(registrations: upcoming, selectedEvent: $selectedEvent)
+                                        EventRegistrationList(
+                                            registrations: upcoming,
+                                            selectedEvent: $selectedEvent,
+                                            showActions: true,
+                                            emptyTitle: "Nessun evento in programma",
+                                            emptyMessage: "Non hai ancora iscrizioni future.",
+                                            emptyActionTitle: "Scopri eventi"
+                                        ) {
+                                            store.homeDiscoveryRequest = HomeDiscoveryRequest()
+                                        }
                                     } else if tab == 1 {
-                                        EventRegistrationList(registrations: past, selectedEvent: $selectedEvent)
+                                        EventRegistrationList(
+                                            registrations: past,
+                                            selectedEvent: $selectedEvent,
+                                            isPast: true,
+                                            emptyTitle: "Nessun evento passato",
+                                            emptyMessage: "Qui troverai gli eventi a cui hai partecipato."
+                                        )
                                     } else {
                                         SavedEventList(savedEvents: store.savedEvents, selectedEvent: $selectedEvent)
                                     }
@@ -10524,65 +13477,429 @@ struct MyEventsView: View {
             .navigationDestination(item: $selectedEvent) { event in
                 EventDetailView(eventId: event.id, showAuth: $showAuth)
             }
-            .navigationDestination(item: $routedEvent) { target in
-                EventDetailView(eventId: target.id, showAuth: $showAuth)
+            .navigationDestination(item: $presentedRoutedEvent) { target in
+                EventDetailView(eventId: target.eventId, showAuth: $showAuth, openParticipantsOnAppear: target.opensParticipants)
             }
             .refreshable { await store.refreshUserData() }
             .onAppear {
                 openRoutedEventIfNeeded()
             }
-            .onChange(of: routedEventId) { _, _ in
+            .onChange(of: routedEvent) { _, _ in
                 openRoutedEventIfNeeded()
             }
         }
     }
 
     private func openRoutedEventIfNeeded() {
-        guard let eventId = routedEventId?.nilIfBlank else { return }
-        routedEvent = EventNavigationTarget(id: eventId)
-        routedEventId = nil
+        guard let target = routedEvent else { return }
+        presentedRoutedEvent = target
+        routedEvent = nil
     }
 }
 
 struct EventRegistrationList: View {
     let registrations: [Registration]
     @Binding var selectedEvent: Event?
+    var showActions = false
+    var isPast = false
+    var emptyTitle = "Nessun evento"
+    var emptyMessage = "Quando ti iscrivi a una scampagnata la troverai qui."
+    var emptyActionTitle: String?
+    var emptyAction: (() -> Void)?
+
+    init(
+        registrations: [Registration],
+        selectedEvent: Binding<Event?>,
+        showActions: Bool = false,
+        isPast: Bool = false,
+        emptyTitle: String = "Nessun evento",
+        emptyMessage: String = "Quando ti iscrivi a una scampagnata la troverai qui.",
+        emptyActionTitle: String? = nil,
+        emptyAction: (() -> Void)? = nil
+    ) {
+        self.registrations = registrations
+        self._selectedEvent = selectedEvent
+        self.showActions = showActions
+        self.isPast = isPast
+        self.emptyTitle = emptyTitle
+        self.emptyMessage = emptyMessage
+        self.emptyActionTitle = emptyActionTitle
+        self.emptyAction = emptyAction
+    }
 
     var body: some View {
         if registrations.isEmpty {
-            EmptyState(icon: "calendar", title: "Nessun evento", message: "Quando ti iscrivi a una scampagnata la troverai qui.")
+            VStack(spacing: 14) {
+                EmptyState(icon: "calendar", title: emptyTitle, message: emptyMessage)
+                if let emptyActionTitle, let emptyAction {
+                    Button(emptyActionTitle, action: emptyAction)
+                        .buttonStyle(SecondaryButtonStyle())
+                        .padding(.horizontal, 12)
+                }
+            }
         } else {
             LazyVStack(spacing: 12) {
                 ForEach(registrations) { registration in
-                    if let event = registration.event {
-                        Button {
-                            selectedEvent = event
-                        } label: {
-                            HStack(spacing: 12) {
-                                RemoteImage(urlString: event.imageUrl)
-                                    .frame(width: 76, height: 76)
-                                    .clipShape(RoundedRectangle(cornerRadius: 14))
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text(event.title)
-                                        .font(.subheadline.weight(.bold))
-                                        .foregroundStyle(Brand.foreground)
-                                        .lineLimit(2)
-                                    Text("\(formatDate(event.date)) · \(event.displayLocation)")
-                                        .font(.caption)
-                                        .foregroundStyle(Brand.mutedForeground)
-                                        .lineLimit(1)
-                                    BadgeLabel(text: registration.statusLabel, color: registration.statusStyle.background, foreground: registration.statusStyle.foreground)
-                                }
-                                Spacer()
-                            }
-                            .padding(12)
-                            .background(Brand.card, in: RoundedRectangle(cornerRadius: 18))
-                        }
-                        .buttonStyle(.plain)
-                    }
+                    EventRegistrationCard(
+                        registration: registration,
+                        selectedEvent: $selectedEvent,
+                        showActions: showActions,
+                        isPast: isPast
+                    )
                 }
             }
         }
+    }
+}
+
+struct EventRegistrationCard: View {
+    @EnvironmentObject private var store: AppStore
+    let registration: Registration
+    @Binding var selectedEvent: Event?
+    var showActions = false
+    var isPast = false
+    @State private var showShare = false
+    @State private var showCalendar = false
+    @State private var showCancelConfirm = false
+    @State private var showEdit = false
+    @State private var feedback: AppFeedback?
+    @State private var activeCheckout: ActiveCheckout?
+    @State private var paymentLoading = false
+
+    private var event: Event? {
+        registration.event
+    }
+
+    private var shouldShowUtilityActions: Bool {
+        (showActions || isPast) && registration.normalizedStatus != "cancelled" && event != nil
+    }
+
+    private var canCancel: Bool {
+        showActions && registration.canCancel
+    }
+
+    private var canCompletePayment: Bool {
+        guard showActions, let event, registration.normalizedStatus != "cancelled" else { return false }
+        return registration.canResumePayment(in: event)
+    }
+
+    private var canEditDetails: Bool {
+        guard showActions, let event, registration.normalizedStatus != "cancelled" else { return false }
+        let hasEditableFields = !event.meetingPoints.isEmpty || event.asksCarAvailability || !event.checkoutCustomFields.isEmpty
+        guard hasEditableFields else { return false }
+        return event.calendarStartDate.map { $0 > Date() } ?? false
+    }
+
+    var body: some View {
+        if let event {
+            VStack(spacing: 0) {
+                Button {
+                    selectedEvent = event
+                } label: {
+                    HStack(spacing: 12) {
+                        RemoteImage(urlString: event.imageUrl)
+                            .frame(width: 76, height: 76)
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(alignment: .top, spacing: 8) {
+                                Text(event.title)
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundStyle(Brand.foreground)
+                                    .lineLimit(2)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                let statusStyle = registration.displayStatusStyle(in: event)
+                                BadgeLabel(text: registration.displayStatusLabel(in: event), color: statusStyle.background, foreground: statusStyle.foreground)
+                            }
+                            Label(dateTimeText(for: event), systemImage: "calendar")
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedForeground)
+                                .lineLimit(1)
+                            Label(event.displayLocation, systemImage: "mappin")
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedForeground)
+                                .lineLimit(1)
+                            if let meetingPoint = registration.meetingPoint {
+                                Label([meetingPoint.name, meetingPoint.time.map { String($0.prefix(5)) }].compactMap { $0?.nilIfBlank }.joined(separator: " · "), systemImage: "clock")
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(Brand.secondary)
+                                    .lineLimit(1)
+                            }
+                            if let priceLine = registration.priceOptionLine(in: event) {
+                                Text(priceLine)
+                                    .font(.caption2.weight(.medium))
+                                    .foregroundStyle(Brand.mutedForeground)
+                                    .lineLimit(1)
+                            }
+                            if let paymentLine = registration.paymentProgressLine {
+                                Text(paymentLine)
+                                    .font(.caption2)
+                                    .foregroundStyle(Brand.mutedForeground)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                    .padding(12)
+                }
+                .buttonStyle(.plain)
+
+                if shouldShowUtilityActions {
+                    Divider()
+                        .padding(.horizontal, 12)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            MyEventActionButton(icon: "square.and.arrow.up", title: "Condividi") {
+                                showShare = true
+                            }
+                            MyEventActionButton(icon: "calendar.badge.plus", title: "Calendario") {
+                                showCalendar = true
+                            }
+                            if canCompletePayment {
+                                MyEventActionButton(icon: "bolt.fill", title: registration.resumeActionTitle(in: event), tint: Brand.primary, isLoading: paymentLoading, isDisabled: paymentLoading) {
+                                    Task { await resumePayment() }
+                                }
+                            }
+                            if canEditDetails {
+                                MyEventActionButton(icon: "square.and.pencil", title: "Modifica") {
+                                    showEdit = true
+                                }
+                            }
+                            Spacer(minLength: 0)
+                            if canCancel {
+                                MyEventActionButton(icon: "xmark", title: "Annulla", tint: Brand.destructive) {
+                                    showCancelConfirm = true
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                    }
+                }
+            }
+            .background(Brand.card, in: RoundedRectangle(cornerRadius: 18))
+            .clipShape(RoundedRectangle(cornerRadius: 18))
+            .sheet(isPresented: $showShare) {
+                ShareSheet(activityItems: shareItems(for: event))
+                    .presentationDetents([.medium])
+            }
+            .sheet(isPresented: $showCalendar) {
+                CalendarEventEditView(event: event)
+            }
+            .sheet(isPresented: $showCancelConfirm) {
+                CancelRegistrationSheet(event: event, registration: registration, feedback: $feedback)
+                    .presentationDetents([.height(360)])
+            }
+            .sheet(isPresented: $showEdit) {
+                EditRegistrationDetailsSheet(event: event, registration: registration) {
+                    feedback = AppFeedback(title: "Iscrizione aggiornata", message: "I dettagli di partecipazione sono stati salvati.", icon: "checkmark.seal.fill", tone: .success)
+                }
+                .presentationDetents([.large])
+            }
+            .sheet(item: $feedback) { feedback in
+                AppFeedbackSheet(feedback: feedback)
+                    .presentationDetents([.height(300)])
+            }
+            .fullScreenCover(item: $activeCheckout) { checkout in
+                PaymentAuthenticationView(checkout: checkout) { result in
+                    feedback = result
+                }
+            }
+        }
+    }
+
+    private func shareItems(for event: Event) -> [Any] {
+        var items: [Any] = ["\(event.title)\n\(formatLongDate(event.date))"]
+        if let url = event.webURL { items.append(url) }
+        return items
+    }
+
+    private func dateTimeText(for event: Event) -> String {
+        var parts: [String] = []
+        if let date = formatDate(event.date).nilIfBlank {
+            parts.append(date)
+        }
+        if let time = event.time.map({ String($0.prefix(5)) })?.nilIfBlank {
+            parts.append(time)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func resumePayment() async {
+        guard !paymentLoading else { return }
+        guard let event else { return }
+        paymentLoading = true
+        defer { paymentLoading = false }
+
+        if registration.waitlistSpotAvailable(in: event), !registration.requiresOnlinePayment(in: event) {
+            if await store.completeWaitlistBooking(for: registration) {
+                feedback = AppFeedback(title: "Prenotazione completata", message: "Il posto è tuo. Abbiamo aggiornato i tuoi eventi.", icon: "checkmark.seal.fill", tone: .success)
+            }
+            return
+        }
+
+        if let result = await store.resumeCheckout(for: registration) {
+            if result.free {
+                feedback = AppFeedback(title: "Prenotazione completata", message: "Abbiamo aggiornato i tuoi eventi.", icon: "checkmark.seal.fill", tone: .success)
+            } else if let url = result.url {
+                activeCheckout = ActiveCheckout(url: url, sessionId: result.sessionId, kind: result.kind)
+            }
+        }
+    }
+}
+
+struct EditRegistrationDetailsSheet: View {
+    @EnvironmentObject private var store: AppStore
+    @Environment(\.dismiss) private var dismiss
+    let event: Event
+    let registration: Registration
+    let onSaved: () -> Void
+    @State private var selectedMeetingPointId = ""
+    @State private var carAvailability = ""
+    @State private var customResponses: [String: String] = [:]
+    @State private var saving = false
+
+    private var customFields: [CheckoutCustomField] {
+        event.checkoutCustomFields
+    }
+
+    private var hasEditableFields: Bool {
+        !event.meetingPoints.isEmpty || event.asksCarAvailability || !customFields.isEmpty
+    }
+
+    private var hasIncompleteRequiredCustomFields: Bool {
+        customFields.contains { field in
+            field.required && customResponses[field.label]?.nilIfBlank == nil
+        }
+    }
+
+    private var saveDisabled: Bool {
+        saving || !hasEditableFields || (!event.meetingPoints.isEmpty && selectedMeetingPointId.nilIfBlank == nil) || hasIncompleteRequiredCustomFields
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Modifica iscrizione")
+                            .font(.system(.title2, design: .rounded, weight: .bold))
+                            .foregroundStyle(Brand.foreground)
+                        Text("Aggiorna solo i dettagli di partecipazione configurati per questo evento.")
+                            .font(.subheadline)
+                            .foregroundStyle(Brand.mutedForeground)
+                    }
+
+                    if !event.meetingPoints.isEmpty {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Punto di ritrovo *")
+                                .font(.headline.weight(.bold))
+                                .foregroundStyle(Brand.foreground)
+                            ForEach(event.meetingPoints) { point in
+                                CheckoutMeetingPointRow(point: point, selected: selectedMeetingPointId == point.id) {
+                                    selectedMeetingPointId = point.id
+                                }
+                            }
+                        }
+                    }
+
+                    if event.asksCarAvailability {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Saresti disposto a prendere la macchina?")
+                                .font(.headline.weight(.bold))
+                                .foregroundStyle(Brand.foreground)
+                            SelectionRow(selected: carAvailability == "yes", title: "Si", subtitle: "Posso mettere a disposizione l'auto.", trailing: "") {
+                                carAvailability = "yes"
+                            }
+                            SelectionRow(selected: carAvailability == "prefer_not", title: "Preferirei di no", subtitle: "Posso valutare se necessario.", trailing: "") {
+                                carAvailability = "prefer_not"
+                            }
+                            SelectionRow(selected: carAvailability == "no_car", title: "Non sono automunito", subtitle: "Partecipo senza auto.", trailing: "") {
+                                carAvailability = "no_car"
+                            }
+                        }
+                    }
+
+                    ForEach(customFields) { field in
+                        CheckoutCustomFieldView(field: field, responses: $customResponses)
+                    }
+
+                    Button {
+                        Task { await save() }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if saving {
+                                ProgressView()
+                                    .tint(.white)
+                            }
+                            Text(saving ? "Salvataggio..." : "Salva modifiche")
+                        }
+                    }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .disabled(saveDisabled)
+                }
+                .padding(20)
+            }
+            .background(Brand.background)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Chiudi") { dismiss() }
+                        .disabled(saving)
+                }
+            }
+            .onAppear {
+                selectedMeetingPointId = registration.meetingPointId ?? registration.meetingPoint?.id ?? ""
+                carAvailability = registration.carAvailability ?? ""
+                customResponses = registration.additionalResponses ?? [:]
+            }
+            .interactiveDismissDisabled(saving)
+        }
+    }
+
+    private func save() async {
+        guard !saving else { return }
+        saving = true
+        let ok = await store.updateRegistrationDetails(
+            registrationId: registration.id,
+            event: event,
+            meetingPointId: event.meetingPoints.isEmpty ? nil : selectedMeetingPointId.nilIfBlank,
+            carAvailability: event.asksCarAvailability ? carAvailability.nilIfBlank : nil,
+            additionalResponses: customResponses
+        )
+        saving = false
+        if ok {
+            onSaved()
+            dismiss()
+        }
+    }
+}
+
+struct MyEventActionButton: View {
+    let icon: String
+    let title: String
+    var tint: Color = Brand.mutedForeground
+    var isLoading = false
+    var isDisabled = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(tint)
+                } else {
+                    Image(systemName: icon)
+                }
+                Text(title)
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(isDisabled ? Brand.mutedForeground : tint)
+            .padding(.horizontal, 12)
+            .frame(height: 34)
+            .background((isDisabled ? Brand.mutedForeground : tint).opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
     }
 }
 
@@ -10596,13 +13913,102 @@ struct SavedEventList: View {
         } else {
             LazyVStack(spacing: 12) {
                 ForEach(savedEvents) { saved in
-                    if let event = saved.event {
-                        EventCard(event: event)
-                            .onTapGesture { selectedEvent = event }
+                    SavedEventCard(savedEvent: saved) { event in
+                        selectedEvent = event
                     }
                 }
             }
         }
+    }
+}
+
+struct SavedEventCard: View {
+    @EnvironmentObject private var store: AppStore
+    let savedEvent: SavedEvent
+    let onOpen: (Event) -> Void
+    @State private var removing = false
+
+    private var event: Event? {
+        savedEvent.event
+    }
+
+    var body: some View {
+        if let event {
+            HStack(spacing: 12) {
+                Button {
+                    onOpen(event)
+                } label: {
+                    HStack(spacing: 12) {
+                        RemoteImage(urlString: event.imageUrl)
+                            .frame(width: 76, height: 76)
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                            .saturation(event.isPastOrCancelled ? 0.35 : 1)
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(spacing: 8) {
+                                Text(event.title)
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundStyle(Brand.foreground)
+                                    .lineLimit(2)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                EventCardPillLabel(
+                                    text: savedStatusText(for: event),
+                                    color: savedStatusColor(for: event).opacity(0.12),
+                                    foreground: savedStatusColor(for: event)
+                                )
+                            }
+                            Label(formatDate(event.date), systemImage: "calendar")
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedForeground)
+                                .lineLimit(1)
+                            Label(event.displayLocation, systemImage: "mappin")
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedForeground)
+                                .lineLimit(1)
+                            Text(event.displayPrice(profile: store.profile, badges: store.badges, registrations: store.myEvents))
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(Brand.foreground)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    Task { await removeSaved(event) }
+                } label: {
+                    if removing {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(Brand.primary)
+                            .frame(width: 32, height: 32)
+                    } else {
+                        Image(systemName: "bookmark.fill")
+                            .font(.headline.weight(.semibold))
+                            .foregroundStyle(Brand.primary)
+                            .frame(width: 32, height: 32)
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(removing)
+            }
+            .padding(12)
+            .background(Brand.card, in: RoundedRectangle(cornerRadius: 18))
+        }
+    }
+
+    private func removeSaved(_ event: Event) async {
+        guard !removing else { return }
+        removing = true
+        await store.toggleSave(eventId: event.id)
+        removing = false
+    }
+
+    private func savedStatusText(for event: Event) -> String {
+        event.isPastOrCancelled ? "Passato" : "Disponibile"
+    }
+
+    private func savedStatusColor(for event: Event) -> Color {
+        event.isPastOrCancelled ? Brand.destructive : Brand.success
     }
 }
 
@@ -10679,12 +14085,15 @@ private enum OrganizerEventBoardFilter: String, CaseIterable, Identifiable {
 struct OrganizerDashboardView: View {
     @EnvironmentObject private var store: AppStore
     @Binding var showAuth: Bool
+    @Binding var routedRoute: OrganizerDashboardRoute?
     @State private var tab = 0
     @State private var eventFilter: OrganizerEventBoardFilter = .published
     @State private var selectedEvent: Event?
     @State private var editorRoute: OrganizerEditorRoute?
     @State private var deleteCandidate: Event?
     @State private var deletingEventId: String?
+    @State private var dashboardRegistrations: [OrganizerRegistration] = []
+    @State private var loadingDashboardRegistrations = false
 
     private var upcomingEvents: [Event] {
         store.organizerEvents.filter(\.organizerIsPublishedUpcoming)
@@ -10714,6 +14123,10 @@ struct OrganizerDashboardView: View {
         store.organizerEvents.reduce(0) { $0 + ($1.spotsTaken ?? 0) }
     }
 
+    private var dashboardPastStats: [OrganizerDashboardPastEventStat] {
+        OrganizerDashboardPastEventStat.stats(events: pastEvents, registrations: dashboardRegistrations)
+    }
+
     private func count(for filter: OrganizerEventBoardFilter) -> Int {
         switch filter {
         case .published: upcomingEvents.count
@@ -10729,19 +14142,20 @@ struct OrganizerDashboardView: View {
                 if !store.isAuthenticated {
                     SignedOutPrompt(title: "Organizzatore", message: "Accedi con un profilo abilitato per gestire gli eventi.", showAuth: $showAuth)
                 } else if !store.isOrganizer {
-                    EmptyState(icon: "lock.fill", title: "Accesso non abilitato", message: "Questa sezione compare solo per gli utenti admin o organizer.")
+                    EmptyState(icon: "lock.fill", title: "Accesso non abilitato", message: "Questa sezione compare solo per gli utenti organizer.")
                         .padding(.horizontal, 20)
                 } else {
                     GeometryReader { proxy in
                         ScrollView {
                             VStack(alignment: .leading, spacing: 16) {
-                                OrganizerHeader(isAdmin: store.isAdmin)
+                                OrganizerHeader {
+                                    editorRoute = OrganizerEditorRoute(mode: .create)
+                                }
 
                                 OrganizerDashboardTabBar(
                                     selection: $tab,
                                     upcomingCount: upcomingEvents.count,
-                                    historyCount: pastEvents.count,
-                                    isAdmin: store.isAdmin
+                                    historyCount: pastEvents.count
                                 )
 
                                 switch tab {
@@ -10755,13 +14169,6 @@ struct OrganizerDashboardView: View {
                                         OrganizerEventBoardFilterBar(selection: $eventFilter) { filter in
                                             count(for: filter)
                                         }
-                                        Button {
-                                            editorRoute = OrganizerEditorRoute(mode: .create)
-                                        } label: {
-                                            Label("Nuovo evento", systemImage: "plus")
-                                                .frame(maxWidth: .infinity)
-                                        }
-                                        .buttonStyle(SecondaryButtonStyle())
                                         OrganizerEventList(
                                             events: filteredBoardEvents,
                                             emptyTitle: eventFilter.emptyTitle,
@@ -10773,31 +14180,21 @@ struct OrganizerDashboardView: View {
                                         )
                                     }
                                 case 1:
-                                    OrganizerEventList(
-                                            events: pastEvents,
-                                            emptyTitle: "Nessun evento passato",
-                                            emptyMessage: "Gli eventi passati compariranno qui.",
-                                            selectedEvent: $selectedEvent,
-                                            onDuplicate: { event in editorRoute = OrganizerEditorRoute(mode: .duplicate(event.id)) },
-                                            onShare: shareEvent,
-                                            onDelete: { event in deleteCandidate = event }
-                                        )
+                                    OrganizerPastEventList(
+                                        stats: dashboardPastStats,
+                                        loading: loadingDashboardRegistrations,
+                                        selectedEvent: $selectedEvent
+                                    )
                                 case 2:
-                                    OrganizerDashboardAnalytics(events: store.organizerEvents)
+                                    OrganizerDashboardAnalytics(
+                                        events: store.organizerEvents,
+                                        registrations: dashboardRegistrations,
+                                        loading: loadingDashboardRegistrations
+                                    )
                                 case 3:
                                     OrganizerProposalsPanel { proposal in
                                         editorRoute = OrganizerEditorRoute(mode: .proposal(proposal))
                                     }
-                                case 4:
-                                    OrganizerDiscountCodesPanel()
-                                case 5:
-                                    OrganizerMissionsPanel()
-                                case 6:
-                                    OrganizerIssuesPanel()
-                                case 7:
-                                    OrganizerBroadcastTemplatesPanel()
-                                case 8:
-                                    OrganizerIOSPushBroadcastPanel()
                                 default:
                                     EmptyView()
                                 }
@@ -10840,11 +14237,18 @@ struct OrganizerDashboardView: View {
                 Text("L'evento verra eliminato definitivamente insieme ai dati gestionali collegati. Operazione non reversibile.")
             }
             .task {
-                await store.loadOrganizerEvents(reportingErrors: false)
+                await loadDashboardData(reportingErrors: false)
+                openRoutedRouteIfNeeded()
             }
             .refreshable {
                 await store.refreshUserData()
-                await store.loadOrganizerEvents()
+                await loadDashboardData(reportingErrors: true)
+            }
+            .onChange(of: routedRoute) { _, _ in
+                openRoutedRouteIfNeeded()
+            }
+            .onChange(of: store.organizerEvents) { _, _ in
+                openRoutedRouteIfNeeded()
             }
         }
     }
@@ -10854,197 +14258,327 @@ struct OrganizerDashboardView: View {
         UIPasteboard.general.string = url.absoluteString
         store.errorMessage = "Link evento copiato negli appunti."
     }
+
+    @MainActor
+    private func loadDashboardData(reportingErrors: Bool) async {
+        await store.loadOrganizerEvents(reportingErrors: reportingErrors)
+        await loadDashboardRegistrations(reportingErrors: reportingErrors)
+    }
+
+    @MainActor
+    private func loadDashboardRegistrations(reportingErrors: Bool) async {
+        let ids = store.organizerEvents.map(\.id)
+        guard !ids.isEmpty else {
+            dashboardRegistrations = []
+            return
+        }
+        loadingDashboardRegistrations = true
+        dashboardRegistrations = await store.fetchOrganizerRegistrations(eventIds: ids, reportingErrors: reportingErrors)
+        loadingDashboardRegistrations = false
+    }
+
+    private func openRoutedRouteIfNeeded() {
+        guard let route = routedRoute else { return }
+        tab = 0
+
+        switch route.destination {
+        case .create:
+            editorRoute = OrganizerEditorRoute(mode: .create)
+            routedRoute = nil
+        case .edit(let eventId):
+            editorRoute = OrganizerEditorRoute(mode: .edit(eventId))
+            routedRoute = nil
+        case .manage(let eventId):
+            if let event = store.organizerEvents.first(where: { $0.id == eventId }) {
+                selectedEvent = event
+                routedRoute = nil
+            }
+        }
+    }
+}
+
+private struct OrganizerDashboardPastEventStat: Identifiable {
+    let event: Event
+    let registered: Int
+    let checkedIn: Int
+    let noShows: Int
+    let cancelled: Int
+
+    var id: String { event.id }
+    var spotsTotal: Int { event.spotsTotal ?? 0 }
+    var attendanceRate: Int {
+        guard registered > 0 else { return 0 }
+        return Int(round(Double(checkedIn) / Double(registered) * 100))
+    }
+    var categoryText: String {
+        categoryLabel(event.category)
+    }
+
+    static func stats(events: [Event], registrations: [OrganizerRegistration]) -> [OrganizerDashboardPastEventStat] {
+        let registrationsByEvent = Dictionary(grouping: registrations) { $0.eventId ?? "" }
+        return events.map { event in
+            let rows = registrationsByEvent[event.id] ?? []
+            let active = rows.filter(\.isActive)
+            let checkedIn = active.filter { $0.checkedIn == true }
+            let cancelled = rows.filter { $0.normalizedStatus == "cancelled" }
+            return OrganizerDashboardPastEventStat(
+                event: event,
+                registered: active.count,
+                checkedIn: checkedIn.count,
+                noShows: active.count - checkedIn.count,
+                cancelled: cancelled.count
+            )
+        }
+    }
+}
+
+private struct OrganizerPastEventList: View {
+    let stats: [OrganizerDashboardPastEventStat]
+    let loading: Bool
+    @Binding var selectedEvent: Event?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Eventi passati")
+                .font(.headline.weight(.bold))
+                .foregroundStyle(Brand.foreground)
+
+            if loading {
+                ProgressView()
+                    .tint(Brand.primary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 24)
+            } else if stats.isEmpty {
+                EmptyState(icon: "clock.arrow.circlepath", title: "Nessun evento passato", message: "Gli eventi passati compariranno qui.")
+            } else {
+                LazyVStack(spacing: 12) {
+                    ForEach(stats) { stat in
+                        Button {
+                            selectedEvent = stat.event
+                        } label: {
+                            OrganizerPastEventRow(stat: stat)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct OrganizerPastEventRow: View {
+    let stat: OrganizerDashboardPastEventStat
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(stat.event.title)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                        .lineLimit(2)
+                    Text("\(formatDate(stat.event.date)) · \(stat.categoryText)")
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(Brand.mutedForeground)
+            }
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 8) {
+                OrganizerPastEventKPI(value: "\(stat.registered)/\(stat.spotsTotal)", label: "Iscritti", tint: Brand.foreground)
+                OrganizerPastEventKPI(value: "\(stat.checkedIn)", label: "Presenti", tint: Brand.success)
+                OrganizerPastEventKPI(value: "\(stat.noShows)", label: "No-show", tint: Brand.destructive)
+                OrganizerPastEventKPI(value: "\(stat.cancelled)", label: "Cancellati", tint: Brand.warning)
+            }
+
+            HStack(spacing: 8) {
+                ProgressView(value: Double(stat.attendanceRate) / 100)
+                    .tint(Brand.primary)
+                Text("\(stat.attendanceRate)%")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(Brand.mutedForeground)
+                    .frame(width: 40, alignment: .trailing)
+            }
+        }
+        .padding(14)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+    }
+}
+
+private struct OrganizerPastEventKPI: View {
+    let value: String
+    let label: String
+    let tint: Color
+
+    var body: some View {
+        VStack(spacing: 3) {
+            Text(value)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(tint)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(label)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(Brand.mutedForeground)
+                .lineLimit(1)
+                .minimumScaleFactor(0.65)
+        }
+        .frame(maxWidth: .infinity)
+    }
 }
 
 struct OrganizerDashboardAnalytics: View {
     let events: [Event]
+    let registrations: [OrganizerRegistration]
+    let loading: Bool
 
-    private var trackedEvents: [Event] { events.filter { !["archived"].contains($0.normalizedStatus) } }
-    private var cancelledEvents: [Event] { trackedEvents.filter(\.organizerIsCancelled) }
-    private var draftEvents: [Event] { trackedEvents.filter(\.organizerIsDraft) }
-    private var upcoming: [Event] { trackedEvents.filter(\.organizerIsPublishedUpcoming) }
-    private var past: [Event] { trackedEvents.filter(\.organizerIsHistoric) }
-    private var totalRegistrations: Int { trackedEvents.reduce(0) { $0 + ($1.spotsTaken ?? 0) } }
-    private var totalCapacity: Int { trackedEvents.reduce(0) { $0 + ($1.spotsTotal ?? 0) } }
-    private var globalFillRate: Int { percent(totalRegistrations, totalCapacity) }
-    private var cancellationRate: Int { percent(cancelledEvents.count, trackedEvents.count) }
-    private var averageFillRate: Int {
-        let rates = trackedEvents.compactMap { event -> Double? in
-            guard let total = event.spotsTotal, total > 0 else { return nil }
-            return min(Double(event.spotsTaken ?? 0) / Double(total), 1)
-        }
-        guard !rates.isEmpty else { return 0 }
-        return Int(round((rates.reduce(0, +) / Double(rates.count)) * 100))
+    private var pastStats: [OrganizerDashboardPastEventStat] {
+        OrganizerDashboardPastEventStat.stats(events: events.filter(\.organizerIsHistoric), registrations: registrations)
     }
-
-    private var statusItems: [OrganizerAnalyticsBreakdownItem] {
+    private var totalPast: Int { pastStats.count }
+    private var totalRegistered: Int { pastStats.reduce(0) { $0 + $1.registered } }
+    private var totalCheckedIn: Int { pastStats.reduce(0) { $0 + $1.checkedIn } }
+    private var totalCancelled: Int { pastStats.reduce(0) { $0 + $1.cancelled } }
+    private var totalNoShows: Int { pastStats.reduce(0) { $0 + $1.noShows } }
+    private var averageParticipants: Int { totalPast > 0 ? Int(round(Double(totalRegistered) / Double(totalPast))) : 0 }
+    private var averageAttendanceRate: Int { percent(totalCheckedIn, totalRegistered) }
+    private var cancellationRate: Int { percent(totalCancelled, totalRegistered + totalCancelled) }
+    private var noShowRate: Int { percent(totalNoShows, totalRegistered) }
+    private var bestAttended: OrganizerDashboardPastEventStat? { pastStats.max { $0.registered < $1.registered } }
+    private var highestAttendance: OrganizerDashboardPastEventStat? { pastStats.max { $0.attendanceRate < $1.attendanceRate } }
+    private var highestCancellation: OrganizerDashboardPastEventStat? { pastStats.max { $0.cancelled < $1.cancelled } }
+    private var attendanceTrendPoints: [OrganizerAnalyticsTrendPoint] {
+        pastStats.compactMap { stat in
+            guard let date = stat.event.date.flatMap(DateFormatter.eventDate.date(from:)) else { return nil }
+            return OrganizerAnalyticsTrendPoint(date: date, label: DateFormatter.analyticsDay.string(from: date), value: stat.attendanceRate)
+        }
+    }
+    private var statusDistribution: [OrganizerAnalyticsBreakdownItem] {
         [
-            OrganizerAnalyticsBreakdownItem(label: "Futuri", value: upcoming.count, color: Brand.primary),
-            OrganizerAnalyticsBreakdownItem(label: "Passati", value: past.count, color: Brand.secondary),
-            OrganizerAnalyticsBreakdownItem(label: "Bozze", value: draftEvents.count, color: Brand.warning),
-            OrganizerAnalyticsBreakdownItem(label: "Annullati", value: cancelledEvents.count, color: Brand.destructive)
+            OrganizerAnalyticsBreakdownItem(label: "Presenti", value: totalCheckedIn, color: Brand.success),
+            OrganizerAnalyticsBreakdownItem(label: "No-show", value: totalNoShows, color: Brand.destructive),
+            OrganizerAnalyticsBreakdownItem(label: "Cancellati", value: totalCancelled, color: Brand.warning)
         ].filter { $0.value > 0 }
     }
-
-    private var categoryItems: [OrganizerAnalyticsBreakdownItem] {
-        Dictionary(grouping: trackedEvents) { categoryLabel($0.category) }
-            .map { OrganizerAnalyticsBreakdownItem(label: $0.key, value: $0.value.count, color: Brand.primary) }
-            .sorted { lhs, rhs in
-                if lhs.value == rhs.value { return lhs.label < rhs.label }
-                return lhs.value > rhs.value
-            }
+    private var participationItems: [OrganizerAnalyticsComparisonItem] {
+        pastStats.prefix(10).map {
+            OrganizerAnalyticsComparisonItem(
+                label: $0.event.title,
+                firstValue: $0.registered,
+                secondValue: $0.checkedIn
+            )
+        }
     }
-
-    private var monthlyEventItems: [OrganizerAnalyticsBreakdownItem] {
-        monthlyItems { _ in 1 }
-    }
-
-    private var monthlyRegistrationItems: [OrganizerAnalyticsBreakdownItem] {
-        monthlyItems { $0.spotsTaken ?? 0 }
-    }
-
-    private var topRegistrationEvents: [Event] {
-        trackedEvents
-            .sorted { lhs, rhs in
-                if (lhs.spotsTaken ?? 0) == (rhs.spotsTaken ?? 0) {
-                    return lhs.title < rhs.title
-                }
-                return (lhs.spotsTaken ?? 0) > (rhs.spotsTaken ?? 0)
-            }
-            .prefix(5)
-            .map { $0 }
-    }
-
-    private var upcomingFocusEvents: [Event] {
-        upcoming
-            .sorted { eventDate($0) ?? .distantFuture < eventDate($1) ?? .distantFuture }
-            .prefix(4)
-            .map { $0 }
+    private var registrationTrendItems: [OrganizerAnalyticsComparisonItem] {
+        pastStats.map {
+            OrganizerAnalyticsComparisonItem(
+                label: $0.event.date.flatMap { DateFormatter.eventDate.date(from: $0) }.map { DateFormatter.analyticsDay.string(from: $0) } ?? formatDate($0.event.date),
+                firstValue: $0.registered,
+                secondValue: $0.cancelled
+            )
+        }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if events.isEmpty {
-                EmptyState(icon: "chart.bar.xaxis", title: "Nessun dato analytics", message: "Le statistiche aggregate appariranno quando ci sono eventi organizzati.")
+            if loading {
+                ProgressView()
+                    .tint(Brand.primary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 24)
+            } else if totalPast == 0 {
+                EmptyState(icon: "chart.bar.xaxis", title: "Analytics non ancora disponibili", message: "Le statistiche saranno disponibili dopo il primo evento concluso.")
             } else {
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                     OrganizerAnalyticsMetricCard(
-                        title: "Eventi",
-                        value: "\(trackedEvents.count)",
-                        subtitle: "\(upcoming.count) futuri · \(past.count) passati",
-                        icon: "calendar",
+                        title: "Partecipanti medi",
+                        value: "\(averageParticipants)",
+                        subtitle: "per evento",
+                        icon: "person.2.fill",
                         tint: Brand.primary
                     )
                     OrganizerAnalyticsMetricCard(
-                        title: "Iscrizioni",
-                        value: "\(totalRegistrations)",
-                        subtitle: "\(totalCapacity) posti totali",
-                        icon: "person.2.fill",
-                        tint: Brand.secondary,
-                        progress: Double(globalFillRate) / 100
-                    )
-                    OrganizerAnalyticsMetricCard(
-                        title: "Riempimento",
-                        value: "\(globalFillRate)%",
-                        subtitle: "Media eventi \(averageFillRate)%",
-                        icon: "chart.line.uptrend.xyaxis",
+                        title: "Presenze",
+                        value: "\(averageAttendanceRate)%",
+                        subtitle: "\(totalCheckedIn)/\(totalRegistered) presenti",
+                        icon: "checkmark.circle.fill",
                         tint: Brand.success,
-                        progress: Double(globalFillRate) / 100
+                        progress: Double(averageAttendanceRate) / 100
                     )
                     OrganizerAnalyticsMetricCard(
-                        title: "Bozze",
-                        value: "\(draftEvents.count)",
-                        subtitle: "\(trackedEvents.count - draftEvents.count - cancelledEvents.count) pubblicati",
-                        icon: "tray.full",
-                        tint: Brand.warning
+                        title: "Cancellazioni",
+                        value: "\(cancellationRate)%",
+                        subtitle: "\(totalCancelled) cancellate",
+                        icon: "xmark.circle.fill",
+                        tint: Brand.warning,
+                        progress: Double(cancellationRate) / 100
                     )
                     OrganizerAnalyticsMetricCard(
-                        title: "Annullati",
-                        value: "\(cancelledEvents.count)",
-                        subtitle: "\(cancellationRate)% del catalogo",
-                        icon: "xmark.octagon.fill",
-                        tint: Brand.destructive
+                        title: "No-show",
+                        value: "\(noShowRate)%",
+                        subtitle: "\(totalNoShows) non presenti",
+                        icon: "person.crop.circle.badge.xmark",
+                        tint: Brand.destructive,
+                        progress: Double(noShowRate) / 100
                     )
                 }
 
-                if !monthlyEventItems.isEmpty || !monthlyRegistrationItems.isEmpty {
-                    OrganizerAnalyticsPanel(title: "Andamento globale", systemImage: "chart.bar.xaxis", subtitle: "Vista aggregata per mese") {
-                        VStack(spacing: 14) {
-                            if !monthlyEventItems.isEmpty {
-                                OrganizerAnalyticsMiniBars(title: "Eventi per mese", items: monthlyEventItems, tint: Brand.primary)
-                            }
-                            if !monthlyRegistrationItems.isEmpty {
-                                OrganizerAnalyticsMiniBars(title: "Iscrizioni per mese", items: monthlyRegistrationItems, tint: Brand.secondary)
-                            }
+                OrganizerAnalyticsPanel(title: "Insight principali", systemImage: "rosette", subtitle: nil) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        if let bestAttended {
+                            OrganizerDashboardInsightRow(icon: "target", tint: Brand.success, label: "Evento piu partecipato", title: bestAttended.event.title, detail: "\(bestAttended.registered) partecipanti")
+                        }
+                        if let highestAttendance {
+                            OrganizerDashboardInsightRow(icon: "checkmark.circle.fill", tint: Brand.primary, label: "Tasso presenza piu alto", title: highestAttendance.event.title, detail: "\(highestAttendance.attendanceRate)% presenze")
+                        }
+                        if let highestCancellation, highestCancellation.cancelled > 0 {
+                            OrganizerDashboardInsightRow(icon: "xmark.circle.fill", tint: Brand.warning, label: "Piu cancellazioni", title: highestCancellation.event.title, detail: "\(highestCancellation.cancelled) cancellazioni")
                         }
                     }
                 }
 
-                if !statusItems.isEmpty {
-                    OrganizerAnalyticsPanel(title: "Stato eventi", systemImage: "slider.horizontal.3", subtitle: "Distribuzione del catalogo organizzatore") {
-                        OrganizerAnalyticsBars(items: statusItems)
+                if participationItems.count > 1 {
+                    OrganizerAnalyticsPanel(title: "Partecipazione per evento", systemImage: "chart.bar.xaxis", subtitle: "Iscritti e presenti sui passati") {
+                        OrganizerAnalyticsComparisonBars(
+                            items: participationItems,
+                            firstLabel: "Iscritti",
+                            secondLabel: "Presenti",
+                            firstColor: Brand.primary,
+                            secondColor: Brand.success
+                        )
                     }
                 }
 
-                if !categoryItems.isEmpty {
-                    OrganizerAnalyticsPanel(title: "Categorie", systemImage: "square.grid.2x2", subtitle: "Categorie piu usate") {
-                        OrganizerAnalyticsBars(items: Array(categoryItems.prefix(6)))
+                if attendanceTrendPoints.count > 1 {
+                    OrganizerAnalyticsPanel(title: "Andamento presenze", systemImage: "chart.line.uptrend.xyaxis", subtitle: "Tasso presenza per evento") {
+                        OrganizerAnalyticsLineChart(points: attendanceTrendPoints, tint: Brand.primary, valueSuffix: "%")
                     }
                 }
 
-                if !upcomingFocusEvents.isEmpty {
-                    OrganizerAnalyticsPanel(title: "Prossimi eventi", systemImage: "calendar.badge.clock", subtitle: "Capienza e riempimento dei prossimi appuntamenti") {
-                        VStack(spacing: 10) {
-                            ForEach(upcomingFocusEvents) { event in
-                                OrganizerAnalyticsEventRow(event: event)
-                            }
-                        }
+                if !statusDistribution.isEmpty {
+                    OrganizerAnalyticsPanel(title: "Distribuzione stati", systemImage: "chart.pie", subtitle: "Presenti, no-show e cancellazioni") {
+                        OrganizerAnalyticsDonut(items: statusDistribution)
                     }
                 }
 
-                if !topRegistrationEvents.isEmpty {
-                    OrganizerAnalyticsPanel(title: "Top iscrizioni", systemImage: "person.2.fill", subtitle: "Eventi con piu partecipanti registrati") {
-                        OrganizerAnalyticsBars(
-                            items: topRegistrationEvents.map {
-                                OrganizerAnalyticsBreakdownItem(label: $0.title, value: $0.spotsTaken ?? 0, color: Brand.primary)
-                            }
+                if registrationTrendItems.count > 1 {
+                    OrganizerAnalyticsPanel(title: "Trend iscrizioni", systemImage: "waveform.path.ecg", subtitle: "Iscritti e cancellati per data evento") {
+                        OrganizerAnalyticsComparisonBars(
+                            items: registrationTrendItems,
+                            firstLabel: "Iscritti",
+                            secondLabel: "Cancellati",
+                            firstColor: Brand.primary,
+                            secondColor: Brand.warning
                         )
                     }
                 }
             }
         }
-    }
-
-    private func eventDate(_ event: Event) -> Date? {
-        guard let value = event.date else { return nil }
-        return DateFormatter.eventDate.date(from: value)
-    }
-
-    private func monthlyItems(value: (Event) -> Int) -> [OrganizerAnalyticsBreakdownItem] {
-        let calendar = Calendar.current
-        let grouped = Dictionary(grouping: trackedEvents.compactMap { event -> (Date, Event)? in
-            guard let date = eventDate(event),
-                  let month = calendar.date(from: calendar.dateComponents([.year, .month], from: date)) else { return nil }
-            return (month, event)
-        }) { $0.0 }
-
-        return grouped
-            .map { month, entries in
-                OrganizerAnalyticsBreakdownItem(
-                    label: DateFormatter.analyticsMonth.string(from: month),
-                    value: entries.reduce(0) { $0 + value($1.1) },
-                    color: Brand.primary
-                )
-            }
-            .sorted { lhs, rhs in
-                guard let lhsDate = DateFormatter.analyticsMonth.date(from: lhs.label),
-                      let rhsDate = DateFormatter.analyticsMonth.date(from: rhs.label) else {
-                    return lhs.label < rhs.label
-                }
-                return lhsDate < rhsDate
-            }
-            .suffix(6)
-            .map { $0 }
     }
 
     private func percent(_ numerator: Int, _ denominator: Int) -> Int {
@@ -11058,54 +14592,23 @@ struct OrganizerProposalsPanel: View {
     let onConvert: (ActivityProposalAdmin) -> Void
     @State private var proposals: [ActivityProposalAdmin] = []
     @State private var loading = true
+    @State private var updatingIds: Set<String> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if loading {
                 ProgressView().tint(Brand.primary)
             } else if proposals.isEmpty {
-                EmptyState(icon: "lightbulb", title: "Nessuna proposta", message: "Le proposte utenti appariranno qui.")
+                EmptyState(icon: "lightbulb", title: "Nessuna proposta ricevuta", message: "Le proposte utenti appariranno qui.")
             } else {
                 ForEach(proposals) { proposal in
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text(proposal.activityTitle)
-                                .font(.subheadline.weight(.bold))
-                            Spacer()
-                            BadgeLabel(text: proposal.status?.capitalized ?? "Pending", color: proposalStatusColor(proposal.status).opacity(0.14), foreground: proposalStatusColor(proposal.status))
-                        }
-                        Text("Da \(proposal.proposerName ?? "utente")")
-                            .font(.caption)
-                            .foregroundStyle(Brand.mutedForeground)
-                        if let description = proposal.description?.nilIfBlank {
-                            Text(description)
-                                .font(.caption)
-                                .foregroundStyle(Brand.mutedForeground)
-                                .lineLimit(2)
-                        }
-                        HStack {
-                            Button("Valutata") { Task { await update(proposal, status: "reviewed") } }
-                                .font(.caption.weight(.bold))
-                                .buttonStyle(.bordered)
-                            Button("Archivia") { Task { await update(proposal, status: "archived") } }
-                                .font(.caption.weight(.bold))
-                                .buttonStyle(.bordered)
-                            Button("Converti") {
-                                Task {
-                                    if await store.updateActivityProposal(id: proposal.id, status: "converted") {
-                                        await load()
-                                        onConvert(proposal)
-                                    }
-                                }
-                            }
-                            .font(.caption.weight(.bold))
-                            .buttonStyle(.borderedProminent)
-                            .tint(Brand.primary)
-                        }
-                    }
-                    .padding(12)
-                    .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
-                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+                    OrganizerProposalCard(
+                        proposal: proposal,
+                        updating: updatingIds.contains(proposal.id),
+                        onReview: { Task { await update(proposal, status: "reviewed") } },
+                        onArchive: { Task { await update(proposal, status: "archived") } },
+                        onConvert: { onConvert(proposal) }
+                    )
                 }
             }
         }
@@ -11113,24 +14616,211 @@ struct OrganizerProposalsPanel: View {
     }
 
     @MainActor
-    private func load() async {
-        loading = true
+    private func load(showLoading: Bool = true) async {
+        if showLoading { loading = true }
         proposals = await store.fetchActivityProposals(reportingErrors: false)
         loading = false
     }
 
+    @MainActor
     private func update(_ proposal: ActivityProposalAdmin, status: String) async {
+        guard !updatingIds.contains(proposal.id) else { return }
+        updatingIds.insert(proposal.id)
+        defer { updatingIds.remove(proposal.id) }
         if await store.updateActivityProposal(id: proposal.id, status: status) {
-            await load()
+            await load(showLoading: false)
+        }
+    }
+}
+
+private struct OrganizerProposalCard: View {
+    let proposal: ActivityProposalAdmin
+    let updating: Bool
+    let onReview: () -> Void
+    let onArchive: () -> Void
+    let onConvert: () -> Void
+
+    private var statusStyle: ActivityProposalStatusStyle {
+        ActivityProposalStatusStyle(proposal.status)
+    }
+
+    private var proposerLine: String {
+        let name = proposal.proposerName?.nilIfBlank ?? "utente"
+        if let createdAt = proposal.createdAt?.isoDate {
+            return "da \(name) · \(DateFormatter.proposalCreatedDate.string(from: createdAt))"
+        }
+        return "da \(name)"
+    }
+
+    private var facts: [OrganizerProposalFact] {
+        var items: [OrganizerProposalFact] = []
+        if let location = proposal.location?.nilIfBlank {
+            items.append(.init(icon: "mappin.and.ellipse", text: location))
+        }
+        if let date = proposal.suggestedDate?.nilIfBlank {
+            let dateText = formatDate(date)
+            let timeText = proposal.suggestedTime?.nilIfBlank.map { String($0.prefix(5)) }
+            items.append(.init(icon: "calendar", text: [dateText, timeText].compactMap { $0 }.joined(separator: " · ")))
+        }
+        if let maxParticipants = proposal.maxParticipants {
+            items.append(.init(icon: "person.2", text: "Max \(maxParticipants)"))
+        }
+        return items
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(proposal.activityTitle)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                        .lineLimit(2)
+                    Text(proposerLine)
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                }
+                Spacer(minLength: 8)
+                BadgeLabel(text: statusStyle.label, color: statusStyle.background, foreground: statusStyle.foreground)
+            }
+
+            if let description = proposal.description?.nilIfBlank {
+                Text(description)
+                    .font(.caption)
+                    .foregroundStyle(Brand.mutedForeground)
+                    .lineLimit(2)
+            }
+
+            if !facts.isEmpty {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 132), spacing: 8)], alignment: .leading, spacing: 8) {
+                    ForEach(facts) { fact in
+                        OrganizerProposalFactView(fact: fact)
+                    }
+                }
+            }
+
+            proposalActions
+        }
+        .padding(12)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+    }
+
+    @ViewBuilder
+    private var proposalActions: some View {
+        switch statusStyle.rawValue {
+        case "pending":
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    reviewButton
+                    archiveButton
+                }
+                VStack(spacing: 8) {
+                    reviewButton
+                    archiveButton
+                }
+            }
+            .padding(.top, 2)
+        case "reviewed":
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    convertButton
+                    archiveButton
+                }
+                VStack(spacing: 8) {
+                    convertButton
+                    archiveButton
+                }
+            }
+            .padding(.top, 2)
+        default:
+            EmptyView()
         }
     }
 
-    private func proposalStatusColor(_ status: String?) -> Color {
-        switch status {
-        case "converted", "reviewed": Brand.success
-        case "archived": Brand.mutedForeground
-        default: Brand.warning
+    private var reviewButton: some View {
+        Button(action: onReview) {
+            Label("Valutata", systemImage: "checkmark.circle")
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
         }
+        .font(.caption.weight(.bold))
+        .buttonStyle(.bordered)
+        .disabled(updating)
+    }
+
+    private var archiveButton: some View {
+        Button(action: onArchive) {
+            Label("Archivia", systemImage: "archivebox")
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .font(.caption.weight(.bold))
+        .buttonStyle(.bordered)
+        .disabled(updating)
+    }
+
+    private var convertButton: some View {
+        Button(action: onConvert) {
+            Label("Converti in evento", systemImage: "checkmark.circle")
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .font(.caption.weight(.bold))
+        .buttonStyle(.borderedProminent)
+        .tint(Brand.primary)
+        .disabled(updating)
+    }
+}
+
+private struct OrganizerProposalFact: Identifiable {
+    let id = UUID()
+    let icon: String
+    let text: String
+}
+
+private struct OrganizerProposalFactView: View {
+    let fact: OrganizerProposalFact
+
+    var body: some View {
+        Label {
+            Text(fact.text)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        } icon: {
+            Image(systemName: fact.icon)
+                .font(.caption2.weight(.semibold))
+        }
+        .font(.caption2)
+        .foregroundStyle(Brand.mutedForeground)
+    }
+}
+
+private struct ActivityProposalStatusStyle {
+    let rawValue: String
+    let label: String
+    let foreground: Color
+
+    init(_ status: String?) {
+        rawValue = status?.nilIfBlank ?? "pending"
+        switch rawValue {
+        case "reviewed":
+            label = "Valutata"
+            foreground = Brand.success
+        case "archived":
+            label = "Archiviata"
+            foreground = Brand.mutedForeground
+        case "converted":
+            label = "Convertita"
+            foreground = Brand.success
+        default:
+            label = "In attesa"
+            foreground = Brand.warning
+        }
+    }
+
+    var background: Color {
+        foreground.opacity(rawValue == "archived" ? 0.10 : 0.14)
     }
 }
 
@@ -12199,7 +15889,7 @@ private struct IOSPushBroadcastHistoryRow: View {
 }
 
 struct OrganizerHeader: View {
-    let isAdmin: Bool
+    let onCreate: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -12207,11 +15897,19 @@ struct OrganizerHeader: View {
                 HStack(spacing: 8) {
                     Image(systemName: AppTab.organizer.systemImage)
                         .foregroundStyle(Brand.primary)
-                    Text("Gestione")
+                    Text("Dashboard")
                 }
                 .font(.system(.title, design: .rounded, weight: .bold))
             }
             Spacer()
+            Button(action: onCreate) {
+                Label("Nuovo evento", systemImage: "plus")
+                    .labelStyle(.titleAndIcon)
+            }
+            .font(.caption.weight(.bold))
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .tint(Brand.primary)
         }
     }
 }
@@ -12220,24 +15918,14 @@ struct OrganizerDashboardTabBar: View {
     @Binding var selection: Int
     let upcomingCount: Int
     let historyCount: Int
-    let isAdmin: Bool
 
     private var tabs: [(id: Int, title: String, systemImage: String)] {
-        var base: [(Int, String, String)] = [
+        let base: [(Int, String, String)] = [
             (0, "Eventi", "calendar"),
             (1, "Passati", "clock.arrow.circlepath"),
-            (2, "Analytics", "chart.bar")
+            (2, "Analytics", "chart.bar"),
+            (3, "Proposte", "lightbulb")
         ]
-        if isAdmin {
-            base.append(contentsOf: [
-                (3, "Proposte", "lightbulb"),
-                (4, "Sconti", "ticket"),
-                (5, "Missioni", "target"),
-                (6, "Issue", "exclamationmark.triangle"),
-                (7, "Template", "text.bubble"),
-                (8, "Push iOS", "bell.badge")
-            ])
-        }
         return base.map { id, title, icon in
             if id == 0 { return (id, "\(title) \(upcomingCount)", icon) }
             if id == 1 { return (id, "\(title) \(historyCount)", icon) }
@@ -12338,17 +16026,13 @@ struct OrganizerEventList: View {
         } else {
             LazyVStack(spacing: 12) {
                 ForEach(events) { event in
-                    Button {
-                        selectedEvent = event
-                    } label: {
-                        OrganizerEventRow(
-                            event: event,
-                            onDuplicate: { onDuplicate(event) },
-                            onShare: { onShare(event) },
-                            onDelete: { onDelete(event) }
-                        )
-                    }
-                    .buttonStyle(.plain)
+                    OrganizerEventRow(
+                        event: event,
+                        onSelect: { selectedEvent = event },
+                        onDuplicate: { onDuplicate(event) },
+                        onShare: { onShare(event) },
+                        onDelete: { onDelete(event) }
+                    )
                 }
             }
         }
@@ -12357,52 +16041,78 @@ struct OrganizerEventList: View {
 
 struct OrganizerEventRow: View {
     let event: Event
+    let onSelect: () -> Void
     let onDuplicate: () -> Void
     let onShare: () -> Void
     let onDelete: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
-            RemoteImage(urlString: event.imageUrl)
-                .frame(width: 72, height: 72)
-                .clipShape(RoundedRectangle(cornerRadius: 14))
+            Button(action: onSelect) {
+                HStack(spacing: 12) {
+                    RemoteImage(urlString: event.imageUrl)
+                        .frame(width: 72, height: 72)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text(event.title)
-                    .font(.subheadline.weight(.bold))
-                    .foregroundStyle(Brand.foreground)
-                    .lineLimit(2)
-                Text("\(formatDate(event.date)) · \(event.displayLocation)")
-                    .font(.caption)
-                    .foregroundStyle(Brand.mutedForeground)
-                    .lineLimit(1)
-                Label(event.organizerDisplayName, systemImage: "person.crop.circle")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(Brand.mutedForeground)
-                    .lineLimit(1)
-                HStack(spacing: 6) {
-                    BadgeLabel(text: event.statusStyle.label, color: event.statusStyle.background, foreground: event.statusStyle.foreground)
-                    Label("\(event.spotsTaken ?? 0)/\(event.spotsTotal ?? 0)", systemImage: "person.2")
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(event.title)
+                            .font(.subheadline.weight(.bold))
+                            .foregroundStyle(Brand.foreground)
+                            .lineLimit(2)
+                        Text("\(formatDate(event.date)) · \(event.displayLocation)")
+                            .font(.caption)
+                            .foregroundStyle(Brand.mutedForeground)
+                            .lineLimit(1)
+                        Label(event.organizerDisplayName, systemImage: "person.crop.circle")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(Brand.mutedForeground)
+                            .lineLimit(1)
+                        HStack(spacing: 6) {
+                            BadgeLabel(text: event.statusStyle.label, color: event.statusStyle.background, foreground: event.statusStyle.foreground)
+                            Label("\(event.spotsTaken ?? 0)/\(event.spotsTotal ?? 0)", systemImage: "person.2")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(Brand.mutedForeground)
+                        }
+                    }
+
+                    Spacer(minLength: 6)
+
+                    Image(systemName: "chevron.right")
                         .font(.caption.weight(.bold))
                         .foregroundStyle(Brand.mutedForeground)
                 }
             }
-            Spacer(minLength: 8)
-            Menu {
-                Button("Duplica", systemImage: "doc.on.doc", action: onDuplicate)
-                Button("Copia link", systemImage: "link", action: onShare)
-                Divider()
-                Button("Elimina evento", systemImage: "trash", role: .destructive, action: onDelete)
-            } label: {
-                Image(systemName: "ellipsis.circle")
-                    .font(.title3)
-                    .foregroundStyle(Brand.mutedForeground)
-                    .frame(width: 36, height: 36)
+            .buttonStyle(.plain)
+
+            VStack(spacing: 8) {
+                quickActionButton(systemImage: "link", accessibilityLabel: "Copia link", action: onShare)
+                quickActionButton(systemImage: "doc.on.doc", accessibilityLabel: "Duplica evento", action: onDuplicate)
+                Menu {
+                    Button("Elimina evento", systemImage: "trash", role: .destructive, action: onDelete)
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.mutedForeground)
+                        .frame(width: 34, height: 34)
+                        .background(Brand.muted.opacity(0.6), in: Circle())
+                }
             }
         }
         .padding(12)
         .background(Brand.card, in: RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Brand.muted, lineWidth: 1))
+    }
+
+    private func quickActionButton(systemImage: String, accessibilityLabel: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(Brand.primary)
+                .frame(width: 34, height: 34)
+                .background(Brand.primary.opacity(0.10), in: Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
     }
 }
 
@@ -12586,6 +16296,56 @@ struct OrganizerOwnerAvatar: View {
     }
 }
 
+private enum OrganizerEventManageConfirmation: Identifiable {
+    case deleteEvent
+    case cancelEvent
+    case cancelRegistration(OrganizerRegistration)
+
+    var id: String {
+        switch self {
+        case .deleteEvent:
+            return "delete-event"
+        case .cancelEvent:
+            return "cancel-event"
+        case .cancelRegistration(let registration):
+            return "cancel-registration-\(registration.id)"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .deleteEvent:
+            return "Eliminare evento?"
+        case .cancelEvent:
+            return "Annullare evento?"
+        case .cancelRegistration:
+            return "Cancellare partecipante?"
+        }
+    }
+
+    var confirmTitle: String {
+        switch self {
+        case .deleteEvent:
+            return "Elimina"
+        case .cancelEvent:
+            return "Conferma cancellazione"
+        case .cancelRegistration:
+            return "Conferma"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .deleteEvent:
+            return "L'operazione usa le stesse regole Supabase della webapp e potrebbe essere bloccata se l'evento ha vincoli attivi."
+        case .cancelEvent:
+            return "L'evento verra segnato come cancellato e la funzione Supabase notifichera i partecipanti."
+        case .cancelRegistration:
+            return "Sei sicuro di voler cancellare questo partecipante?"
+        }
+    }
+}
+
 struct OrganizerEventManageView: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
@@ -12602,8 +16362,8 @@ struct OrganizerEventManageView: View {
     @State private var showAddParticipant = false
     @State private var showCapacity = false
     @State private var showBroadcast = false
-    @State private var showDeleteConfirm = false
-    @State private var showCancelConfirm = false
+    @State private var confirmation: OrganizerEventManageConfirmation?
+    @State private var showStatusSheet = false
     @State private var showOwnerPicker = false
     @State private var shareText: String?
 
@@ -12616,11 +16376,16 @@ struct OrganizerEventManageView: View {
     }
 
     private var pendingRegistrations: [OrganizerRegistration] {
-        registrations.filter { $0.normalizedStatus == "pending_approval" }
+        registrations.filter { ["pending_approval", "pending_payment"].contains($0.normalizedStatus) }
     }
 
     private var cancelledRegistrations: [OrganizerRegistration] {
         registrations.filter { $0.normalizedStatus == "cancelled" }
+    }
+
+    private var availableSpots: Int {
+        guard let event else { return 0 }
+        return max((event.spotsTotal ?? 0) - activeRegistrations.count - (event.reservedSpots ?? 0), 0)
     }
 
     private var attendedCount: Int {
@@ -12628,7 +16393,11 @@ struct OrganizerEventManageView: View {
     }
 
     private var reminderCandidates: [OrganizerRegistration] {
-        registrations.filter { $0.normalizedStatus == "deposit_paid" && !$0.isManual }
+        guard let event else { return [] }
+        return registrations.filter { registration in
+            guard registration.normalizedStatus == "deposit_paid", !registration.isManual else { return false }
+            return (registration.priceOption?.effectiveBalancePaymentMode(fallback: event) ?? event.balancePaymentMode ?? "online") == "online"
+        }
     }
 
     var body: some View {
@@ -12640,100 +16409,7 @@ struct OrganizerEventManageView: View {
             } else if let event {
                 GeometryReader { proxy in
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 16) {
-                            OrganizerManageHero(event: event)
-                            OrganizerEventOwnerCard(
-                                event: event,
-                                isAdmin: store.isAdmin,
-                                onChange: { showOwnerPicker = true }
-                            )
-
-                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
-                                OrganizerMetricCard(title: "\(activeRegistrations.count)", subtitle: "Partecipanti", icon: "person.2.fill")
-                                OrganizerMetricCard(title: "\(attendedCount)", subtitle: "Presenti", icon: "checkmark.circle.fill")
-                                OrganizerMetricCard(title: "\(waitlistedRegistrations.count)", subtitle: "Lista attesa", icon: "list.bullet")
-                                OrganizerMetricCard(title: "\(max((event.spotsTotal ?? 0) - activeRegistrations.count - (event.reservedSpots ?? 0), 0))", subtitle: "Liberi", icon: "chair")
-                            }
-
-                            OrganizerParticipationOptionsBreakdown(event: event, registrations: registrations, priceOptions: priceOptions)
-
-                            Picker("Gestione", selection: $tab) {
-                                Text("Partecipanti").tag(0)
-                                Text("Check-in").tag(1)
-                                Text("Waitlist").tag(2)
-                                Text("Pending").tag(3)
-                                Text("Analytics").tag(4)
-                                Text("Azioni").tag(5)
-                            }
-                            .pickerStyle(.segmented)
-
-                            switch tab {
-                            case 0:
-                                OrganizerParticipantsSection(
-                                    event: event,
-                                    registrations: registrations,
-                                    meetingPoints: meetingPoints,
-                                    priceOptions: priceOptions,
-                                    onToggleCheckIn: toggleCheckIn,
-                                    onStatus: updateStatus,
-                                    onPayment: updatePayment,
-                                    onMeetingPoint: updateMeetingPoint
-                                )
-                            case 1:
-                                OrganizerCheckInSection(registrations: activeRegistrations, meetingPoints: meetingPoints, onToggleCheckIn: toggleCheckIn)
-                            case 2:
-                                OrganizerQueueSection(
-                                    title: "Waitlist",
-                                    emptyTitle: "Nessuno in waitlist",
-                                    registrations: waitlistedRegistrations,
-                                    meetingPoints: meetingPoints,
-                                    primaryTitle: "Promuovi",
-                                    primaryAction: { updateStatus($0, status: "registered") },
-                                    secondaryTitle: "Cancella",
-                                    secondaryAction: { updateStatus($0, status: "cancelled") }
-                                )
-                                if !cancelledRegistrations.isEmpty {
-                                    OrganizerQueueSection(
-                                        title: "Cancellati",
-                                        emptyTitle: "",
-                                        registrations: cancelledRegistrations,
-                                        meetingPoints: meetingPoints,
-                                        primaryTitle: "Ripristina",
-                                        primaryAction: { updateStatus($0, status: "registered") },
-                                        secondaryTitle: nil,
-                                        secondaryAction: nil
-                                    )
-                                }
-                            case 3:
-                                OrganizerQueueSection(
-                                    title: "Approvazioni manuali",
-                                    emptyTitle: "Nessuna approvazione pendente",
-                                    registrations: pendingRegistrations,
-                                    meetingPoints: meetingPoints,
-                                    primaryTitle: "Approva",
-                                    primaryAction: { updateStatus($0, status: "registered") },
-                                    secondaryTitle: "Waitlist",
-                                    secondaryAction: { updateStatus($0, status: "waitlist") }
-                                )
-                            case 4:
-                                OrganizerEventAnalyticsSection(event: event, registrations: registrations, priceOptions: priceOptions, broadcastHistory: broadcastHistory)
-                            default:
-                                OrganizerActionsSection(
-                                    event: event,
-                                    reminderCount: reminderCandidates.count,
-                                    onAddParticipant: { showAddParticipant = true },
-                                    onCapacity: { showCapacity = true },
-                                    onBroadcast: { showBroadcast = true },
-                                    onBalanceReminders: sendBalanceReminders,
-                                    onExport: exportCSV,
-                                    onPublishToggle: togglePublishStatus,
-                                    onCancelEvent: { showCancelConfirm = true },
-                                    onDelete: { showDeleteConfirm = true }
-                                )
-                            }
-                        }
-                        .frame(width: max(proxy.size.width - 32, 0), alignment: .leading)
-                        .padding(16)
+                        eventManagementContent(event: event, width: max(proxy.size.width - 32, 0))
                     }
                     .contentMargins(.bottom, 0, for: .scrollContent)
                 }
@@ -12744,14 +16420,6 @@ struct OrganizerEventManageView: View {
         }
         .navigationTitle("Gestione")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("Modifica") {
-                    editorRoute = OrganizerEditorRoute(mode: .edit(eventId))
-                }
-                .disabled(event == nil)
-            }
-        }
         .navigationDestination(item: $editorRoute) { route in
             OrganizerEventEditorView(route: route)
         }
@@ -12761,7 +16429,7 @@ struct OrganizerEventManageView: View {
             }
         }
         .sheet(isPresented: $showCapacity) {
-            OrganizerCapacitySheet(currentCapacity: event?.spotsTotal ?? 1) { capacity in
+            OrganizerCapacitySheet(currentCapacity: event?.spotsTotal ?? 1, minimumCapacity: activeRegistrations.count) { capacity in
                 if await store.updateOrganizerEventCapacity(eventId: eventId, capacity: capacity) {
                     await load()
                 }
@@ -12771,6 +16439,13 @@ struct OrganizerEventManageView: View {
             if let event {
                 OrganizerBroadcastSheet(event: event, registrations: registrations, templates: templates, history: broadcastHistory) {
                     await load()
+                }
+            }
+        }
+        .sheet(isPresented: $showStatusSheet) {
+            if let event {
+                OrganizerEventStatusSheet(event: event) { status in
+                    Task { await updateEventStatus(status) }
                 }
             }
         }
@@ -12787,32 +16462,164 @@ struct OrganizerEventManageView: View {
         )) { item in
             ShareSheet(activityItems: [item.value])
         }
-        .alert("Eliminare evento?", isPresented: $showDeleteConfirm) {
-            Button("Annulla", role: .cancel) {}
-            Button("Elimina", role: .destructive) {
-                Task {
-                    if await store.deleteOrganizerEvent(eventId: eventId) {
-                        dismiss()
-                    }
+        .alert(item: $confirmation) { confirmation in
+            Alert(
+                title: Text(confirmation.title),
+                message: Text(confirmationMessage(for: confirmation)),
+                primaryButton: .cancel(Text("Annulla")),
+                secondaryButton: .destructive(Text(confirmation.confirmTitle)) {
+                    performConfirmation(confirmation)
                 }
-            }
-        } message: {
-            Text("L'operazione usa le stesse regole Supabase della webapp e potrebbe essere bloccata se l'evento ha vincoli attivi.")
-        }
-        .alert("Annullare evento?", isPresented: $showCancelConfirm) {
-            Button("Annulla", role: .cancel) {}
-            Button("Conferma cancellazione", role: .destructive) {
-                Task {
-                    if await store.cancelOrganizerEvent(eventId: eventId) {
-                        await load()
-                    }
-                }
-            }
-        } message: {
-            Text("L'evento verra segnato come cancellato e la funzione Supabase notifichera i partecipanti.")
+            )
         }
         .task { await load() }
         .refreshable { await load() }
+    }
+
+    @ViewBuilder
+    private func eventManagementContent(event: Event, width: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            OrganizerManageHero(event: event)
+
+            OrganizerManageQuickActions(
+                onEdit: { editorRoute = OrganizerEditorRoute(mode: .edit(eventId)) },
+                onDuplicate: { editorRoute = OrganizerEditorRoute(mode: .duplicate(eventId)) },
+                onStatus: { showStatusSheet = true },
+                onDelete: { confirmation = .deleteEvent }
+            )
+
+            if event.visibility != "public" {
+                OrganizerPrivateLinkCard(
+                    event: event,
+                    onCopy: { shareEventLink(event) },
+                    onWhatsApp: { openEventWhatsAppShare(event) }
+                )
+            }
+
+            if store.isAdmin {
+                OrganizerEventOwnerCard(event: event, isAdmin: true) {
+                    showOwnerPicker = true
+                }
+            }
+
+            manageMetricsGrid
+
+            OrganizerParticipationOptionsBreakdown(event: event, registrations: registrations, priceOptions: priceOptions)
+
+            OrganizerManagePrimaryActions(
+                showBalanceReminders: canShowBalanceReminderAction(for: event),
+                reminderCount: reminderCandidates.count,
+                onAddParticipant: { showAddParticipant = true },
+                onBroadcast: { showBroadcast = true },
+                onBalanceReminders: sendBalanceReminders
+            )
+
+            OrganizerManageTabBar(
+                selection: $tab,
+                participantCount: activeRegistrations.count,
+                checkedInCount: attendedCount,
+                waitlistCount: waitlistedRegistrations.count,
+                pendingCount: pendingRegistrations.count
+            )
+
+            selectedManageTabContent(event: event)
+        }
+        .frame(width: width, alignment: .leading)
+        .padding(16)
+    }
+
+    private func canShowBalanceReminderAction(for event: Event) -> Bool {
+        reminderCandidates.count > 0
+            || event.paymentType == "deposit"
+            || priceOptions.contains { $0.effectivePaymentType(fallback: event) == "deposit" }
+            || event.priceOptions.contains { $0.effectivePaymentType(fallback: event) == "deposit" }
+    }
+
+    private var manageMetricsGrid: some View {
+        LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+            OrganizerMetricCard(title: "\(activeRegistrations.count)", subtitle: "Partecipanti", icon: "person.2.fill")
+            OrganizerMetricCard(title: "\(attendedCount)", subtitle: "Presenti", icon: "checkmark.circle.fill")
+            OrganizerMetricCard(title: "\(waitlistedRegistrations.count)", subtitle: "Lista attesa", icon: "list.bullet")
+            Button {
+                showCapacity = true
+            } label: {
+                OrganizerMetricCard(title: "\(availableSpots)", subtitle: "Liberi", icon: "chair")
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Modifica capienza evento")
+        }
+    }
+
+    @ViewBuilder
+    private func selectedManageTabContent(event: Event) -> some View {
+        switch tab {
+        case 0:
+            OrganizerParticipantsSection(
+                event: event,
+                registrations: registrations,
+                meetingPoints: meetingPoints,
+                priceOptions: priceOptions,
+                onToggleCheckIn: toggleCheckIn,
+                onStatus: updateStatus,
+                onPayment: updatePayment,
+                onMeetingPoint: updateMeetingPoint,
+                onPriceOption: updatePriceOption,
+                onExport: exportCSV
+            )
+        case 1:
+            OrganizerCheckInSection(registrations: activeRegistrations, meetingPoints: meetingPoints, onToggleCheckIn: toggleCheckIn)
+        case 2:
+            OrganizerQueueSection(
+                title: "Waitlist",
+                emptyTitle: "Nessuno in waitlist",
+                registrations: waitlistedRegistrations,
+                meetingPoints: meetingPoints,
+                primaryTitle: "Promuovi",
+                primaryAction: { updateStatus($0, status: "registered") },
+                secondaryTitle: "Cancella",
+                secondaryAction: { updateStatus($0, status: "cancelled") }
+            )
+            if !cancelledRegistrations.isEmpty {
+                OrganizerQueueSection(
+                    title: "Cancellati",
+                    emptyTitle: "",
+                    registrations: cancelledRegistrations,
+                    meetingPoints: meetingPoints,
+                    primaryTitle: nil,
+                    primaryAction: nil,
+                    secondaryTitle: nil,
+                    secondaryAction: nil
+                )
+            }
+        case 3:
+            OrganizerQueueSection(
+                title: "Approvazioni manuali",
+                emptyTitle: "Nessuna approvazione pendente",
+                registrations: pendingRegistrations,
+                meetingPoints: meetingPoints,
+                primaryTitle: "Approva",
+                primaryAction: { updateStatus($0, status: "registered") },
+                secondaryTitle: "Rifiuta",
+                secondaryAction: { updateStatus($0, status: "cancelled") }
+            )
+        case 4:
+            OrganizerEventAnalyticsSection(event: event, registrations: registrations, priceOptions: priceOptions, broadcastHistory: broadcastHistory)
+        default:
+            OrganizerActionsSection(
+                event: event,
+                reminderCount: reminderCandidates.count,
+                onAddParticipant: { showAddParticipant = true },
+                onCapacity: { showCapacity = true },
+                onBroadcast: { showBroadcast = true },
+                onBalanceReminders: sendBalanceReminders,
+                onExport: exportCSV,
+                onShare: { shareEventLink(event) },
+                onDuplicate: { editorRoute = OrganizerEditorRoute(mode: .duplicate(eventId)) },
+                onStatus: { showStatusSheet = true },
+                onCancelEvent: { confirmation = .cancelEvent },
+                onDelete: { confirmation = .deleteEvent }
+            )
+        }
     }
 
     @MainActor
@@ -12846,6 +16653,44 @@ struct OrganizerEventManageView: View {
     }
 
     private func updateStatus(_ registration: OrganizerRegistration, status: String) {
+        if status == "cancelled" {
+            confirmation = .cancelRegistration(registration)
+            return
+        }
+        applyStatus(registration, status: status)
+    }
+
+    private func performConfirmation(_ confirmation: OrganizerEventManageConfirmation) {
+        switch confirmation {
+        case .deleteEvent:
+            Task {
+                if await store.deleteOrganizerEvent(eventId: eventId) {
+                    dismiss()
+                }
+            }
+        case .cancelEvent:
+            Task {
+                if await store.cancelOrganizerEvent(eventId: eventId) {
+                    await load()
+                }
+            }
+        case .cancelRegistration(let registration):
+            applyStatus(registration, status: "cancelled")
+        }
+    }
+
+    private func confirmationMessage(for confirmation: OrganizerEventManageConfirmation) -> String {
+        switch confirmation {
+        case .cancelEvent:
+            let participantCount = activeRegistrations.count + waitlistedRegistrations.count + pendingRegistrations.count
+            let title = event?.title.nilIfBlank ?? "questo evento"
+            return "Sei sicuro di voler cancellare \"\(title)\"? Tutti i partecipanti (\(participantCount)) riceveranno una notifica e un'email di cancellazione. Le iscrizioni verranno annullate. Questa azione non può essere annullata."
+        default:
+            return confirmation.message
+        }
+    }
+
+    private func applyStatus(_ registration: OrganizerRegistration, status: String) {
         Task {
             let update = OrganizerRegistrationUpdate(status: status)
             if await store.updateOrganizerRegistration(id: registration.id, updates: update, eventId: eventId) {
@@ -12872,42 +16717,77 @@ struct OrganizerEventManageView: View {
         }
     }
 
-    private func togglePublishStatus() {
-        guard let event else { return }
-        let next = event.normalizedStatus == "closed" ? "published" : "closed"
+    private func updatePriceOption(_ registration: OrganizerRegistration, priceOptionId: String?) {
         Task {
-            if await store.updateOrganizerEventStatus(eventId: eventId, status: next) {
+            let update = OrganizerRegistrationUpdate(priceOptionId: priceOptionId, hasPriceOptionUpdate: true)
+            if await store.updateOrganizerRegistration(id: registration.id, updates: update, eventId: eventId) {
                 await load()
             }
+        }
+    }
+
+    private func updateEventStatus(_ status: String) async {
+        guard event?.normalizedStatus != status else { return }
+        if await store.updateOrganizerEventStatus(eventId: eventId, status: status) {
+            await load()
+        }
+    }
+
+    private func shareEventLink(_ event: Event) {
+        guard let url = event.webURL else { return }
+        UIPasteboard.general.string = url.absoluteString
+        store.errorMessage = "Link evento copiato negli appunti."
+    }
+
+    @MainActor
+    private func openEventWhatsAppShare(_ event: Event) {
+        guard let url = event.webURL else { return }
+        let message = "\(event.title) - \(url.absoluteString)"
+        let encoded = message.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        if let url = URL(string: "https://wa.me/?text=\(encoded)") {
+            UIApplication.shared.open(url)
         }
     }
 
     private func sendBalanceReminders() {
         guard let event else { return }
         Task {
-            if await store.sendBalanceReminders(event: event, recipients: registrations) != nil {
+            if let sentCount = await store.sendBalanceReminders(event: event, recipients: registrations) {
+                store.errorMessage = sentCount == 1
+                    ? "Notifica saldo inviata con successo."
+                    : "Notifiche saldo inviate a \(sentCount) partecipanti."
                 await load()
             }
         }
     }
 
     private func exportCSV() {
-        let header = "Nome,Telefono,Livello,Opzione prezzo,Stato,Pagamento,Ritrovo,Check-in,Registrato"
+        let header = "Nome,Cognome,Telefono,Livello,Opzione prezzo,Stato,Pagamento,Importo pagato,Rimborso,Ritrovo,Check-in,Registrato"
         let rows = registrations.map { registration in
             let meetingPoint = meetingPoints.first { $0.id == registration.meetingPointId }?.name ?? ""
+            let firstName = registration.isManual ? (registration.manualName ?? registration.displayName) : (registration.profiles?.firstName ?? "")
+            let lastName = registration.isManual ? "(manual)" : (registration.profiles?.lastName ?? "")
             return [
-                registration.displayName.csvEscaped,
-                (registration.profiles?.phone ?? "").csvEscaped,
-                (registration.isManual ? "" : (registration.sportLevel ?? "")).csvEscaped,
-                (registration.priceOption?.displayName ?? "").csvEscaped,
+                firstName.nilIfBlank?.csvEscaped ?? "-".csvEscaped,
+                lastName.nilIfBlank?.csvEscaped ?? "-".csvEscaped,
+                (registration.isManual ? "-" : (registration.profiles?.phone ?? "-")).csvEscaped,
+                (registration.isManual ? "-" : (registration.sportLevel ?? "-")).csvEscaped,
+                (registration.priceOption?.displayName ?? "-").csvEscaped,
                 registration.statusLabel.csvEscaped,
-                (registration.paymentStatus ?? "").csvEscaped,
-                meetingPoint.csvEscaped,
+                (registration.paymentStatus ?? "-").csvEscaped,
+                money(registration.amountPaid ?? 0).csvEscaped,
+                money(registration.refundAmount ?? 0).csvEscaped,
+                (meetingPoint.nilIfBlank ?? "-").csvEscaped,
                 (registration.checkedIn == true ? "Si" : "No").csvEscaped,
-                (registration.createdAt ?? "").csvEscaped
+                formattedRegistrationDate(registration.createdAt).csvEscaped
             ].joined(separator: ",")
         }
         shareText = ([header] + rows).joined(separator: "\n")
+    }
+
+    private func formattedRegistrationDate(_ value: String?) -> String {
+        guard let date = value?.iso8601Date else { return value?.nilIfBlank ?? "-" }
+        return DateFormatter.registrationCSV.string(from: date)
     }
 }
 
@@ -12941,6 +16821,226 @@ struct OrganizerManageHero: View {
             }
         }
     }
+}
+
+struct OrganizerManageQuickActions: View {
+    let onEdit: () -> Void
+    let onDuplicate: () -> Void
+    let onStatus: () -> Void
+    let onDelete: () -> Void
+
+    private var columns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: 8), count: 4)
+    }
+
+    var body: some View {
+        LazyVGrid(columns: columns, spacing: 8) {
+            OrganizerManageQuickActionButton(icon: "pencil", title: "Modifica", tint: Brand.primary, action: onEdit)
+            OrganizerManageQuickActionButton(icon: "doc.on.doc", title: "Duplica", tint: Brand.secondary, action: onDuplicate)
+            OrganizerManageQuickActionButton(icon: "slider.horizontal.3", title: "Stato", tint: Brand.mutedForeground, action: onStatus)
+            OrganizerManageQuickActionButton(icon: "trash", title: "Elimina", tint: Brand.destructive, isDestructive: true, action: onDelete)
+        }
+    }
+}
+
+struct OrganizerManagePrimaryActions: View {
+    let showBalanceReminders: Bool
+    let reminderCount: Int
+    let onAddParticipant: () -> Void
+    let onBroadcast: () -> Void
+    let onBalanceReminders: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            OrganizerManagePrimaryActionButton(
+                icon: "person.badge.plus",
+                title: "Aggiungi",
+                tint: Brand.primary,
+                action: onAddParticipant
+            )
+            OrganizerManagePrimaryActionButton(
+                icon: "paperplane.fill",
+                title: "Messaggio",
+                tint: Brand.warning,
+                action: onBroadcast
+            )
+            if showBalanceReminders {
+                OrganizerManagePrimaryActionButton(
+                    icon: "bell.badge",
+                    title: "Saldo",
+                    tint: Brand.secondary,
+                    isDisabled: reminderCount == 0,
+                    action: onBalanceReminders
+                )
+            }
+        }
+    }
+}
+
+private struct OrganizerManagePrimaryActionButton: View {
+    let icon: String
+    let title: String
+    let tint: Color
+    var isDisabled = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(.caption.weight(.bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+                .frame(maxWidth: .infinity, minHeight: 38)
+                .foregroundStyle(isDisabled ? Brand.mutedForeground : tint)
+                .background((isDisabled ? Brand.muted : tint.opacity(0.10)), in: RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(isDisabled ? Brand.muted : tint.opacity(0.28), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .accessibilityLabel(title)
+    }
+}
+
+private struct OrganizerManageQuickActionButton: View {
+    let icon: String
+    let title: String
+    let tint: Color
+    var isDestructive = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 7) {
+                Image(systemName: icon)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 32, height: 32)
+                    .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                Text(title)
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(isDestructive ? Brand.destructive : Brand.foreground)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 72)
+            .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(isDestructive ? Brand.destructive.opacity(0.28) : Brand.muted, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct OrganizerPrivateLinkCard: View {
+    let event: Event
+    let onCopy: () -> Void
+    let onWhatsApp: () -> Void
+
+    private var title: String {
+        event.visibility == "private" ? "Evento privato" : "Evento nascosto"
+    }
+
+    private var link: String {
+        event.webURL?.absoluteString ?? ""
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("\(title) - Condividi il link", systemImage: "lock")
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(Brand.warning)
+
+            Text(link)
+                .font(.caption)
+                .foregroundStyle(Brand.mutedForeground)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.horizontal, 12)
+                .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
+                .background(Brand.muted.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
+
+            HStack(spacing: 8) {
+                Button(action: onCopy) {
+                    Label("Copia", systemImage: "doc.on.doc")
+                        .frame(maxWidth: .infinity)
+                }
+                .font(.caption.weight(.bold))
+                .buttonStyle(.bordered)
+                .tint(Brand.primary)
+
+                Button(action: onWhatsApp) {
+                    Label("WhatsApp", systemImage: "message.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .font(.caption.weight(.bold))
+                .buttonStyle(.bordered)
+                .tint(Color(red: 0.12, green: 0.84, blue: 0.38))
+            }
+        }
+        .padding(12)
+        .background(Brand.warning.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.warning.opacity(0.24), lineWidth: 1))
+    }
+}
+
+struct OrganizerManageTabBar: View {
+    @Binding var selection: Int
+    let participantCount: Int
+    let checkedInCount: Int
+    let waitlistCount: Int
+    let pendingCount: Int
+
+    private var tabs: [OrganizerManageTabItem] {
+        [
+            .init(id: 0, title: "Participants", icon: "person.2.fill", count: participantCount),
+            .init(id: 1, title: "Check-in", icon: "checkmark.circle.fill", count: checkedInCount),
+            .init(id: 2, title: "Waitlist", icon: "list.bullet", count: waitlistCount),
+            .init(id: 3, title: "Pending", icon: "person.crop.circle.badge.questionmark", count: pendingCount),
+            .init(id: 4, title: "Stats", icon: "chart.bar", count: nil),
+            .init(id: 5, title: "Azioni", icon: "ellipsis.circle", count: nil)
+        ]
+    }
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(tabs) { tab in
+                    Button {
+                        selection = tab.id
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: tab.icon)
+                                .font(.caption.weight(.bold))
+                            Text(tab.title)
+                                .lineLimit(1)
+                            if let count = tab.count, count > 0 {
+                                Text("\(count)")
+                                    .font(.caption2.weight(.bold))
+                                    .padding(.horizontal, 6)
+                                    .frame(minHeight: 18)
+                                    .background(selection == tab.id ? .white.opacity(0.22) : Brand.muted, in: Capsule())
+                            }
+                        }
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(selection == tab.id ? .white : Brand.foreground)
+                        .padding(.horizontal, 12)
+                        .frame(height: 38)
+                        .background(selection == tab.id ? Brand.primary : Brand.card, in: RoundedRectangle(cornerRadius: 12))
+                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(selection == tab.id ? Brand.primary : Brand.muted, lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, 2)
+        }
+    }
+}
+
+private struct OrganizerManageTabItem: Identifiable {
+    let id: Int
+    let title: String
+    let icon: String
+    let count: Int?
 }
 
 struct OrganizerParticipationOptionsBreakdown: View {
@@ -13041,18 +17141,22 @@ struct OrganizerParticipantsSection: View {
     let onStatus: (OrganizerRegistration, String) -> Void
     let onPayment: (OrganizerRegistration, String) -> Void
     let onMeetingPoint: (OrganizerRegistration, String?) -> Void
+    let onPriceOption: (OrganizerRegistration, String?) -> Void
+    let onExport: () -> Void
 
     @State private var selectedParticipantFilter = "__all_participants__"
     @State private var selectedPriceOptionFilter = "__all_price_options__"
+    @State private var selectedMeetingPointFilter = "__all_meeting_points__"
 
     private static let allParticipantFilter = "__all_participants__"
     private static let optionParticipantFilter = "__option_participants__"
     private static let depositParticipantFilter = "__deposit_participants__"
-    private static let balanceOnSiteParticipantFilter = "__balance_on_site_participants__"
-    private static let paidOnlineParticipantFilter = "__paid_online_participants__"
+    private static let attendedParticipantFilter = "__attended_participants__"
     private static let waitlistParticipantFilter = "__waitlist_participants__"
     private static let allPriceOptionsFilter = "__all_price_options__"
     private static let withoutPriceOptionFilter = "__without_price_option__"
+    private static let allMeetingPointsFilter = "__all_meeting_points__"
+    private static let withoutMeetingPointFilter = "__without_meeting_point__"
 
     private var activeRegistrations: [OrganizerRegistration] {
         registrations.filter(\.isActive)
@@ -13073,40 +17177,121 @@ struct OrganizerParticipantsSection: View {
     }
 
     private var filteredRegistrations: [OrganizerRegistration] {
+        let base: [OrganizerRegistration]
         switch selectedParticipantFilter {
         case Self.optionParticipantFilter:
-            return optionFilteredRegistrations
+            base = optionFilteredRegistrations
         case Self.depositParticipantFilter:
-            return activeRegistrations.filter(isDepositPaid)
-        case Self.balanceOnSiteParticipantFilter:
-            return activeRegistrations.filter(isBalanceOnSite)
-        case Self.paidOnlineParticipantFilter:
-            return activeRegistrations.filter(isPaidOnline)
+            base = activeRegistrations.filter(isDepositPaid)
+        case Self.attendedParticipantFilter:
+            base = activeRegistrations.filter(isAttended)
         case Self.waitlistParticipantFilter:
-            return registrations.filter { $0.normalizedStatus == "waitlist" }
+            base = registrations.filter { $0.normalizedStatus == "waitlist" }
         default:
-            return activeRegistrations
+            base = activeRegistrations
         }
+        return registrationsFilteredByMeetingPoint(base)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            LazyVGrid(columns: quickFilterColumns, spacing: 8) {
+                OrganizerParticipantFilterCard(
+                    title: "\(activeRegistrations.count)",
+                    subtitle: "Partecipanti",
+                    icon: "person.2.fill",
+                    tint: Brand.primary,
+                    isSelected: selectedParticipantFilter == Self.allParticipantFilter
+                ) {
+                    selectedParticipantFilter = Self.allParticipantFilter
+                }
+
+                if shouldShowDepositFilter {
+                    OrganizerParticipantFilterCard(
+                        title: "\(depositPaidCount)",
+                        subtitle: "Acconti",
+                        icon: "creditcard",
+                        tint: Brand.warning,
+                        isSelected: selectedParticipantFilter == Self.depositParticipantFilter
+                    ) {
+                        selectedParticipantFilter = Self.depositParticipantFilter
+                    }
+                }
+
+                OrganizerParticipantFilterCard(
+                    title: "\(attendedCount)",
+                    subtitle: "Presenti",
+                    icon: "checkmark.circle.fill",
+                    tint: Brand.success,
+                    isSelected: selectedParticipantFilter == Self.attendedParticipantFilter
+                ) {
+                    selectedParticipantFilter = Self.attendedParticipantFilter
+                }
+
+                OrganizerParticipantFilterCard(
+                    title: "\(waitlistCount)",
+                    subtitle: "Lista d'attesa",
+                    icon: "list.bullet",
+                    tint: Brand.warning,
+                    isSelected: selectedParticipantFilter == Self.waitlistParticipantFilter
+                ) {
+                    selectedParticipantFilter = Self.waitlistParticipantFilter
+                }
+
+                if !filterOptions.isEmpty {
+                    OrganizerParticipantFilterCard(
+                        title: "\(filterOptions.count)",
+                        subtitle: "Opzioni",
+                        icon: "ticket",
+                        tint: Brand.secondary,
+                        isSelected: selectedParticipantFilter == Self.optionParticipantFilter
+                    ) {
+                        selectedParticipantFilter = Self.optionParticipantFilter
+                    }
+                }
+            }
+
             VStack(spacing: 10) {
                 HStack(spacing: 10) {
                     Label("Filtro", systemImage: "line.3.horizontal.decrease.circle")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(Brand.foreground)
                     Spacer()
+                    Button(action: onExport) {
+                        Label("CSV", systemImage: "square.and.arrow.down")
+                    }
+                    .font(.caption.weight(.bold))
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(Brand.primary)
+                    .disabled(registrations.isEmpty)
                     Picker("Filtro", selection: $selectedParticipantFilter) {
                         Text("Tutti").tag(Self.allParticipantFilter)
                         Text("Per opzione").tag(Self.optionParticipantFilter)
                         Text("Acconto pagato").tag(Self.depositParticipantFilter)
-                        Text("Saldo sul posto").tag(Self.balanceOnSiteParticipantFilter)
-                        Text("Pagato online").tag(Self.paidOnlineParticipantFilter)
-                        Text("Waiting list").tag(Self.waitlistParticipantFilter)
+                        Text("Presenti").tag(Self.attendedParticipantFilter)
+                        Text("Lista d'attesa").tag(Self.waitlistParticipantFilter)
                     }
                     .pickerStyle(.menu)
                     .tint(Brand.primary)
+                }
+
+                if !meetingPoints.isEmpty {
+                    HStack(spacing: 10) {
+                        Label("Ritrovo", systemImage: "mappin.and.ellipse")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Brand.foreground)
+                        Spacer()
+                        Picker("Ritrovo", selection: $selectedMeetingPointFilter) {
+                            Text("Tutti").tag(Self.allMeetingPointsFilter)
+                            ForEach(meetingPoints) { point in
+                                Text(point.name ?? "Ritrovo").tag(point.id)
+                            }
+                            Text("Senza ritrovo").tag(Self.withoutMeetingPointFilter)
+                        }
+                        .pickerStyle(.menu)
+                        .tint(Brand.primary)
+                    }
                 }
 
                 if selectedParticipantFilter == Self.optionParticipantFilter, !filterOptions.isEmpty {
@@ -13142,12 +17327,15 @@ struct OrganizerParticipantsSection: View {
                     ForEach(filteredRegistrations) { registration in
                         OrganizerParticipantRow(
                             registration: registration,
+                            event: event,
                             meetingPoint: meetingPoints.first { $0.id == registration.meetingPointId },
                             meetingPoints: meetingPoints,
+                            priceOptions: priceOptions,
                             onToggleCheckIn: { onToggleCheckIn(registration) },
                             onStatus: { onStatus(registration, $0) },
                             onPayment: { onPayment(registration, $0) },
-                            onMeetingPoint: { onMeetingPoint(registration, $0) }
+                            onMeetingPoint: { onMeetingPoint(registration, $0) },
+                            onPriceOption: { onPriceOption(registration, $0) }
                         )
                     }
                 }
@@ -13167,6 +17355,36 @@ struct OrganizerParticipantsSection: View {
             else { return }
             selectedPriceOptionFilter = firstOption.id
         }
+        .onChange(of: meetingPoints.map(\.id)) { _, ids in
+            guard selectedMeetingPointFilter != Self.allMeetingPointsFilter,
+                  selectedMeetingPointFilter != Self.withoutMeetingPointFilter,
+                  !ids.contains(selectedMeetingPointFilter)
+            else { return }
+            selectedMeetingPointFilter = Self.allMeetingPointsFilter
+        }
+    }
+
+    private var quickFilterColumns: [GridItem] {
+        [GridItem(.adaptive(minimum: 96), spacing: 8)]
+    }
+
+    private var depositPaidCount: Int {
+        activeRegistrations.filter(isDepositPaid).count
+    }
+
+    private var attendedCount: Int {
+        activeRegistrations.filter(isAttended).count
+    }
+
+    private var waitlistCount: Int {
+        registrations.filter { $0.normalizedStatus == "waitlist" }.count
+    }
+
+    private var shouldShowDepositFilter: Bool {
+        depositPaidCount > 0
+            || event.paymentType == "deposit"
+            || priceOptions.contains { $0.effectivePaymentType(fallback: event) == "deposit" }
+            || event.priceOptions.contains { $0.effectivePaymentType(fallback: event) == "deposit" }
     }
 
     private var optionFilteredRegistrations: [OrganizerRegistration] {
@@ -13181,18 +17399,28 @@ struct OrganizerParticipantsSection: View {
         }
     }
 
+    private func registrationsFilteredByMeetingPoint(_ source: [OrganizerRegistration]) -> [OrganizerRegistration] {
+        guard !meetingPoints.isEmpty else { return source }
+        switch selectedMeetingPointFilter {
+        case Self.allMeetingPointsFilter:
+            return source
+        case Self.withoutMeetingPointFilter:
+            return source.filter { $0.meetingPointId?.nilIfBlank == nil }
+        default:
+            return source.filter { $0.meetingPointId == selectedMeetingPointFilter }
+        }
+    }
+
     private var selectedFilterLabel: String {
         switch selectedParticipantFilter {
         case Self.optionParticipantFilter:
             return "Filtro opzione"
         case Self.depositParticipantFilter:
             return "Acconto pagato"
-        case Self.balanceOnSiteParticipantFilter:
-            return "Saldo sul posto"
-        case Self.paidOnlineParticipantFilter:
-            return "Pagato online"
+        case Self.attendedParticipantFilter:
+            return "Presenti"
         case Self.waitlistParticipantFilter:
-            return "Waiting list"
+            return "Lista d'attesa"
         default:
             return "Partecipanti"
         }
@@ -13204,10 +17432,8 @@ struct OrganizerParticipantsSection: View {
             return "ticket"
         case Self.depositParticipantFilter:
             return "creditcard"
-        case Self.balanceOnSiteParticipantFilter:
-            return "banknote"
-        case Self.paidOnlineParticipantFilter:
-            return "checkmark.seal"
+        case Self.attendedParticipantFilter:
+            return "checkmark.circle.fill"
         case Self.waitlistParticipantFilter:
             return "list.bullet"
         default:
@@ -13221,32 +17447,57 @@ struct OrganizerParticipantsSection: View {
             return "Non ci sono partecipanti per questa opzione."
         case Self.depositParticipantFilter:
             return "Non ci sono partecipanti con acconto pagato."
-        case Self.balanceOnSiteParticipantFilter:
-            return "Non ci sono saldi da incassare sul posto."
-        case Self.paidOnlineParticipantFilter:
-            return "Non ci sono partecipanti con pagamento online completato."
+        case Self.attendedParticipantFilter:
+            return "Non ci sono partecipanti con check-in confermato."
         case Self.waitlistParticipantFilter:
-            return "Non ci sono partecipanti in waiting list."
+            return "Non ci sono partecipanti in lista d'attesa."
         default:
             return "Non ci sono partecipanti per questo filtro."
         }
+    }
+
+    private func isAttended(_ registration: OrganizerRegistration) -> Bool {
+        registration.checkedIn == true || registration.normalizedStatus == "attended"
     }
 
     private func isDepositPaid(_ registration: OrganizerRegistration) -> Bool {
         registration.normalizedStatus == "deposit_paid" || registration.paymentStatus == "deposit_paid"
     }
 
-    private func isBalanceOnSite(_ registration: OrganizerRegistration) -> Bool {
-        if registration.paymentStatus == "pay_on_location" { return true }
-        guard isDepositPaid(registration) else { return false }
-        return (registration.priceOption?.effectiveBalancePaymentMode(fallback: event) ?? event.balancePaymentMode ?? "online") == "on_site"
-    }
+}
 
-    private func isPaidOnline(_ registration: OrganizerRegistration) -> Bool {
-        let isPaid = registration.normalizedStatus == "paid" || registration.paymentStatus == "paid"
-        guard isPaid else { return false }
-        let paymentType = registration.priceOption?.effectivePaymentType(fallback: event) ?? event.paymentType ?? "free"
-        return paymentType == "paid" || paymentType == "deposit"
+private struct OrganizerParticipantFilterCard: View {
+    let title: String
+    let subtitle: String
+    let icon: String
+    let tint: Color
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(isSelected ? .white : tint)
+                    .frame(height: 18)
+                Text(title)
+                    .font(.system(.headline, design: .rounded, weight: .bold))
+                    .foregroundStyle(isSelected ? .white : Brand.foreground)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(isSelected ? .white.opacity(0.88) : Brand.mutedForeground)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 74)
+            .background(isSelected ? tint : Brand.card, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(isSelected ? tint : Brand.muted, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(subtitle): \(title)")
     }
 }
 
@@ -13256,11 +17507,13 @@ struct OrganizerCheckInSection: View {
     let onToggleCheckIn: (OrganizerRegistration) -> Void
 
     @State private var selectedMeetingPointFilter = allMeetingPointsFilter
+    @State private var searchQuery = ""
+    @State private var quickCheckIn = false
 
     private static let allMeetingPointsFilter = "__all_meeting_points__"
     private static let withoutMeetingPointFilter = "__without_meeting_point__"
 
-    private var filteredRegistrations: [OrganizerRegistration] {
+    private var meetingPointFilteredRegistrations: [OrganizerRegistration] {
         switch selectedMeetingPointFilter {
         case Self.allMeetingPointsFilter:
             return registrations
@@ -13271,8 +17524,44 @@ struct OrganizerCheckInSection: View {
         }
     }
 
+    private var filteredRegistrations: [OrganizerRegistration] {
+        let cleanQuery = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanQuery.isEmpty else { return meetingPointFilteredRegistrations }
+        return meetingPointFilteredRegistrations.filter { registration in
+            registration.displayName.localizedCaseInsensitiveContains(cleanQuery)
+                || (registration.profiles?.phone?.localizedCaseInsensitiveContains(cleanQuery) == true)
+                || (registration.profiles?.membershipId.map(String.init)?.localizedCaseInsensitiveContains(cleanQuery) == true)
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Label("Cerca", systemImage: "magnifyingglass")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Brand.foreground)
+                TextField("Nome, telefono o ID", text: $searchQuery)
+                    .textInputAutocapitalization(.words)
+                    .editableTextInput()
+                Button {
+                    quickCheckIn.toggle()
+                } label: {
+                    Label("Quick", systemImage: "bolt.fill")
+                        .labelStyle(.titleAndIcon)
+                }
+                .font(.caption.weight(.bold))
+                .foregroundStyle(quickCheckIn ? .white : Brand.primary)
+                .padding(.horizontal, 10)
+                .frame(height: 32)
+                .background(quickCheckIn ? Brand.primary : Brand.primary.opacity(0.08), in: Capsule())
+                .overlay(Capsule().stroke(quickCheckIn ? Brand.primary : Brand.primary.opacity(0.28), lineWidth: 1))
+                .buttonStyle(.plain)
+                .accessibilityLabel(quickCheckIn ? "Disattiva check-in rapido" : "Attiva check-in rapido")
+            }
+            .padding(12)
+            .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+
             if !meetingPoints.isEmpty {
                 HStack(spacing: 10) {
                     Label("Ritrovo", systemImage: "mappin.and.ellipse")
@@ -13302,37 +17591,23 @@ struct OrganizerCheckInSection: View {
             if registrations.isEmpty {
                 EmptyState(icon: "person.crop.circle.badge.xmark", title: "Nessun check-in", message: "Non ci sono partecipanti attivi.")
             } else if filteredRegistrations.isEmpty {
-                EmptyState(icon: "line.3.horizontal.decrease.circle", title: "Nessun partecipante", message: "Non ci sono partecipanti per questo ritrovo.")
+                EmptyState(
+                    icon: "line.3.horizontal.decrease.circle",
+                    title: "Nessun partecipante",
+                    message: searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? "Non ci sono partecipanti per questo ritrovo."
+                        : "Nessun partecipante corrisponde alla ricerca."
+                )
             } else {
                 LazyVStack(spacing: 10) {
                     ForEach(filteredRegistrations) { registration in
-                        Button {
+                        OrganizerCheckInRow(
+                            registration: registration,
+                            subtitle: checkInSubtitle(for: registration),
+                            quickCheckIn: quickCheckIn
+                        ) {
                             onToggleCheckIn(registration)
-                        } label: {
-                            HStack(spacing: 12) {
-                                Image(systemName: registration.checkedIn == true ? "checkmark.circle.fill" : "circle")
-                                    .font(.title3)
-                                    .foregroundStyle(registration.checkedIn == true ? Brand.success : Brand.mutedForeground)
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(registration.displayName)
-                                        .font(.subheadline.weight(.bold))
-                                        .foregroundStyle(Brand.foreground)
-                                    if let point = meetingPoints.first(where: { $0.id == registration.meetingPointId }) {
-                                        Text(point.name ?? "Ritrovo")
-                                            .font(.caption)
-                                            .foregroundStyle(Brand.mutedForeground)
-                                    }
-                                }
-                                Spacer()
-                                Text(registration.checkedIn == true ? "Undo" : "Check-in")
-                                    .font(.caption.weight(.bold))
-                                    .foregroundStyle(registration.checkedIn == true ? Brand.success : Brand.primary)
-                            }
-                            .padding(12)
-                            .background(registration.checkedIn == true ? Brand.success.opacity(0.08) : Brand.card, in: RoundedRectangle(cornerRadius: 16))
-                            .overlay(RoundedRectangle(cornerRadius: 16).stroke(registration.checkedIn == true ? Brand.success.opacity(0.28) : Brand.muted, lineWidth: 1))
                         }
-                        .buttonStyle(.plain)
                     }
                 }
             }
@@ -13345,6 +17620,90 @@ struct OrganizerCheckInSection: View {
             selectedMeetingPointFilter = Self.allMeetingPointsFilter
         }
     }
+
+    private func checkInSubtitle(for registration: OrganizerRegistration) -> String {
+        var parts: [String] = []
+        if let point = meetingPoints.first(where: { $0.id == registration.meetingPointId })?.name?.nilIfBlank {
+            parts.append(point)
+        }
+        if let membershipId = registration.profiles?.membershipId {
+            parts.append("ID \(membershipId)")
+        }
+        if let sportLevel = registration.sportLevel?.nilIfBlank, !registration.isManual {
+            parts.append(sportLevel)
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
+struct OrganizerCheckInRow: View {
+    let registration: OrganizerRegistration
+    let subtitle: String
+    let quickCheckIn: Bool
+    let onToggle: () -> Void
+
+    private var checkedIn: Bool {
+        registration.checkedIn == true
+    }
+
+    var body: some View {
+        Group {
+            if quickCheckIn {
+                Button(action: onToggle) {
+                    rowContent
+                }
+                .buttonStyle(.plain)
+            } else {
+                rowContent
+            }
+        }
+        .padding(12)
+        .background(checkedIn ? Brand.success.opacity(0.08) : Brand.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(checkedIn ? Brand.success.opacity(0.28) : Brand.muted, lineWidth: 1))
+    }
+
+    @ViewBuilder
+    private var rowContent: some View {
+        HStack(spacing: 12) {
+            Image(systemName: checkedIn ? "checkmark.circle.fill" : "circle")
+                .font(.title3)
+                .foregroundStyle(checkedIn ? Brand.success : Brand.mutedForeground)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 5) {
+                    Text(registration.displayName)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                        .lineLimit(1)
+                    if registration.isManual {
+                        Text("manuale")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(Brand.warning)
+                    }
+                }
+                Text(subtitle.isEmpty ? "Partecipante registrato" : subtitle)
+                    .font(.caption)
+                    .foregroundStyle(Brand.mutedForeground)
+                    .lineLimit(1)
+            }
+            Spacer()
+            if quickCheckIn {
+                Text(checkedIn ? "Presente" : "Da fare")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(checkedIn ? Brand.success : Brand.mutedForeground)
+            } else {
+                Button(action: onToggle) {
+                    Text(checkedIn ? "Undo" : "Check-in")
+                        .font(.caption.weight(.bold))
+                        .padding(.horizontal, 10)
+                        .frame(height: 30)
+                        .foregroundStyle(checkedIn ? Brand.success : .white)
+                        .background(checkedIn ? Brand.success.opacity(0.12) : Brand.primary, in: Capsule())
+                        .overlay(Capsule().stroke(checkedIn ? Brand.success.opacity(0.28) : Brand.primary, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
 }
 
 struct OrganizerQueueSection: View {
@@ -13352,8 +17711,8 @@ struct OrganizerQueueSection: View {
     let emptyTitle: String
     let registrations: [OrganizerRegistration]
     let meetingPoints: [MeetingPoint]
-    let primaryTitle: String
-    let primaryAction: (OrganizerRegistration) -> Void
+    let primaryTitle: String?
+    let primaryAction: ((OrganizerRegistration) -> Void)?
     let secondaryTitle: String?
     let secondaryAction: ((OrganizerRegistration) -> Void)?
 
@@ -13370,38 +17729,91 @@ struct OrganizerQueueSection: View {
                 }
             } else {
                 ForEach(registrations) { registration in
-                    HStack(spacing: 12) {
-                        OrganizerProfileAvatar(profile: registration.profiles, name: registration.displayName)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(registration.displayName)
-                                .font(.subheadline.weight(.bold))
-                            if let point = meetingPoints.first(where: { $0.id == registration.meetingPointId }) {
-                                Text(point.name ?? "Ritrovo")
-                                    .font(.caption)
-                                    .foregroundStyle(Brand.mutedForeground)
-                            }
-                            if let priceOption = registration.priceOption?.displayName.nilIfBlank {
-                                Text(priceOption)
-                                    .font(.caption)
-                                    .foregroundStyle(Brand.mutedForeground)
-                            }
-                        }
-                        Spacer()
-                        Button(primaryTitle) { primaryAction(registration) }
-                            .font(.caption.weight(.bold))
-                            .buttonStyle(.borderedProminent)
-                            .tint(Brand.primary)
-                        if let secondaryTitle, let secondaryAction {
-                            Button(secondaryTitle) { secondaryAction(registration) }
-                                .font(.caption.weight(.bold))
-                                .buttonStyle(.bordered)
-                        }
-                    }
-                    .padding(12)
-                    .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
-                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+                    OrganizerQueueRow(
+                        registration: registration,
+                        meetingPoint: meetingPoints.first { $0.id == registration.meetingPointId },
+                        primaryTitle: primaryTitle,
+                        primaryAction: primaryAction.map { action in { action(registration) } },
+                        secondaryTitle: secondaryTitle,
+                        secondaryAction: secondaryAction.map { action in { action(registration) } }
+                    )
                 }
             }
+        }
+    }
+}
+
+private struct OrganizerQueueRow: View {
+    let registration: OrganizerRegistration
+    let meetingPoint: MeetingPoint?
+    let primaryTitle: String?
+    let primaryAction: (() -> Void)?
+    let secondaryTitle: String?
+    let secondaryAction: (() -> Void)?
+
+    private var details: String {
+        [
+            meetingPoint?.name?.nilIfBlank,
+            registration.priceOption?.displayName.nilIfBlank,
+            registration.createdAt?.shortDateLabel
+        ]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+    }
+
+    private var hasActions: Bool {
+        (primaryTitle != nil && primaryAction != nil) || (secondaryTitle != nil && secondaryAction != nil)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                OrganizerProfileAvatar(profile: registration.profiles, name: registration.displayName)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(registration.displayName)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                        .lineLimit(1)
+                    if !details.isEmpty {
+                        Text(details)
+                            .font(.caption)
+                            .foregroundStyle(Brand.mutedForeground)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+
+            if hasActions {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        actionButtons
+                    }
+                    VStack(spacing: 8) {
+                        actionButtons
+                    }
+                }
+            }
+        }
+        .padding(12)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+    }
+
+    @ViewBuilder
+    private var actionButtons: some View {
+        if let primaryTitle, let primaryAction {
+            Button(primaryTitle, action: primaryAction)
+                .font(.caption.weight(.bold))
+                .buttonStyle(.borderedProminent)
+                .tint(Brand.primary)
+                .frame(maxWidth: .infinity)
+        }
+        if let secondaryTitle, let secondaryAction {
+            Button(secondaryTitle, action: secondaryAction)
+                .font(.caption.weight(.bold))
+                .buttonStyle(.bordered)
+                .frame(maxWidth: .infinity)
         }
     }
 }
@@ -13581,6 +17993,11 @@ struct OrganizerEventAnalyticsSection: View {
                                     Text("\(broadcast.channelLabel) · \(broadcast.recipientsCount ?? 0) destinatari")
                                         .font(.caption.weight(.bold))
                                         .foregroundStyle(Brand.foreground)
+                                    if let date = broadcast.displayDateTime {
+                                        Text(date)
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundStyle(Brand.mutedForeground.opacity(0.75))
+                                    }
                                     Text(broadcast.message)
                                         .font(.caption)
                                         .foregroundStyle(Brand.mutedForeground)
@@ -13621,6 +18038,44 @@ private struct OrganizerAnalyticsTrendPoint: Identifiable {
     let value: Int
 
     var id: Date { date }
+}
+
+private struct OrganizerAnalyticsComparisonItem: Identifiable {
+    let label: String
+    let firstValue: Int
+    let secondValue: Int
+
+    var id: String { label }
+}
+
+private struct OrganizerDashboardInsightRow: View {
+    let icon: String
+    let tint: Color
+    let label: String
+    let title: String
+    let detail: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(tint)
+                .frame(width: 24)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label)
+                    .font(.caption)
+                    .foregroundStyle(Brand.mutedForeground)
+                Text(title)
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Brand.foreground)
+                    .lineLimit(2)
+                Text(detail)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Brand.mutedForeground)
+            }
+            Spacer(minLength: 0)
+        }
+    }
 }
 
 private struct OrganizerAnalyticsMetricCard: View {
@@ -13729,6 +18184,7 @@ private struct OrganizerAnalyticsPanel<Content: View>: View {
 private struct OrganizerAnalyticsLineChart: View {
     let points: [OrganizerAnalyticsTrendPoint]
     let tint: Color
+    var valueSuffix = " iscrizioni"
 
     private var maxValue: Int {
         max(points.map(\.value).max() ?? 1, 1)
@@ -13784,12 +18240,81 @@ private struct OrganizerAnalyticsLineChart: View {
             HStack {
                 Text(points.first?.label ?? "")
                 Spacer()
-                Text("\(chartMaxValue) iscrizioni")
+                Text("\(chartMaxValue)\(valueSuffix)")
                 Spacer()
                 Text(points.last?.label ?? "")
             }
             .font(.caption2.weight(.semibold))
             .foregroundStyle(Brand.mutedForeground)
+        }
+    }
+}
+
+private struct OrganizerAnalyticsComparisonBars: View {
+    let items: [OrganizerAnalyticsComparisonItem]
+    let firstLabel: String
+    let secondLabel: String
+    let firstColor: Color
+    let secondColor: Color
+
+    private var maxValue: Int {
+        max(items.map { max($0.firstValue, $0.secondValue) }.max() ?? 1, 1)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 14) {
+                OrganizerAnalyticsLegend(label: firstLabel, color: firstColor)
+                OrganizerAnalyticsLegend(label: secondLabel, color: secondColor)
+                Spacer(minLength: 0)
+            }
+
+            VStack(spacing: 12) {
+                ForEach(items) { item in
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text(item.label)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Brand.foreground)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.72)
+                            Spacer()
+                            Text("\(item.firstValue)/\(item.secondValue)")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(Brand.mutedForeground)
+                        }
+                        GeometryReader { proxy in
+                            VStack(spacing: 4) {
+                                Capsule()
+                                    .fill(firstColor)
+                                    .frame(width: proxy.size.width * (CGFloat(item.firstValue) / CGFloat(maxValue)), height: 7)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                Capsule()
+                                    .fill(secondColor)
+                                    .frame(width: proxy.size.width * (CGFloat(item.secondValue) / CGFloat(maxValue)), height: 7)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .frame(height: 18)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct OrganizerAnalyticsLegend: View {
+    let label: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            Text(label)
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(Brand.mutedForeground)
         }
     }
 }
@@ -13974,12 +18499,15 @@ private struct OrganizerAnalyticsEventRow: View {
 
 struct OrganizerParticipantRow: View {
     let registration: OrganizerRegistration
+    let event: Event
     let meetingPoint: MeetingPoint?
     let meetingPoints: [MeetingPoint]
+    let priceOptions: [PriceOption]
     let onToggleCheckIn: () -> Void
     let onStatus: (String) -> Void
     let onPayment: (String) -> Void
     let onMeetingPoint: (String?) -> Void
+    let onPriceOption: (String?) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -14016,18 +18544,25 @@ struct OrganizerParticipantRow: View {
                             Label(registration.checkedIn == true ? "Annulla check-in" : "Check-in", systemImage: registration.checkedIn == true ? "xmark.circle" : "checkmark.circle")
                         }
                         Divider()
-                        ForEach(["registered", "deposit_paid", "paid", "attended", "no_show", "cancelled"], id: \.self) { status in
-                            Button(status.organizerStatusLabel) { onStatus(status) }
+                        ForEach(["registered", "deposit_paid", "paid", "attended", "no_show", "pending_payment", "pending_approval", "waitlist", "cancelled"], id: \.self) { status in
+                            Button(status.webRegistrationStatusLabel) { onStatus(status) }
                         }
                         Divider()
-                        ForEach(["not_required", "pending", "paid", "deposit_paid", "pay_on_location", "failed"], id: \.self) { status in
-                            Button(status.paymentStatusLabel) { onPayment(status) }
+                        ForEach(["deposit_paid", "paid", "pending", "pay_on_location", "not_required", "failed"], id: \.self) { status in
+                            Button(status.webPaymentStatusLabel) { onPayment(status) }
                         }
                         if !meetingPoints.isEmpty {
                             Divider()
                             Button("Nessun ritrovo") { onMeetingPoint(nil) }
                             ForEach(meetingPoints) { point in
                                 Button(point.name ?? "Ritrovo") { onMeetingPoint(point.id) }
+                            }
+                        }
+                        if !priceOptions.isEmpty {
+                            Divider()
+                            Button("Nessuna opzione prezzo") { onPriceOption(nil) }
+                            ForEach(priceOptions) { option in
+                                Button(option.displayName) { onPriceOption(option.id) }
                             }
                         }
                     } label: {
@@ -14058,26 +18593,27 @@ struct OrganizerParticipantRow: View {
     private var participantChips: [OrganizerParticipantChipModel] {
         var chips: [OrganizerParticipantChipModel] = []
         if registration.isManual {
-            chips.append(.init(text: "Manuale", icon: "person.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
+            chips.append(.init(text: "(manual)", icon: "person.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
             return chips
         }
         if let level = registration.profiles?.selfLevel?.nilIfBlank {
-            chips.append(.init(text: level.readableProfileValue, icon: selfLevelIcon(level), tint: selfLevelColor(level), fill: selfLevelColor(level).opacity(0.12)))
+            chips.append(.init(text: level, icon: selfLevelIcon(level), tint: selfLevelColor(level), fill: selfLevelColor(level).opacity(0.12)))
         }
         if let trekking = registration.profiles?.trekkingExperience?.nilIfBlank {
-            chips.append(.init(text: "\(trekking.readableTrekkingValue) trek", icon: "mountain.2.fill", tint: Brand.mutedForeground, fill: Brand.muted.opacity(0.85)))
+            chips.append(.init(text: "\(trekking.webTrekkingValue) trek", icon: "mountain.2.fill", tint: Brand.mutedForeground, fill: Brand.muted.opacity(0.85)))
         }
         if let frequency = registration.profiles?.activityFrequency?.nilIfBlank {
-            chips.append(.init(text: frequency.readableProfileValue, icon: activityFrequencyIcon(frequency), tint: Brand.mutedForeground, fill: Brand.muted.opacity(0.85)))
+            chips.append(.init(text: frequency, icon: activityFrequencyIcon(frequency), tint: Brand.mutedForeground, fill: Brand.muted.opacity(0.85)))
         }
         if let grade = registration.profiles?.experienceGrade {
             chips.append(.init(text: "Grade: \(grade)", icon: "chart.bar.fill", tint: Brand.secondary, fill: Brand.secondary.opacity(0.12)))
         }
         if let sportLevel = registration.sportLevel?.nilIfBlank, !sportLevel.hasPrefix("manual:") {
-            chips.append(.init(text: "Livello: \(sportLevel.readableProfileValue)", icon: "figure.hiking", tint: Brand.primary, fill: Brand.primary.opacity(0.10)))
+            chips.append(.init(text: "Level: \(sportLevel)", icon: "figure.hiking", tint: Brand.primary, fill: Brand.primary.opacity(0.10)))
         }
-        if let payment = registration.paymentStatus?.nilIfBlank, payment != "not_required" {
-            chips.append(.init(text: payment.paymentStatusLabel, icon: "creditcard", tint: payment == "paid" ? Brand.success : Brand.warning, fill: (payment == "paid" ? Brand.success : Brand.warning).opacity(0.12)))
+        if let payment = registration.webParticipantPaymentLabel(for: event) {
+            let isPaid = registration.paymentStatus == "paid" || registration.normalizedStatus == "paid"
+            chips.append(.init(text: payment, icon: "creditcard", tint: isPaid ? Brand.success : Brand.warning, fill: (isPaid ? Brand.success : Brand.warning).opacity(0.12)))
         }
         return chips
     }
@@ -14231,7 +18767,9 @@ struct OrganizerActionsSection: View {
     let onBroadcast: () -> Void
     let onBalanceReminders: () -> Void
     let onExport: () -> Void
-    let onPublishToggle: () -> Void
+    let onShare: () -> Void
+    let onDuplicate: () -> Void
+    let onStatus: () -> Void
     let onCancelEvent: () -> Void
     let onDelete: () -> Void
 
@@ -14245,12 +18783,106 @@ struct OrganizerActionsSection: View {
             OrganizerActionButton(icon: "slider.horizontal.3", title: "Modifica capienza", subtitle: "\(event.spotsTotal ?? 0) posti totali", tint: Brand.secondary, action: onCapacity)
             OrganizerActionButton(icon: "bell.badge", title: "Invia comunicazione", subtitle: "In-app o WhatsApp, con storico", tint: Brand.warning, action: onBroadcast)
             if canSendBalanceReminders {
-                OrganizerActionButton(icon: "creditcard", title: "Sollecita saldo", subtitle: "\(reminderCount) partecipanti con acconto", tint: Brand.secondary, action: onBalanceReminders)
+                OrganizerActionButton(
+                    icon: "creditcard",
+                    title: "Sollecita saldo",
+                    subtitle: reminderCount > 0 ? "\(reminderCount) partecipanti con acconto" : "Nessun saldo da sollecitare",
+                    tint: Brand.secondary,
+                    disabled: reminderCount == 0,
+                    action: onBalanceReminders
+                )
             }
             OrganizerActionButton(icon: "square.and.arrow.up", title: "Esporta partecipanti", subtitle: "CSV condivisibile", tint: Brand.primary, action: onExport)
-            OrganizerActionButton(icon: event.normalizedStatus == "closed" ? "lock.open" : "lock", title: event.normalizedStatus == "closed" ? "Riapri iscrizioni" : "Chiudi iscrizioni", subtitle: "Aggiorna lo stato evento", tint: Brand.mutedForeground, action: onPublishToggle)
+            OrganizerActionButton(icon: "link", title: "Condividi link evento", subtitle: "Copia il link pubblico o privato", tint: Brand.primary, action: onShare)
+            OrganizerActionButton(icon: "doc.on.doc", title: "Duplica evento", subtitle: "Crea una bozza da questo evento", tint: Brand.secondary, action: onDuplicate)
+            OrganizerActionButton(icon: "slider.horizontal.3", title: "Cambia stato", subtitle: event.statusStyle.label, tint: Brand.mutedForeground, action: onStatus)
             OrganizerActionButton(icon: "xmark.octagon", title: "Cancella evento", subtitle: "Invia notifiche ed email tramite Supabase", tint: Brand.destructive, action: onCancelEvent)
             OrganizerActionButton(icon: "trash", title: "Elimina evento", subtitle: "Operazione protetta da Supabase", tint: Brand.destructive, action: onDelete)
+        }
+    }
+}
+
+struct OrganizerEventStatusSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let event: Event
+    let onSelect: (String) -> Void
+
+    private let statuses = ["draft", "published", "full", "closed", "past"]
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Stato evento") {
+                    ForEach(statuses, id: \.self) { status in
+                        Button {
+                            onSelect(status)
+                            dismiss()
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: icon(for: status))
+                                    .foregroundStyle(tint(for: status))
+                                    .frame(width: 26)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(status.organizerStatusLabel)
+                                        .font(.subheadline.weight(.bold))
+                                        .foregroundStyle(Brand.foreground)
+                                    Text(description(for: status))
+                                        .font(.caption)
+                                        .foregroundStyle(Brand.mutedForeground)
+                                }
+                                Spacer()
+                                if event.normalizedStatus == status {
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(Brand.primary)
+                                }
+                            }
+                        }
+                    }
+                }
+                Section {
+                    Text("Per cancellare l'evento usa l'azione dedicata: invia le notifiche previste ai partecipanti.")
+                        .font(.footnote)
+                        .foregroundStyle(Brand.mutedForeground)
+                }
+            }
+            .navigationTitle("Cambia stato")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Chiudi") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private func icon(for status: String) -> String {
+        switch status {
+        case "draft": return "doc.text"
+        case "published": return "eye"
+        case "full": return "person.2.slash"
+        case "closed": return "lock"
+        case "past": return "archivebox"
+        default: return "circle"
+        }
+    }
+
+    private func tint(for status: String) -> Color {
+        switch status {
+        case "draft": return Brand.warning
+        case "published": return Brand.success
+        case "full": return Brand.destructive
+        case "closed", "past": return Brand.mutedForeground
+        default: return Brand.primary
+        }
+    }
+
+    private func description(for status: String) -> String {
+        switch status {
+        case "draft": return "Nasconde l'evento dalle iscrizioni pubbliche."
+        case "published": return "Rende l'evento aperto alle iscrizioni."
+        case "full": return "Segna l'evento come completo."
+        case "closed": return "Chiude nuove iscrizioni senza cancellare l'evento."
+        case "past": return "Archivia l'evento come concluso."
+        default: return ""
         }
     }
 }
@@ -14260,6 +18892,7 @@ struct OrganizerActionButton: View {
     let title: String
     let subtitle: String
     let tint: Color
+    var disabled = false
     let action: () -> Void
 
     var body: some View {
@@ -14288,6 +18921,8 @@ struct OrganizerActionButton: View {
             .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
         }
         .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.5 : 1)
     }
 }
 
@@ -14306,7 +18941,7 @@ struct OrganizerAddParticipantSheet: View {
     @State private var selectedProfile: OrganizerSearchProfile?
     @State private var meetingPointId = ""
     @State private var priceOptionId = ""
-    @State private var paymentStatus = "pending"
+    @State private var paymentStatus = "not_required"
     @State private var saving = false
 
     var body: some View {
@@ -14330,7 +18965,7 @@ struct OrganizerAddParticipantSheet: View {
                         }
                         .editableControlSurface()
                     } else {
-                        TextField("Cerca per nome", text: $searchQuery)
+                        TextField("Cerca per nome o email", text: $searchQuery)
                             .textInputAutocapitalization(.words)
                             .editableTextInput()
                         ForEach(searchResults) { profile in
@@ -14338,13 +18973,7 @@ struct OrganizerAddParticipantSheet: View {
                                 selectedProfile = profile
                                 searchQuery = profile.displayName
                             } label: {
-                                HStack {
-                                    Text(profile.displayName)
-                                    Spacer()
-                                    if selectedProfile?.id == profile.id {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
+                                OrganizerSearchProfileRow(profile: profile, selected: selectedProfile?.id == profile.id)
                             }
                         }
                     }
@@ -14367,7 +18996,7 @@ struct OrganizerAddParticipantSheet: View {
                     }
                     .editableControlSurface()
                     Picker("Pagamento", selection: $paymentStatus) {
-                        ForEach(["pending", "paid", "deposit_paid", "not_required", "pay_on_location"], id: \.self) {
+                        ForEach(["deposit_paid", "paid", "pending", "pay_on_location", "not_required", "failed"], id: \.self) {
                             Text($0.paymentStatusLabel).tag($0)
                         }
                     }
@@ -14428,21 +19057,62 @@ struct OrganizerAddParticipantSheet: View {
     }
 }
 
+private struct OrganizerSearchProfileRow: View {
+    let profile: OrganizerSearchProfile
+    let selected: Bool
+
+    private var subtitle: String {
+        [profile.phone?.nilIfBlank, profile.email?.nilIfBlank, profile.membershipId.map { "ID \($0)" }]
+            .compactMap { $0 }
+            .joined(separator: " · ")
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            OrganizerOwnerAvatar(name: profile.displayName, avatarUrl: profile.avatarUrl, size: 34)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(profile.displayName)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Brand.foreground)
+                    .lineLimit(1)
+                if !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                        .lineLimit(1)
+                }
+            }
+            Spacer()
+            if selected {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(Brand.success)
+            }
+        }
+    }
+}
+
 struct OrganizerCapacitySheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var capacity: Int
+    let minimumCapacity: Int
     let onSave: (Int) async -> Void
 
-    init(currentCapacity: Int, onSave: @escaping (Int) async -> Void) {
-        _capacity = State(initialValue: max(currentCapacity, 1))
+    init(currentCapacity: Int, minimumCapacity: Int, onSave: @escaping (Int) async -> Void) {
+        self.minimumCapacity = max(minimumCapacity, 1)
+        _capacity = State(initialValue: max(currentCapacity, minimumCapacity, 1))
         self.onSave = onSave
     }
 
     var body: some View {
         NavigationStack {
             Form {
-                Stepper("Posti totali: \(capacity)", value: $capacity, in: 1...300)
-                    .editableControlSurface()
+                Section("Capienza") {
+                    Stepper("Posti totali: \(capacity)", value: $capacity, in: minimumCapacity...300)
+                        .editableControlSurface()
+                    Text("Minimo: \(minimumCapacity) partecipanti attivi.")
+                        .font(.footnote)
+                        .foregroundStyle(Brand.mutedForeground)
+                }
             }
             .navigationTitle("Capienza")
             .toolbar {
@@ -14454,6 +19124,7 @@ struct OrganizerCapacitySheet: View {
                             dismiss()
                         }
                     }
+                    .disabled(capacity < minimumCapacity)
                 }
             }
         }
@@ -14472,11 +19143,41 @@ struct OrganizerBroadcastSheet: View {
     @State private var channel = "notification"
     @State private var sending = false
 
+    private var activeRecipients: [OrganizerRegistration] {
+        registrations.filter { $0.isActive && !$0.isManual }
+    }
+
+    private var notificationRecipientCount: Int {
+        Set(activeRecipients.compactMap { $0.userId?.nilIfBlank }).count
+    }
+
+    private var whatsAppPhones: [String] {
+        var seen = Set<String>()
+        return activeRecipients.compactMap { registration in
+            guard let phone = registration.profiles?.phone?.whatsAppPhone, seen.insert(phone).inserted else {
+                return nil
+            }
+            return phone
+        }
+    }
+
+    private var currentRecipientCount: Int {
+        channel == "whatsapp" ? whatsAppPhones.count : notificationRecipientCount
+    }
+
+    private var canSend: Bool {
+        message.nilIfBlank != nil && !sending && currentRecipientCount > 0
+    }
+
     var body: some View {
         NavigationStack {
             Form {
-                if !templates.isEmpty {
-                    Section("Template") {
+                Section("Template") {
+                    if templates.isEmpty {
+                        Text("Nessun template configurato.")
+                            .font(.caption)
+                            .foregroundStyle(Brand.mutedForeground)
+                    } else {
                         ForEach(templates) { template in
                             Button(template.title) {
                                 message = template.message.replacingOccurrences(of: "{{event_title}}", with: event.title)
@@ -14485,14 +19186,22 @@ struct OrganizerBroadcastSheet: View {
                     }
                 }
                 Section("Messaggio") {
-                    TextEditor(text: $message)
-                        .frame(minHeight: 140)
-                        .foregroundStyle(Brand.inputForeground)
-                        .tint(Brand.primary)
-                        .scrollContentBackground(.hidden)
-                        .padding(10)
-                        .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 14))
-                        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.inputBorder, lineWidth: 1))
+                    ZStack(alignment: .topLeading) {
+                        if message.isEmpty {
+                            Text("Scrivi il messaggio...")
+                                .foregroundStyle(Brand.inputMutedForeground)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 18)
+                        }
+                        TextEditor(text: $message)
+                            .frame(minHeight: 140)
+                            .foregroundStyle(Brand.inputForeground)
+                            .tint(Brand.primary)
+                            .scrollContentBackground(.hidden)
+                            .padding(10)
+                    }
+                    .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 14))
+                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.inputBorder, lineWidth: 1))
                 }
                 Section("Canale") {
                     Picker("Canale", selection: $channel) {
@@ -14500,14 +19209,34 @@ struct OrganizerBroadcastSheet: View {
                         Text("WhatsApp").tag("whatsapp")
                     }
                     .pickerStyle(.segmented)
+                    BroadcastRecipientCountRow(
+                        title: "In-app",
+                        count: notificationRecipientCount,
+                        icon: "bell.fill",
+                        tint: Brand.primary,
+                        isSelected: channel == "notification"
+                    )
+                    BroadcastRecipientCountRow(
+                        title: "WhatsApp",
+                        count: whatsAppPhones.count,
+                        icon: "message.fill",
+                        tint: Color(red: 0.12, green: 0.84, blue: 0.38),
+                        isSelected: channel == "whatsapp"
+                    )
                 }
                 if !history.isEmpty {
                     Section("Storico") {
                         ForEach(history.prefix(5)) { broadcast in
                             VStack(alignment: .leading, spacing: 4) {
-                                Text("\(broadcast.channelLabel) · \(broadcast.recipientsCount ?? 0) destinatari")
-                                    .font(.caption.weight(.bold))
-                                    .foregroundStyle(broadcast.channelColor)
+                                HStack(spacing: 8) {
+                                    Text("\(broadcast.channelLabel) · \(broadcast.recipientsCount ?? 0) destinatari")
+                                        .foregroundStyle(broadcast.channelColor)
+                                    if let date = broadcast.displayDateTime {
+                                        Text(date)
+                                            .foregroundStyle(Brand.mutedForeground)
+                                    }
+                                }
+                                .font(.caption.weight(.bold))
                                 Text(broadcast.message)
                                     .font(.caption)
                                     .foregroundStyle(Brand.mutedForeground)
@@ -14526,37 +19255,78 @@ struct OrganizerBroadcastSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Annulla") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(sending ? "Invio..." : "Invia") {
+                    Button(sendButtonTitle) {
                         Task { await send() }
                     }
-                    .disabled(message.nilIfBlank == nil || sending)
+                    .disabled(!canSend)
                 }
             }
         }
     }
 
+    private var sendButtonTitle: String {
+        if sending { return "Invio..." }
+        if channel == "whatsapp" { return currentRecipientCount > 0 ? "Apri WhatsApp" : "Nessun numero" }
+        return currentRecipientCount > 0 ? "Invia a \(currentRecipientCount)" : "Nessun destinatario"
+    }
+
     private func send() async {
+        guard canSend else { return }
         sending = true
         if let sentCount = await store.sendOrganizerBroadcast(event: event, message: message, channel: channel, recipients: registrations) {
             if channel == "whatsapp" {
                 openWhatsAppBroadcast()
             }
-            store.errorMessage = channel == "whatsapp" ? "Broadcast WhatsApp preparato per \(sentCount) partecipanti." : "Broadcast inviato a \(sentCount) partecipanti."
+            store.errorMessage = successMessage(sentCount: sentCount)
             await onSent()
             dismiss()
         }
         sending = false
     }
 
+    private func successMessage(sentCount: Int) -> String {
+        guard channel == "whatsapp" else {
+            return "Broadcast inviato a \(sentCount) partecipanti."
+        }
+
+        let copiedCount = max(whatsAppPhones.count - 1, 0)
+        if copiedCount > 0 {
+            return "WhatsApp aperto sul primo contatto. \(copiedCount) numeri copiati negli appunti."
+        }
+        return "WhatsApp aperto. Messaggio pronto da inviare."
+    }
+
     private func openWhatsAppBroadcast() {
-        let phones = registrations
-            .filter { $0.isActive && !$0.isManual }
-            .compactMap { $0.profiles?.phone?.whatsAppPhone }
+        let phones = whatsAppPhones
         guard let first = phones.first, let url = URL(string: "https://wa.me/\(first)?text=\(message.urlEncoded)") else { return }
         if phones.count > 1 {
             UIPasteboard.general.string = phones.dropFirst().joined(separator: "\n")
         }
         UIApplication.shared.open(url)
+    }
+}
+
+struct BroadcastRecipientCountRow: View {
+    let title: String
+    let count: Int
+    let icon: String
+    let tint: Color
+    let isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(tint)
+                .frame(width: 20)
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(isSelected ? Brand.foreground : Brand.mutedForeground)
+            Spacer()
+            Text("\(count) destinatari")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(isSelected ? tint : Brand.mutedForeground)
+        }
     }
 }
 
@@ -14591,6 +19361,7 @@ struct OrganizerEventEditorView: View {
                             Text(validationMessage)
                                 .font(.footnote.weight(.semibold))
                                 .foregroundStyle(Brand.destructive)
+                                .fixedSize(horizontal: false, vertical: true)
                                 .padding(12)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .background(Brand.destructive.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
@@ -14663,35 +19434,63 @@ struct OrganizerEventEditorView: View {
                             OrganizerGalleryEditor(urls: $draft.galleryImageURLs)
                         }
 
-                        OrganizerEditorSection(title: "Capienza evento") {
+                        OrganizerEditorSection(title: "Capienza e pagamento") {
                             OrganizerIntegerStepperField("Posti totali", value: $draft.spotsTotal, range: 1...300)
                             OrganizerIntegerStepperField("Posti riservati", value: $draft.reservedSpots, range: 0...max(draft.spotsTotal, 1))
-                            Picker("Policy cancellazione", selection: $draft.cancellationPolicy) {
-                                ForEach(OrganizerEventDraft.cancellationPolicies, id: \.id) { policy in
-                                    Text(policy.label).tag(policy.id)
+                            OrganizerBasePaymentEditor(
+                                paymentType: $draft.paymentType,
+                                price: $draft.price,
+                                deposit: $draft.deposit,
+                                balancePaymentMode: $draft.balancePaymentMode,
+                                hasPriceOptions: draft.priceOptions.contains { $0.name.nilIfBlank != nil }
+                            )
+                            if draft.paymentType == "free" {
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text("Regole eventi gratuiti")
+                                        .font(.subheadline.weight(.bold))
+                                        .foregroundStyle(Brand.foreground)
+                                    Text("Per gli eventi gratuiti non viene mostrata alcuna policy di rimborso. Gli utenti vedranno solo le regole di comportamento e cancellazione del posto.")
+                                        .font(.caption)
+                                        .foregroundStyle(Brand.mutedForeground)
                                 }
-                            }
-                            .editableControlSurface()
-                            if let policy = OrganizerEventDraft.cancellationPolicies.first(where: { $0.id == draft.cancellationPolicy }) {
-                                Text(policy.description)
-                                    .font(.caption)
-                                    .foregroundStyle(Brand.mutedForeground)
+                                .padding(12)
+                                .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 14))
+                                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.muted, lineWidth: 1))
+                            } else {
+                                Picker("Policy cancellazione", selection: $draft.cancellationPolicy) {
+                                    ForEach(OrganizerEventDraft.cancellationPolicies, id: \.id) { policy in
+                                        Text(policy.label).tag(policy.id)
+                                    }
+                                }
+                                .editableControlSurface()
+                                if let policy = OrganizerEventDraft.cancellationPolicies.first(where: { $0.id == draft.cancellationPolicy }) {
+                                    Text(policy.description)
+                                        .font(.caption)
+                                        .foregroundStyle(Brand.mutedForeground)
+                                }
                             }
                         }
 
                         OrganizerEditorSection(title: "Opzioni di partecipazione") {
-                            ForEach(draft.priceOptions) { option in
-                                OrganizerPriceOptionEditor(option: priceOptionBinding(for: option.id), specialBadges: allBadges) {
-                                    draft.priceOptions.removeAll { $0.id == option.id }
+                            ForEach($draft.priceOptions) { optionBinding in
+                                OrganizerPriceOptionEditor(option: optionBinding, specialBadges: allBadges) {
+                                    let optionId = optionBinding.wrappedValue.id
+                                    draft.priceOptions.removeAll { $0.id == optionId }
                                 }
                             }
                             Button("Aggiungi opzione") {
                                 var option = OrganizerPriceOptionDraft()
-                                option.name = "Nuova opzione"
-                                option.paymentType = "paid"
+                                option.paymentType = draft.paymentType
+                                option.price = draft.paymentType == "free" ? 0 : draft.price
+                                option.depositAmount = draft.paymentType == "deposit" ? draft.deposit : 0
+                                option.balanceAmount = draft.paymentType == "deposit" ? max(0, draft.price - draft.deposit) : 0
+                                option.balancePaymentMode = draft.balancePaymentMode
                                 draft.priceOptions.append(option)
                             }
                             .buttonStyle(SecondaryButtonStyle())
+                            if draft.priceOptions.isEmpty {
+                                EmptyState(icon: "ticket", title: "Nessuna fascia prezzo", message: "Il prezzo base si applica a tutti.")
+                            }
                         }
 
                         OrganizerEditorSection(title: "Dettagli evento") {
@@ -14733,6 +19532,9 @@ struct OrganizerEventEditorView: View {
                         }
 
                         OrganizerEditorSection(title: "Regole di iscrizione") {
+                            Text("Configura chi può vedere, accedere e registrarsi a questo evento.")
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedForeground)
                             OrganizerVisibilityPickerField(visibility: $draft.visibility)
                             OrganizerRegistrationOpenField(isOpen: registrationOpenBinding)
                             OrganizerAccessRulesEditor(rules: $draft.accessRules, specialBadges: allBadges)
@@ -14747,6 +19549,12 @@ struct OrganizerEventEditorView: View {
                                 .editableControlSurface()
                                 Field("Messaggio restrizione", text: $draft.restrictionMessage)
                             }
+                            OrganizerRegistrationRulesSummary(
+                                visibility: draft.visibility,
+                                registrationOpen: draft.status != "closed",
+                                accessRulesCount: draft.accessRules.count,
+                                priceOptionCount: draft.priceOptions.filter { $0.name.nilIfBlank != nil }.count
+                            )
                         }
 
                         OrganizerEditorSection(title: "Ritrovi") {
@@ -14754,6 +19562,13 @@ struct OrganizerEventEditorView: View {
                                 OrganizerMeetingPointEditor(point: meetingPointBinding(for: point.id)) {
                                     draft.meetingPoints.removeAll { $0.id == point.id }
                                 }
+                            }
+                            if draft.meetingPoints.isEmpty {
+                                Text("Nessun punto di ritrovo aggiunto")
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.mutedForeground)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 6)
                             }
                             Button("Aggiungi ritrovo") {
                                 draft.meetingPoints.append(OrganizerMeetingPointDraft())
@@ -14765,7 +19580,7 @@ struct OrganizerEventEditorView: View {
                             if !equipmentTemplates.isEmpty {
                                 Menu("Carica template attrezzatura") {
                                     ForEach(equipmentTemplates) { template in
-                                        Button(template.name) {
+                                        Button("\(template.name) (\(template.sortedItems.count) elementi)") {
                                             draft.equipmentItems = template.sortedItems.map(OrganizerEquipmentItemDraft.init(templateItem:))
                                         }
                                     }
@@ -14777,6 +19592,13 @@ struct OrganizerEventEditorView: View {
                                     draft.equipmentItems.removeAll { $0.id == item.id }
                                 }
                             }
+                            if draft.equipmentItems.isEmpty {
+                                Text("Nessun elemento. Seleziona un template o aggiungi manualmente.")
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.mutedForeground)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 6)
+                            }
                             Button("Aggiungi oggetto") {
                                 draft.equipmentItems.append(OrganizerEquipmentItemDraft())
                             }
@@ -14784,15 +19606,39 @@ struct OrganizerEventEditorView: View {
                         }
 
                         OrganizerEditorSection(title: "Disponibilità auto") {
+                            Text("Chiedi ai partecipanti se possono guidare fino al luogo dell'evento.")
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedForeground)
                             Toggle("Chiedi disponibilita auto", isOn: $draft.askCarAvailability)
                                 .editableControlSurface()
+                            if draft.askCarAvailability {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Durante la registrazione, i partecipanti vedranno: \"Saresti disposto a prendere la macchina?\"")
+                                    Text("Opzioni: Si · Preferirei di no · Non sono automunito")
+                                        .font(.caption2)
+                                }
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedForeground)
+                                .padding(12)
+                                .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 14))
+                            }
                         }
 
                         OrganizerEditorSection(title: "Richieste speciali") {
+                            Text("Aggiungi domande personalizzate che i partecipanti devono compilare durante la registrazione.")
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedForeground)
                             ForEach(draft.additionalFields) { field in
                                 OrganizerAdditionalFieldEditor(field: additionalFieldBinding(for: field.id)) {
                                     draft.additionalFields.removeAll { $0.id == field.id }
                                 }
+                            }
+                            if draft.additionalFields.isEmpty {
+                                Text("Nessun campo personalizzato.")
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.mutedForeground)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 6)
                             }
                             Button("Aggiungi campo iscrizione") {
                                 draft.additionalFields.append(OrganizerAdditionalFieldDraft())
@@ -14811,10 +19657,10 @@ struct OrganizerEventEditorView: View {
         .roundedInlineNavigationTitle(route.title)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button(saving ? "Salvo..." : "Salva") {
+                Button(saveButtonTitle) {
                     Task { await save() }
                 }
-                .disabled(saving || loading)
+                .disabled(saving || loading || uploadingImages)
             }
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
@@ -14869,8 +19715,16 @@ struct OrganizerEventEditorView: View {
             if paymentType == "free" {
                 draft.price = 0
                 draft.deposit = 0
+            } else if paymentType != "deposit" {
+                draft.deposit = 0
             }
         }
+    }
+
+    private var saveButtonTitle: String {
+        if uploadingImages { return "Carico..." }
+        if saving { return "Salvo..." }
+        return "Salva"
     }
 
     private var registrationOpenBinding: Binding<Bool> {
@@ -14917,8 +19771,16 @@ struct OrganizerEventEditorView: View {
 
     private func save() async {
         guard !saving else { return }
-        validationMessage = draft.validationMessage
-        guard validationMessage == nil else { return }
+        guard !uploadingImages else {
+            validationMessage = "Attendi il completamento del caricamento immagini."
+            return
+        }
+        if draft.status != "closed" {
+            draft.status = "published"
+        }
+        let messages = draft.validationMessages
+        validationMessage = messages.isEmpty ? nil : "Completa prima:\n" + messages.map { "- \($0)" }.joined(separator: "\n")
+        guard messages.isEmpty else { return }
         saving = true
         defer { saving = false }
         let existingId: String?
@@ -14997,15 +19859,6 @@ struct OrganizerEventEditorView: View {
         } set: { updated in
             guard let index = draft.meetingPoints.firstIndex(where: { $0.id == id }) else { return }
             draft.meetingPoints[index] = updated
-        }
-    }
-
-    private func priceOptionBinding(for id: UUID) -> Binding<OrganizerPriceOptionDraft> {
-        Binding {
-            draft.priceOptions.first { $0.id == id } ?? OrganizerPriceOptionDraft()
-        } set: { updated in
-            guard let index = draft.priceOptions.firstIndex(where: { $0.id == id }) else { return }
-            draft.priceOptions[index] = updated
         }
     }
 
@@ -15926,6 +20779,45 @@ struct OrganizerRegistrationOpenField: View {
     }
 }
 
+struct OrganizerRegistrationRulesSummary: View {
+    let visibility: String
+    let registrationOpen: Bool
+    let accessRulesCount: Int
+    let priceOptionCount: Int
+
+    private var visibilityLabel: String {
+        switch visibility {
+        case "public": return "Visibile a tutti"
+        case "private": return "Solo link diretto"
+        case "hidden": return "Nascosto"
+        default: return "Visibilità personalizzata"
+        }
+    }
+
+    var body: some View {
+        Text(summary)
+            .font(.caption)
+            .foregroundStyle(Brand.mutedForeground)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Brand.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.primary.opacity(0.14), lineWidth: 1))
+    }
+
+    private var summary: AttributedString {
+        var text = AttributedString("Riepilogo: ")
+        var strong = AttributedString(visibilityLabel)
+        strong.foregroundColor = Brand.foreground
+        strong.font = .caption.weight(.bold)
+        text.append(strong)
+        text.append(AttributedString(" · \(registrationOpen ? "Iscrizioni aperte" : "Iscrizioni chiuse") · "))
+        text.append(AttributedString(accessRulesCount == 0 ? "Nessuna restrizione" : "\(accessRulesCount) regola/e di accesso"))
+        text.append(AttributedString(" · "))
+        text.append(AttributedString(priceOptionCount == 0 ? "Prezzo unico" : "\(priceOptionCount) fascia/e di prezzo"))
+        return text
+    }
+}
+
 struct OrganizerDurationPickerField: View {
     let title: String
     @Binding var duration: String
@@ -16475,6 +21367,86 @@ struct OrganizerMeetingPointEditor: View {
     }
 }
 
+struct OrganizerBasePaymentEditor: View {
+    @Binding var paymentType: String
+    @Binding var price: Double
+    @Binding var deposit: Double
+    @Binding var balancePaymentMode: String
+    let hasPriceOptions: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("Tipo pagamento", selection: paymentModeBinding) {
+                Text("Evento gratuito").tag("free")
+                Text("Pagamento online").tag("paid")
+                Text("Pagamento sul posto").tag("location")
+                Text("Acconto + saldo online").tag("deposit_online")
+                Text("Acconto + saldo sul posto").tag("deposit_on_site")
+            }
+            .editableControlSurface(cornerRadius: 12)
+
+            if paymentType != "free" {
+                OrganizerEuroField("Prezzo totale", value: $price)
+                    .disabled(hasPriceOptions)
+                    .opacity(hasPriceOptions ? 0.55 : 1)
+            }
+            if paymentType == "deposit" {
+                OrganizerEuroField("Acconto", value: $deposit)
+                    .disabled(hasPriceOptions)
+                    .opacity(hasPriceOptions ? 0.55 : 1)
+                HStack {
+                    Text("Saldo")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Brand.foreground)
+                    Spacer()
+                    Text("€\(money(max(0, price - deposit)))")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.primary)
+                }
+                .padding(12)
+                .background(Brand.background, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.muted, lineWidth: 1))
+            }
+        }
+    }
+
+    private var paymentModeBinding: Binding<String> {
+        Binding {
+            switch paymentType {
+            case "deposit":
+                return balancePaymentMode == "on_site" ? "deposit_on_site" : "deposit_online"
+            case "paid", "location", "free":
+                return paymentType
+            default:
+                return "free"
+            }
+        } set: { mode in
+            switch mode {
+            case "free":
+                paymentType = "free"
+                price = 0
+                deposit = 0
+                balancePaymentMode = "online"
+            case "paid":
+                paymentType = "paid"
+                balancePaymentMode = "online"
+            case "location":
+                paymentType = "location"
+                balancePaymentMode = "online"
+            case "deposit_on_site":
+                paymentType = "deposit"
+                balancePaymentMode = "on_site"
+            case "deposit_online":
+                paymentType = "deposit"
+                balancePaymentMode = "online"
+            default:
+                paymentType = "free"
+                balancePaymentMode = "online"
+            }
+        }
+    }
+}
+
 struct OrganizerPriceOptionEditor: View {
     @Binding var option: OrganizerPriceOptionDraft
     let specialBadges: [BadgeDefinition]
@@ -16500,13 +21472,23 @@ struct OrganizerPriceOptionEditor: View {
             }
             .editableControlSurface(cornerRadius: 12)
             if option.paymentType != "free" {
-                OrganizerEuroField("Prezzo totale", value: $option.price)
+                OrganizerEuroField("Prezzo totale", value: optionPriceBinding)
             }
             if option.paymentType == "deposit" {
-                OrganizerEuroField("Acconto", value: $option.depositAmount)
-                OrganizerEuroField("Saldo", value: $option.balanceAmount)
+                OrganizerEuroField("Acconto", value: depositAmountBinding)
+                HStack {
+                    Text("Saldo calcolato")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.mutedForeground)
+                    Spacer()
+                    Text("€\(money(max(0, option.price - option.depositAmount)))")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                }
+                .padding(12)
+                .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
             }
-            Toggle("Limite posti dedicato", isOn: $option.hasDedicatedSpots)
+            Toggle("Limite posti dedicato", isOn: dedicatedSpotsEnabledBinding)
                 .editableControlSurface(cornerRadius: 12)
             if option.hasDedicatedSpots {
                 OrganizerIntegerStepperField("Posti dedicati", value: $option.dedicatedSpots, range: 1...300)
@@ -16544,10 +21526,10 @@ struct OrganizerPriceOptionEditor: View {
             if eligibleGroupMode == "events_gt" {
                 Field("Numero eventi maggiore di", text: thresholdBinding(prefix: "events_gt"), keyboard: .numberPad)
             }
+            OrganizerOptionalEuroField("Prezzo originale", value: $option.originalPrice)
             Toggle("Promozionale", isOn: $option.isPromotional)
                 .editableControlSurface(cornerRadius: 12)
             if option.isPromotional {
-                OrganizerOptionalEuroField("Prezzo originale", value: $option.originalPrice)
                 OrganizerOptionalDatePickerField("Promo dal", dateString: $option.promoStart)
                 OrganizerOptionalDatePickerField("Promo al", dateString: $option.promoEnd)
             }
@@ -16596,6 +21578,35 @@ struct OrganizerPriceOptionEditor: View {
                 option.paymentType = "free"
                 option.balancePaymentMode = "online"
             }
+        }
+    }
+
+    private var optionPriceBinding: Binding<Double> {
+        Binding {
+            option.price
+        } set: { price in
+            option.price = price
+            if option.paymentType == "deposit" {
+                option.balanceAmount = max(0, price - option.depositAmount)
+            }
+        }
+    }
+
+    private var depositAmountBinding: Binding<Double> {
+        Binding {
+            option.depositAmount
+        } set: { deposit in
+            option.depositAmount = deposit
+            option.balanceAmount = max(0, option.price - deposit)
+        }
+    }
+
+    private var dedicatedSpotsEnabledBinding: Binding<Bool> {
+        Binding {
+            option.hasDedicatedSpots
+        } set: { isEnabled in
+            option.hasDedicatedSpots = isEnabled
+            option.dedicatedSpots = isEnabled ? max(option.dedicatedSpots, 1) : 0
         }
     }
 
@@ -16676,8 +21687,8 @@ struct OrganizerAdditionalFieldEditor: View {
             }
             Field("Etichetta", text: $field.label)
             Picker("Tipo", selection: $field.type) {
-                Text("Testo").tag("text")
-                Text("Selezione").tag("select")
+                Text("Testo libero").tag("text")
+                Text("Menu a tendina").tag("select")
             }
             .editableControlSurface(cornerRadius: 12)
             Toggle("Obbligatorio", isOn: $field.required)
@@ -16697,37 +21708,87 @@ struct OrganizerAccessRuleConfig: Identifiable {
     let valueLabel: String?
     let defaultValue: String
     let usesBadges: Bool
+    let showsEnforcement: Bool
 
     var id: String { type }
+}
+
+struct OrganizerAccessRuleGroup: Identifiable {
+    let id: String
+    let title: String
+    let configs: [OrganizerAccessRuleConfig]
+}
+
+struct OrganizerAccessValueOption: Identifiable {
+    let value: String
+    let label: String
+
+    var id: String { value }
 }
 
 struct OrganizerAccessRulesEditor: View {
     @Binding var rules: [OrganizerAccessRuleDraft]
     let specialBadges: [BadgeDefinition]
 
-    private static let configs: [OrganizerAccessRuleConfig] = [
-        .init(type: "min_level", title: "Livello minimo", valueLabel: "Livello 1-3", defaultValue: "1", usesBadges: false),
-        .init(type: "min_experience", title: "Esperienza minima", valueLabel: "Esperienza 1-3", defaultValue: "1", usesBadges: false),
-        .init(type: "min_activity_frequency", title: "Frequenza minima", valueLabel: "Frequenza 1-3", defaultValue: "1", usesBadges: false),
-        .init(type: "min_trekking_events", title: "Eventi trekking minimi", valueLabel: "Numero eventi", defaultValue: "1", usesBadges: false),
-        .init(type: "min_attended_events", title: "Presenze minime", valueLabel: "Numero presenze", defaultValue: "1", usesBadges: false),
-        .init(type: "require_membership", title: "Richiedi tessera attiva", valueLabel: nil, defaultValue: "", usesBadges: false),
-        .init(type: "require_badge", title: "Richiedi badge", valueLabel: nil, defaultValue: "", usesBadges: true),
-        .init(type: "manual_approval", title: "Approvazione manuale", valueLabel: nil, defaultValue: "", usesBadges: false)
+    private static let profileRules: [OrganizerAccessRuleConfig] = [
+        .init(type: "min_level", title: "Livello minimo richiesto", valueLabel: "Livello", defaultValue: "1", usesBadges: false, showsEnforcement: true),
+        .init(type: "min_experience", title: "Numero minimo di esperienze", valueLabel: "Esperienze", defaultValue: "1", usesBadges: false, showsEnforcement: true),
+        .init(type: "min_activity_frequency", title: "Frequenza attività fisica minima", valueLabel: "Frequenza", defaultValue: "1", usesBadges: false, showsEnforcement: true)
+    ]
+
+    private static let historyRules: [OrganizerAccessRuleConfig] = [
+        .init(type: "min_trekking_events", title: "Min. eventi trekking completati", valueLabel: "Numero eventi", defaultValue: "1", usesBadges: false, showsEnforcement: true),
+        .init(type: "min_attended_events", title: "Min. presenze totali", valueLabel: "Numero presenze", defaultValue: "1", usesBadges: false, showsEnforcement: true)
+    ]
+
+    private static let accessRules: [OrganizerAccessRuleConfig] = [
+        .init(type: "require_membership", title: "Membership attiva richiesta", valueLabel: nil, defaultValue: "", usesBadges: false, showsEnforcement: false),
+        .init(type: "require_badge", title: "Badge specifico richiesto", valueLabel: nil, defaultValue: "", usesBadges: true, showsEnforcement: false),
+        .init(type: "manual_approval", title: "Approvazione manuale richiesta", valueLabel: nil, defaultValue: "", usesBadges: false, showsEnforcement: false)
+    ]
+
+    private static let groups: [OrganizerAccessRuleGroup] = [
+        .init(id: "profile", title: "Profilo partecipante", configs: profileRules),
+        .init(id: "history", title: "Storico attività", configs: historyRules),
+        .init(id: "access", title: "Accesso", configs: accessRules)
     ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Regole accesso")
-                .font(.subheadline.weight(.bold))
-            ForEach(Self.configs) { config in
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Requisiti di registrazione")
+                    .font(.subheadline.weight(.bold))
+                Text("Chi può registrarsi. Gli utenti che non soddisfano i requisiti vedranno un messaggio di restrizione.")
+                    .font(.caption)
+                    .foregroundStyle(Brand.mutedForeground)
+            }
+
+            ForEach(Self.groups) { group in
                 VStack(alignment: .leading, spacing: 8) {
-                    Toggle(config.title, isOn: activeBinding(for: config))
-                        .editableControlSurface(cornerRadius: 12)
-                    if rules.contains(where: { $0.type == config.type }) {
-                        OrganizerAccessRuleDetail(config: config, rule: ruleBinding(for: config), specialBadges: specialBadges)
+                    Text(group.title)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                    ForEach(group.configs) { config in
+                        VStack(alignment: .leading, spacing: 8) {
+                            Toggle(config.title, isOn: activeBinding(for: config))
+                                .editableControlSurface(cornerRadius: 12)
+                            if rules.contains(where: { $0.type == config.type }) {
+                                OrganizerAccessRuleDetail(config: config, rule: ruleBinding(for: config), specialBadges: specialBadges)
+                            }
+                        }
                     }
                 }
+                if group.id != Self.groups.last?.id {
+                    Divider()
+                }
+            }
+
+            if rules.isEmpty {
+                Text("Nessuna restrizione di accesso. Tutti possono registrarsi.")
+                    .font(.caption)
+                    .foregroundStyle(Brand.mutedForeground)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
             }
         }
     }
@@ -16763,21 +21824,43 @@ struct OrganizerAccessRuleDetail: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             if let valueLabel = config.valueLabel {
-                Field(valueLabel, text: $rule.value, keyboard: .numberPad)
+                if let options = valueOptions(for: config.type) {
+                    Picker(valueLabel, selection: $rule.value) {
+                        ForEach(options) { option in
+                            Text(option.label).tag(option.value)
+                        }
+                    }
+                    .editableControlSurface(cornerRadius: 12)
+                } else {
+                    Field(valueLabel, text: $rule.value, keyboard: .numberPad)
+                }
             }
-            Picker("Applicazione", selection: $rule.enforcement) {
-                Text("Bloccante").tag("hard")
-                Text("Avviso").tag("soft")
+            if config.showsEnforcement {
+                Picker("Applicazione", selection: $rule.enforcement) {
+                    Text("Bloccante").tag("hard")
+                    Text("Avviso").tag("soft")
+                }
+                .editableControlSurface(cornerRadius: 12)
             }
-            .editableControlSurface(cornerRadius: 12)
             if config.usesBadges {
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                    ForEach(specialBadges) { badge in
-                        OrganizerToggleChip(title: badge.name, selected: rule.badgeIds.contains(badge.id)) {
-                            if rule.badgeIds.contains(badge.id) {
-                                rule.badgeIds.removeAll { $0 == badge.id }
-                            } else {
-                                rule.badgeIds.append(badge.id)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("L'utente deve avere almeno uno di questi badge")
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                    if specialBadges.isEmpty {
+                        Text("Nessun badge disponibile.")
+                            .font(.caption)
+                            .foregroundStyle(Brand.mutedForeground)
+                    } else {
+                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                            ForEach(specialBadges) { badge in
+                                OrganizerToggleChip(title: badge.name, selected: rule.badgeIds.contains(badge.id)) {
+                                    if rule.badgeIds.contains(badge.id) {
+                                        rule.badgeIds.removeAll { $0 == badge.id }
+                                    } else {
+                                        rule.badgeIds.append(badge.id)
+                                    }
+                                }
                             }
                         }
                     }
@@ -16785,6 +21868,31 @@ struct OrganizerAccessRuleDetail: View {
             }
         }
         .padding(.leading, 6)
+    }
+
+    private func valueOptions(for type: String) -> [OrganizerAccessValueOption]? {
+        switch type {
+        case "min_level":
+            return [
+                .init(value: "1", label: "Principiante"),
+                .init(value: "2", label: "Intermedio"),
+                .init(value: "3", label: "Avanzato")
+            ]
+        case "min_experience":
+            return [
+                .init(value: "1", label: "0-2 escursioni"),
+                .init(value: "2", label: "3-5 escursioni"),
+                .init(value: "3", label: "5+ escursioni")
+            ]
+        case "min_activity_frequency":
+            return [
+                .init(value: "1", label: "Raramente"),
+                .init(value: "2", label: "1-2 volte a settimana"),
+                .init(value: "3", label: "Più di 2 volte a settimana")
+            ]
+        default:
+            return nil
+        }
     }
 }
 
@@ -16810,11 +21918,15 @@ struct OrganizerStringListEditor: View {
                     }
                 }
             }
-            Button("Aggiungi URL") {
+            Button(addButtonTitle) {
                 values.append("")
             }
             .font(.footnote.weight(.bold))
         }
+    }
+
+    private var addButtonTitle: String {
+        placeholder.localizedCaseInsensitiveContains("opzione") ? "Aggiungi opzione" : "Aggiungi URL"
     }
 
     private func safeValueBinding(for index: Int) -> Binding<String> {
@@ -17207,7 +22319,10 @@ struct ProfileView: View {
     @EnvironmentObject private var store: AppStore
     @Binding var showAuth: Bool
     @Binding var scrollTarget: ProfileScrollTarget?
+    @Binding var openRewards: Bool
     @State private var showEdit = false
+    @State private var showPointsInfo = false
+    @State private var showRoutedRewards = false
 
     var body: some View {
         NavigationStack {
@@ -17232,9 +22347,21 @@ struct ProfileView: View {
                                                     .foregroundStyle(Brand.mutedForeground)
                                                     .lineLimit(1)
                                                     .minimumScaleFactor(0.82)
-                                                Label("\(profile.totalPoints ?? 0) punti", systemImage: "star.fill")
+                                                Button {
+                                                    withAnimation(.easeInOut(duration: 0.18)) {
+                                                        showPointsInfo.toggle()
+                                                    }
+                                                } label: {
+                                                    HStack(spacing: 4) {
+                                                        Label("\(profile.totalPoints ?? 0) punti", systemImage: "star.fill")
+                                                        Image(systemName: "info.circle")
+                                                            .font(.caption2.weight(.semibold))
+                                                            .foregroundStyle(Brand.mutedForeground)
+                                                    }
                                                     .font(.caption.weight(.semibold))
                                                     .foregroundStyle(Brand.secondary)
+                                                }
+                                                .buttonStyle(.plain)
                                             }
                                             Spacer()
                                             Button { showEdit = true } label: {
@@ -17246,6 +22373,15 @@ struct ProfileView: View {
                                             }
                                         }
                                         .id(ProfileScrollTarget.profile)
+
+                                        if showPointsInfo {
+                                            PointsInfoCard {
+                                                withAnimation(.easeInOut(duration: 0.18)) {
+                                                    showPointsInfo = false
+                                                }
+                                            }
+                                            .transition(.opacity.combined(with: .move(edge: .top)))
+                                        }
 
                                         ProfileCompletenessCard(profile: profile) {
                                             showEdit = true
@@ -17263,6 +22399,7 @@ struct ProfileView: View {
                                             .id(ProfileScrollTarget.activity)
                                         HelpSection()
                                             .id(ProfileScrollTarget.help)
+                                        AccountSettingsSection()
                                     }
                                     .frame(width: max(proxy.size.width - 32, 0), alignment: .leading)
                                     .padding(16)
@@ -17286,11 +22423,26 @@ struct ProfileView: View {
                 }
             }
             .refreshable { await store.refreshUserData() }
+            .navigationDestination(isPresented: $showRoutedRewards) {
+                RewardsView(rewards: store.rewards, badges: store.badges)
+            }
             .task(id: store.session?.user.id) {
                 guard store.isAuthenticated else { return }
                 await store.refreshUserData(reportingErrors: false)
             }
+            .onAppear {
+                openRewardsIfNeeded()
+            }
+            .onChange(of: openRewards) { _, _ in
+                openRewardsIfNeeded()
+            }
         }
+    }
+
+    private func openRewardsIfNeeded() {
+        guard openRewards else { return }
+        showRoutedRewards = true
+        openRewards = false
     }
 
     private func scrollToProfileTarget(with proxy: ScrollViewProxy) {
@@ -17317,6 +22469,47 @@ struct ProfileSectionHeader: View {
                 .font(.system(.headline, design: .rounded, weight: .bold))
                 .foregroundStyle(Brand.foreground)
         }
+    }
+}
+
+struct PointsInfoCard: View {
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "star.fill")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Brand.secondary)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Come funzionano i punti")
+                        .font(.system(.subheadline, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                    Text("I punti ti aiutano a salire di livello nella community e a sbloccare badge, missioni e ricompense.")
+                    Text("Puoi guadagnare punti partecipando agli eventi, completando missioni e mantenendo il profilo aggiornato.")
+                    Text("Più punti accumuli, più avanzi nella community.")
+                        .fontWeight(.semibold)
+                        .foregroundStyle(Brand.foreground)
+                }
+                .font(.caption)
+                .foregroundStyle(Brand.mutedForeground)
+                .fixedSize(horizontal: false, vertical: true)
+
+                Spacer(minLength: 4)
+
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.mutedForeground)
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Chiudi informazioni sui punti")
+            }
+        }
+        .padding(14)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
     }
 }
 
@@ -17432,7 +22625,7 @@ struct ProfileCompletenessCard: View {
 struct MembershipCard: View {
     @EnvironmentObject private var store: AppStore
     let profile: Profile
-    @State private var benefitsExpanded = false
+    @State private var benefitsExpanded = true
     @State private var isGeneratingWalletPass = false
     @State private var walletPassPayload: WalletPassPayload?
 
@@ -17839,6 +23032,7 @@ struct ProfileProgressionSection: View {
 }
 
 struct MissionsSection: View {
+    @EnvironmentObject private var store: AppStore
     let missions: [MissionCardModel]
     @State private var selectedMission: MissionCardModel?
     @State private var showCompletedMissions = false
@@ -17868,7 +23062,7 @@ struct MissionsSection: View {
                 } else {
                     ForEach(activeMissions) { mission in
                         MissionRow(mission: mission) {
-                            selectedMission = mission
+                            openEvents(for: mission)
                         }
                     }
                 }
@@ -17900,7 +23094,7 @@ struct MissionsSection: View {
                     if showCompletedMissions {
                         ForEach(completedMissions) { mission in
                             MissionRow(mission: mission) {
-                                selectedMission = mission
+                                openEvents(for: mission)
                             }
                         }
                     }
@@ -17912,6 +23106,10 @@ struct MissionsSection: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
+    }
+
+    private func openEvents(for mission: MissionCardModel) {
+        store.homeDiscoveryRequest = HomeDiscoveryRequest(mission: mission)
     }
 }
 
@@ -18149,7 +23347,7 @@ struct RewardsView: View {
     }
 
     private var activeCoupons: [Reward] {
-        rewards.filter { $0.kind == .coupon && $0.effectiveStatus == "active" }
+        rewards.filter { $0.kind == .coupon && $0.isCurrent }
     }
 
     private var activeOtherRewards: [Reward] {
@@ -18194,8 +23392,22 @@ struct RewardsView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.top, 80)
                 } else {
-                    if !unlockedBadges.isEmpty || !fallbackBadgeRewards.isEmpty {
-                        RewardsSection(title: "Badge sbloccati", icon: "trophy", color: Brand.accent) {
+                    if !activeCoupons.isEmpty {
+                        RewardsSection(title: "Coupon attivi", icon: "ticket", color: Brand.primary) {
+                            ForEach(activeCoupons) { reward in
+                                Button {
+                                    selectedRewardDetail = RewardDetailItem(reward: reward)
+                                } label: {
+                                    RewardCard(reward: reward)
+                                }
+                                .buttonStyle(.plain)
+                                .rewardCardTapTarget()
+                            }
+                        }
+                    }
+
+                    if !unlockedBadges.isEmpty || !fallbackBadgeRewards.isEmpty || !pointRewards.isEmpty || !activeOtherRewards.isEmpty {
+                        RewardsSection(title: "Ricompense sbloccate", icon: "gift", color: Brand.secondary) {
                             ForEach(unlockedBadges) { badge in
                                 Button {
                                     selectedRewardDetail = RewardDetailItem(badge: badge)
@@ -18215,11 +23427,7 @@ struct RewardsView: View {
                                 .buttonStyle(.plain)
                                 .rewardCardTapTarget()
                             }
-                        }
-                    }
 
-                    if !pointRewards.isEmpty {
-                        RewardsSection(title: "Punti guadagnati", icon: "star", color: Brand.secondary) {
                             ForEach(pointRewards) { reward in
                                 Button {
                                     selectedRewardDetail = RewardDetailItem(reward: reward)
@@ -18229,25 +23437,7 @@ struct RewardsView: View {
                                 .buttonStyle(.plain)
                                 .rewardCardTapTarget()
                             }
-                        }
-                    }
 
-                    if !activeCoupons.isEmpty {
-                        RewardsSection(title: "Coupon disponibili", icon: "ticket", color: Brand.primary) {
-                            ForEach(activeCoupons) { reward in
-                                Button {
-                                    selectedRewardDetail = RewardDetailItem(reward: reward)
-                                } label: {
-                                    RewardCard(reward: reward)
-                                }
-                                .buttonStyle(.plain)
-                                .rewardCardTapTarget()
-                            }
-                        }
-                    }
-
-                    if !activeOtherRewards.isEmpty {
-                        RewardsSection(title: "Premi da ritirare", icon: "gift", color: Brand.warning) {
                             ForEach(activeOtherRewards) { reward in
                                 Button {
                                     selectedRewardDetail = RewardDetailItem(reward: reward)
@@ -18326,6 +23516,7 @@ struct RewardsSection<Content: View>: View {
 
 struct RewardCard: View {
     let reward: Reward
+    @State private var copiedCode = false
 
     private var isDimmed: Bool {
         !reward.isCurrent
@@ -18349,6 +23540,30 @@ struct RewardCard: View {
                     .font(.caption2)
                     .foregroundStyle(Brand.mutedForeground)
                     .lineLimit(2)
+
+                if reward.kind == .coupon, let code = reward.value?.nilIfBlank {
+                    HStack(spacing: 8) {
+                        Text(code)
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(Brand.foreground)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Brand.muted.opacity(0.7), in: RoundedRectangle(cornerRadius: 7))
+
+                        if reward.effectiveStatus == "active" {
+                            Image(systemName: copiedCode ? "checkmark" : "doc.on.doc")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(Brand.primary)
+                                .padding(6)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    UIPasteboard.general.string = code
+                                    copiedCode = true
+                                }
+                            .accessibilityLabel(copiedCode ? "Codice copiato" : "Copia codice")
+                        }
+                    }
+                }
 
                 if reward.kind == .physical, reward.effectiveStatus == "pending" {
                     HStack(spacing: 4) {
@@ -18396,7 +23611,13 @@ struct RewardTypeIconView: View {
     let reward: Reward
 
     var body: some View {
-        LucideIconView(name: reward.iconName, size: 20, color: reward.accentColor)
+        Group {
+            if let badgeIcon = reward.badgeIconValue {
+                BadgeIconView(icon: badgeIcon, size: 20)
+            } else {
+                LucideIconView(name: reward.iconName, size: 20, color: reward.accentColor)
+            }
+        }
             .frame(width: 40, height: 40)
             .background(reward.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
     }
@@ -18485,8 +23706,8 @@ struct RewardDetailItem: Identifiable {
         self.id = "reward-\(reward.id)"
         self.title = reward.displayTitle
         self.subtitle = reward.displayDescription
-        self.iconName = reward.iconName
-        self.badgeIcon = nil
+        self.iconName = reward.badgeIconValue == nil ? reward.iconName : nil
+        self.badgeIcon = reward.badgeIconValue
         self.accentColor = reward.accentColor
         self.status = reward.statusStyle.label
         self.statusColor = reward.statusStyle.color
@@ -19407,8 +24628,10 @@ struct LucideIconView: View {
 struct ProfileActivityHistorySection: View {
     let registrations: [Registration]
     @State private var showTimeline = false
+    @State private var timelineLimit = 8
     @State private var showStreakDetail = false
     @State private var activeStatsHelp: StatsHelp?
+    private let timelinePageSize = 8
 
     private enum StatsHelp: Equatable {
         case reliability
@@ -19682,6 +24905,9 @@ struct ProfileActivityHistorySection: View {
             Button {
                 withAnimation(.easeInOut(duration: 0.18)) {
                     showTimeline.toggle()
+                    if !showTimeline {
+                        timelineLimit = timelinePageSize
+                    }
                 }
             } label: {
                 HStack(spacing: 5) {
@@ -19701,7 +24927,7 @@ struct ProfileActivityHistorySection: View {
                     EmptyState(icon: "calendar.badge.plus", title: "Non hai ancora partecipato a eventi", message: "Scopri le prossime esperienze disponibili.")
                 } else {
                     VStack(alignment: .leading, spacing: 0) {
-                        ForEach(timelineRegistrations.prefix(6)) { registration in
+                        ForEach(timelineRegistrations.prefix(timelineLimit)) { registration in
                             TimelineRegistrationRow(registration: registration)
                         }
                     }
@@ -19711,6 +24937,26 @@ struct ProfileActivityHistorySection: View {
                             .fill(Brand.muted)
                             .frame(width: 2)
                             .padding(.leading, 10)
+                    }
+
+                    if timelineRegistrations.count > timelineLimit {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                timelineLimit += timelinePageSize
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Text("Mostra altri")
+                                Image(systemName: "chevron.down")
+                            }
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(Brand.primary)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 40)
+                            .background(Brand.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, 8)
                     }
                 }
             }
@@ -20077,6 +25323,27 @@ struct AccountSettingsSection: View {
                 }
 
                 Button {
+                    store.signOut()
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "rectangle.portrait.and.arrow.right")
+                            .foregroundStyle(Brand.secondary)
+                            .frame(width: 32)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Esci")
+                                .font(.subheadline.weight(.semibold))
+                            Text("Termina la sessione")
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedForeground)
+                        }
+                        Spacer()
+                    }
+                    .padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+                .disabled(isDeletingAccount || store.isLoading)
+
+                Button {
                     withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
                         deleteDialog = .confirm
                     }
@@ -20201,6 +25468,7 @@ struct HelpContentView: View {
     @State private var page: ContentPageData?
     @State private var loading = true
     @State private var errorMessage: String?
+    @State private var renderedHeight: CGFloat = 1
     private let api = SupabaseAPI()
 
     var body: some View {
@@ -20214,8 +25482,17 @@ struct HelpContentView: View {
                 } else if let errorMessage {
                     EmptyState(icon: "exclamationmark.triangle", title: "Contenuto non disponibile", message: errorMessage)
                 } else if let page {
-                    ForEach(HelpContentBlock.parse(page.contentHtml)) { block in
-                        HelpContentBlockView(block: block)
+                    ContentPageHeader(slug: slug, title: page.title)
+
+                    EventDescriptionHTMLView(html: EventDescriptionHTML.cleanStoredHTML(from: page.contentHtml), height: $renderedHeight)
+                        .frame(height: renderedHeight)
+
+                    if ContentPageHeader.isLegalSlug(slug) {
+                        Text("© \(Calendar.current.component(.year, from: Date())) Scampagnate - Tutti i diritti riservati")
+                            .font(.caption)
+                            .foregroundStyle(Brand.mutedForeground)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.top, 12)
                     }
                 }
             }
@@ -20233,12 +25510,65 @@ struct HelpContentView: View {
     private func load() async {
         loading = true
         errorMessage = nil
+        renderedHeight = 1
         do {
             page = try await api.fetchContentPage(slug: slug)
         } catch {
             errorMessage = error.localizedDescription
         }
         loading = false
+    }
+}
+
+struct ContentPageHeader: View {
+    let slug: String
+    let title: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if Self.isLegalSlug(slug) {
+                HStack(alignment: .center, spacing: 12) {
+                    Image(systemName: iconName)
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(Brand.primary)
+                        .frame(width: 46, height: 46)
+                        .background(Brand.primary.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(title)
+                            .font(.system(.title2, design: .rounded, weight: .bold))
+                            .foregroundStyle(Brand.foreground)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(subtitle)
+                            .font(.subheadline)
+                            .foregroundStyle(Brand.mutedForeground)
+                    }
+                }
+            } else {
+                Text(title)
+                    .font(.system(.title, design: .rounded, weight: .bold))
+                    .foregroundStyle(Brand.foreground)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Rectangle()
+                .fill(Brand.muted)
+                .frame(height: 1)
+        }
+    }
+
+    static func isLegalSlug(_ slug: String) -> Bool {
+        ["privacy-policy", "termini-di-servizio"].contains(slug)
+    }
+
+    private var iconName: String {
+        slug == "privacy-policy" ? "shield" : "doc.text"
+    }
+
+    private var subtitle: String {
+        slug == "privacy-policy"
+            ? "Come proteggiamo i tuoi dati personali"
+            : "Le condizioni per utilizzare la piattaforma"
     }
 }
 
@@ -20256,8 +25586,16 @@ struct HelpContentBlock: Identifiable {
     let kind: Kind
     let text: String
 
-    static func parse(_ html: String) -> [HelpContentBlock] {
-        let pattern = #"(?is)<(h2|h3|p|li)[^>]*>(.*?)</\1>|<img[^>]*src=["']([^"']+)["'][^>]*>|<hr\s*/?>"#
+    static func blocks(from html: String) -> [HelpContentBlock] {
+        let parsedBlocks = parse(html)
+        if !parsedBlocks.isEmpty {
+            return parsedBlocks
+        }
+        return html.htmlPlainText.nilIfBlank.map { [HelpContentBlock(kind: .paragraph, text: $0)] } ?? []
+    }
+
+    private static func parse(_ html: String) -> [HelpContentBlock] {
+        let pattern = #"(?is)<(h1|h2|h3|h4|p|li)[^>]*>(.*?)</\1>|<img[^>]*src=["']([^"']+)["'][^>]*>|<hr\s*/?>"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
         let source = html as NSString
         return regex.matches(in: html, range: NSRange(location: 0, length: source.length)).compactMap { match in
@@ -20273,8 +25611,8 @@ struct HelpContentBlock: Identifiable {
             let text = source.substring(with: match.range(at: 2)).htmlStripped
             guard !text.isEmpty else { return nil }
             switch tag {
-            case "h2": return HelpContentBlock(kind: .heading, text: text)
-            case "h3": return HelpContentBlock(kind: .subheading, text: text)
+            case "h1", "h2": return HelpContentBlock(kind: .heading, text: text)
+            case "h3", "h4": return HelpContentBlock(kind: .subheading, text: text)
             case "li": return HelpContentBlock(kind: .listItem, text: text)
             default: return HelpContentBlock(kind: .paragraph, text: text)
             }
@@ -20493,6 +25831,7 @@ struct ActivityProposalSheet: View {
         NavigationStack {
             if submitted {
                 ActivityProposalSuccessView {
+                    store.homeDiscoveryRequest = HomeDiscoveryRequest()
                     dismiss()
                 }
                 .background(Brand.background)
@@ -20786,7 +26125,7 @@ private struct ActivityProposalSuccessView: View {
             Button {
                 done()
             } label: {
-                Text("Torna al profilo")
+                Text("Torna agli eventi")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(PrimaryButtonStyle())
@@ -20995,8 +26334,16 @@ struct ProfileEditSheet: View {
                 borderWidth: ProfileSheetFieldStyle.inputBorderWidth
             )
             HStack(alignment: .top, spacing: 14) {
-                ProfileSheetField("Luogo di nascita", text: $input.birthPlace)
-                ProvinceProfileSheetField(text: $input.provinceOfBirth)
+                ProfileSheetField(
+                    "Luogo di nascita",
+                    text: $input.birthPlace,
+                    help: #"Inserisci il comune di nascita. Se sei nato/a all'estero, inserisci il nome della nazione (es. "Francia", "Romania")."#
+                )
+                ProvinceProfileSheetField(
+                    "Provincia di nascita",
+                    text: $input.provinceOfBirth,
+                    help: #"Inserisci la sigla della provincia (es. "RM", "MI"). Se sei nato/a all'estero, scrivi EE."#
+                )
             }
             OrganizerAddressAutocompleteField(
                 "Indirizzo di residenza",
@@ -21006,9 +26353,16 @@ struct ProfileEditSheet: View {
                 borderWidth: ProfileSheetFieldStyle.inputBorderWidth,
                 showsLeadingIcon: false
             )
+            Text(#"Inserisci via e numero civico (es. "Via Roma 12")."#)
+                .font(.caption)
+                .foregroundStyle(Brand.mutedForeground)
             HStack(alignment: .top, spacing: 14) {
                 ProfileSheetField("Città di residenza", text: $input.cityOfResidence)
-                ProvinceProfileSheetField(text: $input.provinceOfResidence)
+                ProvinceProfileSheetField(
+                    "Provincia di residenza",
+                    text: $input.provinceOfResidence,
+                    help: #"Inserisci la sigla della provincia (es. "RM", "MI"). Se sei residente all'estero, scrivi EE."#
+                )
             }
         }
         .padding(16)
@@ -21033,10 +26387,12 @@ struct ProfileEditSheet: View {
                 ProfileSettingsRow(icon: "envelope", iconColor: Brand.secondary, title: "Cambia email", subtitle: store.session?.user.email ?? "", showChevron: false)
             }
             .buttonStyle(.plain)
-            Button { showPasswordDialog = true } label: {
-                ProfileSettingsRow(icon: "lock", iconColor: Brand.secondary, title: "Cambia password", subtitle: "Aggiorna la tua password di accesso", showChevron: false)
+            if store.session?.user.usesEmailProvider ?? true {
+                Button { showPasswordDialog = true } label: {
+                    ProfileSettingsRow(icon: "lock", iconColor: Brand.secondary, title: "Cambia password", subtitle: "Aggiorna la tua password di accesso", showChevron: false)
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
             Button {
                 store.signOut()
                 dismiss()
@@ -21292,6 +26648,8 @@ struct ProfileEditSheet: View {
     }
 }
 
+private let deleteAccountConfirmationPhrase = "CANCELLA IL MIO ACCOUNT"
+
 private enum DeleteAccountDialog: Equatable {
     case confirm
     case deleting
@@ -21304,6 +26662,11 @@ private struct ProfileDeleteAccountDialog: View {
     let onCancel: () -> Void
     let onConfirm: () -> Void
     let onFinish: () -> Void
+    @State private var confirmation = ""
+
+    private var canConfirmDeletion: Bool {
+        confirmation.trimmingCharacters(in: .whitespacesAndNewlines) == deleteAccountConfirmationPhrase
+    }
 
     var body: some View {
         ZStack {
@@ -21326,6 +26689,8 @@ private struct ProfileDeleteAccountDialog: View {
                         .lineSpacing(2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+
+                confirmationPrompt
 
                 actions
                     .padding(.top, 4)
@@ -21361,6 +26726,32 @@ private struct ProfileDeleteAccountDialog: View {
     }
 
     @ViewBuilder
+    private var confirmationPrompt: some View {
+        if case .confirm = state {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Per confermare scrivi \(deleteAccountConfirmationPhrase).")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Brand.foreground)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                TextField(deleteAccountConfirmationPhrase, text: $confirmation)
+                    .textInputAutocapitalization(.characters)
+                    .autocorrectionDisabled()
+                    .font(.body)
+                    .foregroundStyle(Brand.inputForeground)
+                    .tint(Brand.primary)
+                    .padding(.horizontal, 14)
+                    .frame(height: 50)
+                    .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 14))
+                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(canConfirmDeletion ? Brand.destructive : Brand.inputBorder, lineWidth: 1))
+            }
+            .padding(12)
+            .background(Brand.destructive.opacity(0.05), in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.destructive.opacity(0.18), lineWidth: 1))
+        }
+    }
+
+    @ViewBuilder
     private var actions: some View {
         switch state {
         case .confirm:
@@ -21372,6 +26763,8 @@ private struct ProfileDeleteAccountDialog: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(DestructiveButtonStyle())
+                .disabled(!canConfirmDeletion)
+                .opacity(canConfirmDeletion ? 1 : 0.55)
 
                 Button {
                     onCancel()
@@ -21431,7 +26824,7 @@ private struct ProfileDeleteAccountDialog: View {
     private var message: String {
         switch state {
         case .confirm:
-            return "Questa azione rimuove il tuo accesso e i dati collegati al profilo. Non potrai recuperare l'account dopo la conferma."
+            return "Questa azione cancella l'accesso e anonimizza i dati personali collegati al profilo. Non può essere annullata."
         case .deleting:
             return "Il sistema sta cancellando profilo, accesso, notifiche e dati collegati. Potrebbero volerci alcuni secondi."
         case .success:
@@ -21741,10 +27134,12 @@ private struct ProfileSheetInputLabel: View {
 }
 
 struct ProvinceProfileSheetField: View {
+    let title: String
     @Binding var text: String
     let help: String?
 
-    init(text: Binding<String>, help: String? = nil) {
+    init(_ title: String = "Provincia", text: Binding<String>, help: String? = nil) {
+        self.title = title
         self._text = text
         self.help = help
     }
@@ -21752,7 +27147,7 @@ struct ProvinceProfileSheetField: View {
     var body: some View {
         VStack(alignment: .leading, spacing: ProfileSheetFieldStyle.labelSpacing) {
             HStack(spacing: 6) {
-                ProfileSheetInputLabel("Provincia")
+                ProfileSheetInputLabel(title)
                 if let help {
                     InfoTooltipButton(text: help)
                 }
@@ -23299,12 +28694,30 @@ struct OnboardingBurstPiece: Identifiable {
 
 struct NotificationsView: View {
     @EnvironmentObject private var store: AppStore
+    @EnvironmentObject private var pushNotifications: PushNotificationService
     @Environment(\.dismiss) private var dismiss
     let onNavigate: (NotificationDestination) -> Void
     @State private var expandedNotificationIds: Set<String> = []
 
     private var unreadNotifications: [UserNotification] {
         store.notifications.filter { !$0.read }
+    }
+
+    private var groupedNotifications: [NotificationDateGroup] {
+        var groups: [NotificationDateGroup] = []
+        var currentLabel: String?
+
+        for notification in store.notifications {
+            let label = notificationGroupLabel(notification.createdAt)
+            if groups.isEmpty || currentLabel != label {
+                groups.append(NotificationDateGroup(label: label, notifications: [notification]))
+                currentLabel = label
+            } else {
+                groups[groups.count - 1].notifications.append(notification)
+            }
+        }
+
+        return groups
     }
 
     var body: some View {
@@ -23318,28 +28731,42 @@ struct NotificationsView: View {
                 Spacer(minLength: 0)
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(store.notifications) { notification in
-                            Button {
-                                handleTap(notification)
-                            } label: {
-                                NotificationRow(
-                                    notification: notification,
-                                    isExpanded: expandedNotificationIds.contains(notification.id),
-                                    destinationHint: notification.destination?.actionTitle
-                                )
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityHint(notification.destination == nil ? "Espande la notifica" : "Apre la sezione collegata")
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(groupedNotifications) { group in
+                            Text(group.label)
+                                .font(.system(size: 11, weight: .bold))
+                                .textCase(.uppercase)
+                                .tracking(1.2)
+                                .foregroundStyle(Brand.mutedForeground.opacity(0.75))
+                                .padding(.horizontal, 22)
+                                .padding(.top, 16)
+                                .padding(.bottom, 8)
 
-                            if notification.id != store.notifications.last?.id {
-                                Divider()
-                                    .overlay(Brand.muted)
-                                    .padding(.leading, 72)
+                            VStack(spacing: 0) {
+                                ForEach(group.notifications) { notification in
+                                    NotificationRow(
+                                        notification: notification,
+                                        isExpanded: expandedNotificationIds.contains(notification.id),
+                                        destinationHint: notification.destination?.actionTitle,
+                                        onOpenURL: { url in UIApplication.shared.open(url) }
+                                    )
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        handleTap(notification)
+                                    }
+                                    .accessibilityAddTraits(.isButton)
+                                    .accessibilityHint(notification.destination == nil ? "Espande la notifica" : "Apre la sezione collegata")
+
+                                    if notification.id != group.notifications.last?.id {
+                                        Divider()
+                                            .overlay(Brand.muted)
+                                            .padding(.leading, 72)
+                                    }
+                                }
                             }
+                            .background(Brand.card)
                         }
                     }
-                    .background(Brand.card)
                 }
                 .refreshable {
                     await store.refreshUserData()
@@ -23364,6 +28791,17 @@ struct NotificationsView: View {
                 .lineLimit(1)
 
             Spacer(minLength: 8)
+
+            Button {
+                Task { await togglePushNotifications() }
+            } label: {
+                Label(pushNotifications.isPushActive ? "Attive" : "Push", systemImage: "bell.badge")
+                    .font(.subheadline.weight(.semibold))
+                    .labelStyle(.titleAndIcon)
+            }
+            .foregroundStyle(pushNotifications.isPushActive ? Brand.primary : Brand.mutedForeground)
+            .buttonStyle(.plain)
+            .disabled(pushNotifications.isRegistering)
 
             if !unreadNotifications.isEmpty {
                 Button {
@@ -23400,6 +28838,19 @@ struct NotificationsView: View {
         }
     }
 
+    private func togglePushNotifications() async {
+        guard let session = store.session else { return }
+        if pushNotifications.canOpenSettings {
+            pushNotifications.openAppSettings()
+            return
+        }
+        if pushNotifications.isPushActive {
+            await pushNotifications.unregister(session: session)
+        } else {
+            await pushNotifications.requestPermissionAndRegister(session: session)
+        }
+    }
+
     private func handleTap(_ notification: UserNotification) {
         if !notification.read {
             Task { await store.markNotificationRead(notification.id) }
@@ -23420,10 +28871,18 @@ struct NotificationsView: View {
     }
 }
 
+struct NotificationDateGroup: Identifiable {
+    let label: String
+    var notifications: [UserNotification]
+
+    var id: String { label }
+}
+
 struct NotificationRow: View {
     let notification: UserNotification
     let isExpanded: Bool
     let destinationHint: String?
+    let onOpenURL: (URL) -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 16) {
@@ -23435,7 +28894,7 @@ struct NotificationRow: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text(notification.title)
+                    Text(notification.displayTitle)
                         .font(.system(.headline, design: .rounded, weight: notification.read ? .semibold : .bold))
                         .foregroundStyle(notification.read ? Brand.mutedForeground : Brand.foreground)
                         .lineLimit(2)
@@ -23450,11 +28909,15 @@ struct NotificationRow: View {
                     }
                 }
 
-                Text(notification.displayMessage)
-                    .font(.system(.subheadline, design: .rounded))
-                    .foregroundStyle(Brand.mutedForeground)
-                    .lineLimit(isExpanded ? nil : 3)
-                    .fixedSize(horizontal: false, vertical: true)
+                if notification.isDetailedReminder, !notification.reminderParts.isEmpty {
+                    NotificationReminderMessageView(parts: notification.reminderParts, onOpenURL: onOpenURL)
+                } else {
+                    Text(notification.displayMessage)
+                        .font(.system(.subheadline, design: .rounded))
+                        .foregroundStyle(Brand.mutedForeground)
+                        .lineLimit(isExpanded ? nil : 3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 footer
 
@@ -23471,7 +28934,7 @@ struct NotificationRow: View {
     }
 
     private var iconColor: Color {
-        notification.read ? Brand.mutedForeground : Brand.primary
+        notificationTintColor(notification.type, read: notification.read)
     }
 
     @ViewBuilder
@@ -23498,10 +28961,90 @@ struct NotificationRow: View {
     }
 }
 
+struct NotificationReminderPart: Identifiable, Hashable {
+    enum Kind: Hashable {
+        case text
+        case location
+        case navigation(URL)
+    }
+
+    let id = UUID()
+    let kind: Kind
+    let text: String
+
+    static func parts(from message: String) -> [NotificationReminderPart] {
+        message
+            .components(separatedBy: .newlines)
+            .compactMap { rawLine -> NotificationReminderPart? in
+                let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !line.isEmpty else { return nil }
+
+                if let urlString = line.firstRegexCapture(#"(https?://[^\s]+)"#)?
+                    .trimmingCharacters(in: CharacterSet(charactersIn: ".,);]")),
+                   let url = URL(string: urlString) {
+                    return NotificationReminderPart(kind: .navigation(url), text: "Apri navigazione")
+                }
+
+                if line.contains("📍") {
+                    let cleaned = line
+                        .replacingOccurrences(of: "📍", with: "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    return NotificationReminderPart(kind: .location, text: cleaned)
+                }
+
+                return NotificationReminderPart(kind: .text, text: line)
+            }
+    }
+}
+
+struct NotificationReminderMessageView: View {
+    let parts: [NotificationReminderPart]
+    let onOpenURL: (URL) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(parts) { part in
+                switch part.kind {
+                case .text:
+                    Text(part.text)
+                        .font(.system(.subheadline, design: .rounded))
+                        .foregroundStyle(Brand.mutedForeground)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .location:
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "mappin.and.ellipse")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(Brand.primary)
+                            .frame(width: 16, alignment: .leading)
+                        Text(part.text)
+                            .font(.system(.subheadline, design: .rounded, weight: .semibold))
+                            .foregroundStyle(Brand.foreground)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                case .navigation(let url):
+                    Button {
+                        onOpenURL(url)
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "location.fill")
+                                .font(.caption.weight(.bold))
+                            Text(part.text)
+                                .font(.system(.subheadline, design: .rounded, weight: .bold))
+                        }
+                        .foregroundStyle(Brand.primary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Shop
 
 struct ShopView: View {
     @EnvironmentObject private var store: AppStore
+    @Binding var routedProductId: String?
     @State private var selectedProduct: MerchProduct?
     private let gridSpacing: CGFloat = 12
 
@@ -23533,13 +29076,7 @@ struct ShopView: View {
                             }
                         }
 
-                        Text("Tutti gli ordini sono gestiti manualmente via WhatsApp. I dettagli di consegna e pagamento saranno concordati direttamente con il team.")
-                            .font(.caption)
-                            .foregroundStyle(Brand.mutedForeground)
-                            .multilineTextAlignment(.center)
-                            .frame(maxWidth: .infinity)
-                            .padding(16)
-                            .background(Brand.muted.opacity(0.55), in: RoundedRectangle(cornerRadius: 16))
+                        ShopInfoFooter()
                 }
                 .frame(width: contentWidth, alignment: .leading)
                 .padding(16)
@@ -23553,9 +29090,32 @@ struct ShopView: View {
             .navigationDestination(item: $selectedProduct) { product in
                 ProductDetailView(product: product)
             }
+            .task(id: routedProductId ?? "") {
+                await openRoutedProductIfNeeded()
+            }
+            .onChange(of: store.products) { _, _ in
+                Task { await openRoutedProductIfNeeded() }
+            }
         }
     }
-}
+    }
+
+    private func openRoutedProductIfNeeded() async {
+        guard let productId = routedProductId?.nilIfBlank else { return }
+        if let product = store.products.first(where: { $0.id == productId }) {
+            selectedProduct = product
+            routedProductId = nil
+            return
+        }
+
+        await store.loadPublicData(reportingErrors: false)
+        if let product = store.products.first(where: { $0.id == productId }) {
+            selectedProduct = product
+        } else {
+            store.errorMessage = "Prodotto non trovato"
+        }
+        routedProductId = nil
+    }
 }
 
 private func productColumns(for width: CGFloat) -> [GridItem] {
@@ -23614,30 +29174,32 @@ struct ProductCard: View {
             .padding(12)
         }
         .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+        .contentShape(RoundedRectangle(cornerRadius: 16))
     }
 }
 
 struct ProductDetailView: View {
     let product: MerchProduct
+    @State private var currentImageIndex = 0
+    @State private var showingFullscreenGallery = false
 
     var images: [String] {
-        var values = product.galleryImages ?? []
-        if let image = product.imageUrl, !values.contains(image) { values.insert(image, at: 0) }
-        return values
+        product.productImages
     }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                TabView {
-                    ForEach(images.isEmpty ? [product.imageUrl ?? ""] : images, id: \.self) { image in
-                        RemoteImage(urlString: image)
-                            .aspectRatio(1, contentMode: .fill)
-                    }
+                if images.isEmpty {
+                    ProductImagePlaceholder()
+                        .frame(height: 390)
+                } else {
+                    ProductImageGallery(
+                        images: images,
+                        currentIndex: $currentImageIndex,
+                        showingFullscreenGallery: $showingFullscreenGallery
+                    )
                 }
-                .tabViewStyle(.page)
-                .frame(height: 390)
-                .background(Brand.muted)
 
                 VStack(alignment: .leading, spacing: 12) {
                     if let badge = product.displayBadge {
@@ -23653,10 +29215,13 @@ struct ProductDetailView: View {
                     Button {
                         openWhatsApp(product)
                     } label: {
-                        Label("Ordina su WhatsApp", systemImage: "message.fill")
+                        Label("Acquista su WhatsApp", systemImage: "message.fill")
                     }
                     .buttonStyle(PrimaryButtonStyle())
                     .padding(.top, 10)
+
+                    ShopInfoFooter()
+                        .padding(.top, 2)
                 }
                 .padding(18)
                 .padding(.bottom, 84)
@@ -23665,6 +29230,215 @@ struct ProductDetailView: View {
         .background(Brand.background)
         .navigationTitle("Prodotto")
         .navigationBarTitleDisplayMode(.inline)
+        .fullScreenCover(isPresented: $showingFullscreenGallery) {
+            ProductFullscreenGallery(images: images, currentIndex: $currentImageIndex)
+        }
+    }
+}
+
+struct ProductImageGallery: View {
+    let images: [String]
+    @Binding var currentIndex: Int
+    @Binding var showingFullscreenGallery: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                TabView(selection: $currentIndex) {
+                    ForEach(Array(images.enumerated()), id: \.offset) { index, image in
+                        RemoteImage(urlString: image)
+                            .aspectRatio(1, contentMode: .fill)
+                            .tag(index)
+                    }
+                }
+                .tabViewStyle(.page(indexDisplayMode: .never))
+                .frame(height: 390)
+                .background(Brand.muted)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    showingFullscreenGallery = true
+                }
+
+                if images.count > 1 {
+                    galleryButton(systemImage: "chevron.left") {
+                        moveImage(by: -1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 12)
+
+                    galleryButton(systemImage: "chevron.right") {
+                        moveImage(by: 1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.trailing, 12)
+
+                    ProductGalleryDots(count: images.count, currentIndex: currentIndex)
+                        .frame(maxHeight: .infinity, alignment: .bottom)
+                        .padding(.bottom, 14)
+                }
+            }
+
+            if images.count > 1 {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(Array(images.enumerated()), id: \.offset) { index, image in
+                            ProductThumbnailButton(
+                                image: image,
+                                isSelected: index == currentIndex
+                            ) {
+                                withAnimation(.snappy) {
+                                    currentIndex = index
+                                }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                }
+            }
+        }
+        .onAppear(perform: clampIndex)
+        .onChange(of: images) { _, _ in
+            clampIndex()
+        }
+    }
+
+    private func moveImage(by offset: Int) {
+        guard !images.isEmpty else { return }
+        withAnimation(.snappy) {
+            currentIndex = (currentIndex + offset + images.count) % images.count
+        }
+    }
+
+    private func clampIndex() {
+        guard !images.isEmpty else {
+            currentIndex = 0
+            return
+        }
+        currentIndex = min(max(currentIndex, 0), images.count - 1)
+    }
+
+    private func galleryButton(systemImage: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(Brand.foreground)
+                .frame(width: 34, height: 34)
+                .background(Brand.background.opacity(0.82), in: Circle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct ProductFullscreenGallery: View {
+    let images: [String]
+    @Binding var currentIndex: Int
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            if images.isEmpty {
+                ProductImagePlaceholder()
+                    .padding(24)
+            } else {
+                TabView(selection: $currentIndex) {
+                    ForEach(Array(images.enumerated()), id: \.offset) { index, image in
+                        RemoteImage(urlString: image, contentMode: .fit)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .tag(index)
+                    }
+                }
+                .tabViewStyle(.page(indexDisplayMode: .never))
+
+                if images.count > 1 {
+                    ProductGalleryDots(count: images.count, currentIndex: currentIndex, activeColor: .white, inactiveColor: .white.opacity(0.4))
+                        .frame(maxHeight: .infinity, alignment: .bottom)
+                        .padding(.bottom, 34)
+                }
+            }
+
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 40, height: 40)
+                    .background(Color.black.opacity(0.54), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            .padding(18)
+        }
+    }
+}
+
+struct ProductThumbnailButton: View {
+    let image: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            RemoteImage(urlString: image)
+                .frame(width: 64, height: 64)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(isSelected ? Brand.primary : Color.clear, lineWidth: 2)
+                )
+                .opacity(isSelected ? 1 : 0.62)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct ProductGalleryDots: View {
+    let count: Int
+    let currentIndex: Int
+    var activeColor: Color = Brand.primary
+    var inactiveColor: Color = Brand.foreground.opacity(0.3)
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(0..<count, id: \.self) { index in
+                Circle()
+                    .fill(index == currentIndex ? activeColor : inactiveColor)
+                    .frame(width: index == currentIndex ? 8 : 7, height: index == currentIndex ? 8 : 7)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Brand.background.opacity(0.72), in: Capsule())
+    }
+}
+
+struct ProductImagePlaceholder: View {
+    var body: some View {
+        ZStack {
+            Brand.muted
+            Image(systemName: "bag")
+                .font(.system(size: 46, weight: .regular))
+                .foregroundStyle(Brand.mutedForeground.opacity(0.35))
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+struct ShopInfoFooter: View {
+    var body: some View {
+        VStack(spacing: 4) {
+            Text("Tutti gli ordini sono gestiti manualmente via WhatsApp.")
+            Text("I dettagli di consegna e pagamento saranno concordati direttamente con il team.")
+        }
+        .font(.caption)
+        .foregroundStyle(Brand.mutedForeground)
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: .infinity)
+        .padding(16)
+        .background(Brand.muted.opacity(0.55), in: RoundedRectangle(cornerRadius: 16))
     }
 }
 
@@ -23871,6 +29645,8 @@ private func dismissKeyboard() {
 }
 
 private struct ReadableSwitchToggleStyle: ToggleStyle {
+    @Environment(\.colorScheme) private var colorScheme
+
     func makeBody(configuration: Configuration) -> some View {
         HStack(spacing: 12) {
             configuration.label
@@ -23897,19 +29673,15 @@ private struct ReadableSwitchToggleStyle: ToggleStyle {
     }
 
     private var offTrack: Color {
-        Color(uiColor: UIColor { traits in
-            traits.userInterfaceStyle == .dark
-                ? UIColor(red: 0.34, green: 0.38, blue: 0.35, alpha: 1)
-                : UIColor(red: 0.78, green: 0.80, blue: 0.78, alpha: 1)
-        })
+        colorScheme == .dark
+            ? Color(red: 0.34, green: 0.38, blue: 0.35)
+            : Color(red: 0.78, green: 0.80, blue: 0.78)
     }
 
     private var offBorder: Color {
-        Color(uiColor: UIColor { traits in
-            traits.userInterfaceStyle == .dark
-                ? UIColor(red: 0.50, green: 0.56, blue: 0.52, alpha: 1)
-                : UIColor(red: 0.64, green: 0.67, blue: 0.64, alpha: 1)
-        })
+        colorScheme == .dark
+            ? Color(red: 0.50, green: 0.56, blue: 0.52)
+            : Color(red: 0.64, green: 0.67, blue: 0.64)
     }
 }
 
@@ -24216,10 +29988,12 @@ struct ConsentToggle: View {
                         .foregroundStyle(Brand.foreground)
                         .lineLimit(2)
 
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(Brand.mutedForeground)
-                        .fixedSize(horizontal: false, vertical: true)
+                    if !subtitle.isEmpty {
+                        Text(subtitle)
+                            .font(.caption)
+                            .foregroundStyle(Brand.mutedForeground)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -24267,31 +30041,34 @@ struct LegalConsentToggle: View {
             .accessibilityLabel(isOn ? "Consenso termini e privacy selezionato" : "Consenso termini e privacy non selezionato")
 
             VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 0) {
-                    Text("Accetto ")
-                    NavigationLink {
-                        HelpContentView(slug: "privacy-policy", fallbackTitle: "Privacy Policy")
-                    } label: {
-                        Text("Privacy Policy")
-                            .fontWeight(.semibold)
-                            .foregroundStyle(Brand.primary)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 0) {
+                        Text("Ho letto e accetto i ")
+                        NavigationLink {
+                            HelpContentView(slug: "termini-di-servizio", fallbackTitle: "Termini di Utilizzo")
+                        } label: {
+                            Text("Termini di Utilizzo")
+                                .fontWeight(.semibold)
+                                .foregroundStyle(Brand.primary)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
-                    Text(" e ")
-                    NavigationLink {
-                        HelpContentView(slug: "termini-di-servizio", fallbackTitle: "Termini di servizio")
-                    } label: {
-                        Text("Termini di servizio")
-                            .fontWeight(.semibold)
-                            .foregroundStyle(Brand.primary)
+                    HStack(spacing: 0) {
+                        Text("e l'")
+                        NavigationLink {
+                            HelpContentView(slug: "privacy-policy", fallbackTitle: "Informativa Privacy")
+                        } label: {
+                            Text("Informativa Privacy")
+                                .fontWeight(.semibold)
+                                .foregroundStyle(Brand.primary)
+                        }
+                        .buttonStyle(.plain)
+                        Text("*")
                     }
-                    .buttonStyle(.plain)
-                    Text("*")
                 }
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(Brand.foreground)
-                .lineLimit(1)
-                .minimumScaleFactor(0.72)
+                .fixedSize(horizontal: false, vertical: true)
 
                 Text("Usiamo i tuoi dati solo per gestire account, iscrizioni e comunicazioni legate alle attività.")
                     .font(.caption)
@@ -24572,6 +30349,8 @@ struct BadgeLabel: View {
         Text(text)
             .font(.caption.weight(.bold))
             .lineLimit(1)
+            .minimumScaleFactor(0.72)
+            .allowsTightening(true)
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .background(color, in: Capsule())
@@ -24804,6 +30583,21 @@ private extension Event {
         organizerIsPastByDate && !organizerIsDraft && !organizerIsCancelled
     }
 
+    var organizerCapacityWarning: (text: String, icon: String, color: Color)? {
+        guard let total = spotsTotal, total > 0 else { return nil }
+        let taken = spotsTaken ?? 0
+        let spotsLeft = total - taken
+        guard spotsLeft > 0 else { return nil }
+        if spotsLeft <= 3 {
+            let noun = spotsLeft == 1 ? "posto" : "posti"
+            return ("Solo \(spotsLeft) \(noun) rimasti", "info.circle.fill", Brand.destructive)
+        }
+        if Double(taken) / Double(total) >= 0.8 {
+            return ("Quasi pieno", "flame.fill", Brand.warning)
+        }
+        return nil
+    }
+
     var organizerDisplayName: String {
         organizerName?.nilIfBlank
             ?? organizerId.map { "Organizer \(String($0.prefix(8)))" }
@@ -24822,6 +30616,43 @@ private extension Event {
                 return EventStatusStyle(label: "Lista d'attesa", background: Brand.secondary.opacity(0.15), foreground: Brand.secondary)
             }
             return EventStatusStyle(label: "Sold out", background: Brand.destructive.opacity(0.14), foreground: Brand.destructive)
+        }
+        return EventStatusStyle(label: "Aperto", background: Brand.success.opacity(0.16), foreground: Brand.success)
+    }
+
+    func cardStatusStyle(registration: Registration?) -> EventStatusStyle {
+        if let registration, registration.blocksNewRegistration {
+            if isPastOrCancelled, registration.checkedIn == true || registration.normalizedStatus == "attended" {
+                return EventStatusStyle(label: "Partecipato", background: Brand.primary.opacity(0.15), foreground: Brand.primary)
+            }
+            if registration.waitlistSpotAvailable(in: self) {
+                return EventStatusStyle(label: "Posto disponibile", background: Brand.success.opacity(0.16), foreground: Brand.success)
+            }
+            switch registration.normalizedStatus {
+            case "registered", "paid", "attended", "deposit_paid":
+                return EventStatusStyle(label: "Iscritto", background: Brand.success.opacity(0.16), foreground: Brand.success)
+            case "waitlist":
+                return EventStatusStyle(label: "Waitlist", background: Brand.warning.opacity(0.16), foreground: Brand.warning)
+            case "pending_approval":
+                return EventStatusStyle(label: "Da approvare", background: Brand.warning.opacity(0.16), foreground: Brand.warning)
+            case "pending_payment":
+                return EventStatusStyle(label: "Pagamento", background: Brand.warning.opacity(0.16), foreground: Brand.warning)
+            default:
+                break
+            }
+        }
+
+        if normalizedStatus == "draft" {
+            return EventStatusStyle(label: "In arrivo", background: Brand.warning.opacity(0.15), foreground: Brand.warning)
+        }
+        if ["closed", "cancelled", "past", "archived"].contains(normalizedStatus) || isPastOrCancelled {
+            return EventStatusStyle(label: "Chiuso", background: Brand.muted, foreground: Brand.mutedForeground)
+        }
+        if normalizedStatus == "full" || isFull {
+            if hasWaitlistParticipationOption {
+                return EventStatusStyle(label: "Waitlist", background: Brand.warning.opacity(0.16), foreground: Brand.warning)
+            }
+            return EventStatusStyle(label: "Chiuso", background: Brand.muted, foreground: Brand.mutedForeground)
         }
         return EventStatusStyle(label: "Aperto", background: Brand.success.opacity(0.16), foreground: Brand.success)
     }
@@ -24964,6 +30795,7 @@ private func notificationIcon(_ type: String?) -> String {
     case "payment", "payment_confirmed", "deposit", "balance_due": "creditcard"
     case "event_update": "exclamationmark.circle"
     case "event_reminder", "event_reminder_24h", "event_reminder_3h": "clock"
+    case "issue_resolved": "checkmark.circle"
     case "membership", "membership_payment", "membership_activated": "checkmark.seal"
     case "mission", "mission_completed", "challenge", "challenge_completed": "flag.checkered"
     case "badge", "badge_unlocked", "user_badge": "rosette"
@@ -24971,6 +30803,27 @@ private func notificationIcon(_ type: String?) -> String {
     case "shop", "merch", "merch_product", "product": "bag"
     case "admin_broadcast", "ios_broadcast": "megaphone"
     default: "bell"
+    }
+}
+
+private func notificationTintColor(_ type: String?, read: Bool) -> Color {
+    if read {
+        return Brand.mutedForeground
+    }
+
+    switch type?.notificationTypeKey {
+    case "registration", "registration_confirmed", "event_registration", "payment_confirmed", "issue_resolved":
+        return Brand.success
+    case "waitlist", "balance_due", "deposit", "event_reminder", "event_reminder_24h":
+        return Brand.warning
+    case "event_reminder_3h":
+        return Brand.destructive
+    case "event_update", "admin_broadcast", "ios_broadcast":
+        return Brand.primary
+    case "shop", "merch", "merch_product", "product", "reward", "rewards", "points", "coupon", "coupon_unlocked", "mission_reward", "prize":
+        return Brand.secondary
+    default:
+        return Brand.primary
     }
 }
 
@@ -24982,9 +30835,17 @@ private func notificationRelativeTime(_ createdAt: String?) -> String? {
     return formatter.localizedString(for: date, relativeTo: Date())
 }
 
+private func notificationGroupLabel(_ createdAt: String?) -> String {
+    guard let date = createdAt?.isoDate else { return "Recenti" }
+    let calendar = Calendar.current
+    if calendar.isDateInToday(date) { return "Oggi" }
+    if calendar.isDateInYesterday(date) { return "Ieri" }
+    return DateFormatter.notificationGroupItalian.string(from: date)
+}
+
 @MainActor
 private func openWhatsApp(_ product: MerchProduct) {
-    let number = product.whatsappNumber?.filter(\.isNumber) ?? "923027858300"
+    let number = product.whatsappNumber?.filter(\.isNumber).nilIfBlank ?? "923027858300"
     let text = "Ciao! Vorrei acquistare: \(product.displayName) (€\(money(product.price ?? 0)))"
     let encoded = text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
     if let url = URL(string: "https://wa.me/\(number)?text=\(encoded)") {
@@ -25020,6 +30881,30 @@ private extension DateFormatter {
         formatter.calendar = Calendar(identifier: .gregorian)
         formatter.locale = Locale(identifier: "it_IT")
         formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+
+    static let proposalCreatedDate: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "it_IT")
+        formatter.dateFormat = "d MMM yyyy"
+        return formatter
+    }()
+
+    static let registrationCSV: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "it_IT")
+        formatter.dateFormat = "dd/MM/yyyy HH:mm"
+        return formatter
+    }()
+
+    static let broadcastHistoryItalian: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "it_IT")
+        formatter.dateFormat = "d MMM HH:mm"
         return formatter
     }()
 
@@ -25071,6 +30956,13 @@ private extension DateFormatter {
         return formatter
     }()
 
+    static let notificationGroupItalian: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "it_IT")
+        formatter.dateFormat = "d MMMM"
+        return formatter
+    }()
+
     static let analyticsMonth: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "it_IT")
@@ -25108,6 +31000,11 @@ private func parseBirthDate(_ value: String) -> Date? {
         ?? DateFormatter.birthDateItalianSlashes.date(from: cleanedValue)
 }
 
+private func calculateAge(from birthDate: String) -> Int? {
+    guard let date = parseBirthDate(birthDate) else { return nil }
+    return Calendar.current.dateComponents([.year], from: date, to: Date()).year
+}
+
 private extension URL {
     func appendingPath(_ path: String) -> URL {
         URL(string: absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + path)!
@@ -25123,6 +31020,14 @@ private extension URL {
             return components[payIndex + 1]
         }
         return components.first(where: { $0.hasPrefix("cs_") })
+    }
+
+    func queryValue(named name: String) -> String? {
+        URLComponents(url: self, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .first(where: { $0.name == name })?
+            .value?
+            .nilIfBlank
     }
 
     var isScampagnatePaymentCancellation: Bool {
@@ -25151,6 +31056,18 @@ private extension String {
     var nilIfBlank: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    var normalizedSearchText: String {
+        folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "it_IT"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    var recommendationLabel: String {
+        replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .capitalized
     }
 
     var whatsAppPhone: String? {
@@ -25186,10 +31103,18 @@ private extension String {
         }
     }
 
+    var webTrekkingValue: String {
+        switch self {
+        case "5_plus", "5+": return "5+"
+        default: return self
+        }
+    }
+
     var organizerStatusLabel: String {
         switch self {
         case "draft": return "Bozza"
         case "published", "available": return "Pubblicato"
+        case "full": return "Completo"
         case "closed": return "Chiuso"
         case "cancelled": return "Annullato"
         case "past": return "Passato"
@@ -25214,6 +31139,33 @@ private extension String {
         case "pay_on_location": return "Sul posto"
         case "failed": return "Fallito"
         default: return replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+
+    var webRegistrationStatusLabel: String {
+        switch self {
+        case "registered": return "Registered"
+        case "deposit_paid": return "Deposit Paid"
+        case "paid": return "Paid"
+        case "attended": return "Attended"
+        case "no_show": return "No-show"
+        case "pending_payment": return "Pending Payment"
+        case "pending_approval": return "Pending Approval"
+        case "waitlist": return "Waitlist"
+        case "cancelled": return "Cancel"
+        default: return self
+        }
+    }
+
+    var webPaymentStatusLabel: String {
+        switch self {
+        case "deposit_paid": return "Deposit Paid"
+        case "paid": return "Paid"
+        case "pending": return "Pending"
+        case "pay_on_location": return "Pay on location"
+        case "not_required": return "Not Required"
+        case "failed": return "Failed"
+        default: return self
         }
     }
 
