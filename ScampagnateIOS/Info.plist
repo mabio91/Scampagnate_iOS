@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>it</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>it</string>
+	</array>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>comgooglemaps</string>
+		<string>waze</string>
+	</array>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Scampagnate usa il calendario per aggiungere gli eventi a cui vuoi partecipare.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Scampagnate usa il calendario per aggiungere gli eventi a cui vuoi partecipare.</string>
+	<key>NSCalendarsWriteOnlyAccessUsageDescription</key>
+	<string>Scampagnate usa il calendario per aggiungere gli eventi a cui vuoi partecipare.</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.fmcp.scampagnate.app</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>scampagnate</string>
+			</array>
+		</dict>
+	</array>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+	</dict>
+</dict>
+</plist>
