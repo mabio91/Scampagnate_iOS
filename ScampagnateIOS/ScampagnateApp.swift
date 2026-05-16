@@ -20442,80 +20442,16 @@ struct OrganizerEventTimePickerField: View {
     }
 }
 
-private enum OrganizerRichTextCommand {
-    case bold
-    case italic
-    case underline
-    case strikethrough
-    case heading(Int)
-    case bulletList
-    case numberedList
-    case link(String)
-    case image(String)
-    case undo
-    case redo
-}
-
 @MainActor
 private final class OrganizerRichTextEditorController: ObservableObject {
     weak var webView: WKWebView?
-
-    func apply(_ command: OrganizerRichTextCommand) {
-        switch command {
-        case .bold:
-            runEditorCommand("bold")
-        case .italic:
-            runEditorCommand("italic")
-        case .underline:
-            runEditorCommand("underline")
-        case .strikethrough:
-            runEditorCommand("strikeThrough")
-        case .heading(let level):
-            evaluate("window.scampEditorHeading(\(level));")
-        case .bulletList:
-            runEditorCommand("insertUnorderedList")
-        case .numberedList:
-            runEditorCommand("insertOrderedList")
-        case .link(let urlString):
-            guard let url = normalizedURL(urlString, allowsMail: true) else { return }
-            evaluate("window.scampEditorLink(\(Self.jsStringLiteral(url)), \(Self.jsStringLiteral(url)));")
-        case .image(let urlString):
-            guard let url = normalizedURL(urlString, allowsMail: false) else { return }
-            evaluate("window.scampEditorImage(\(Self.jsStringLiteral(url)));")
-        case .undo:
-            runEditorCommand("undo")
-        case .redo:
-            runEditorCommand("redo")
-        }
-    }
 
     func setHTML(_ html: String) {
         evaluate("window.scampSetHTML(\(Self.jsStringLiteral(html)));")
     }
 
-    private func runEditorCommand(_ command: String) {
-        evaluate("window.scampEditorCommand(\(Self.jsStringLiteral(command)));")
-    }
-
     private func evaluate(_ javaScript: String) {
         webView?.evaluateJavaScript(javaScript)
-    }
-
-    private func normalizedURL(_ raw: String, allowsMail: Bool) -> String? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let normalized: String
-        if trimmed.range(of: "://") == nil,
-           !(allowsMail && trimmed.lowercased().hasPrefix("mailto:")) {
-            normalized = "https://\(trimmed)"
-        } else {
-            normalized = trimmed
-        }
-        guard let url = URL(string: normalized),
-              let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" || (allowsMail && scheme == "mailto")
-        else { return nil }
-        return normalized
     }
 
     private static func jsStringLiteral(_ value: String) -> String {
@@ -20530,10 +20466,6 @@ private final class OrganizerRichTextEditorController: ObservableObject {
 private struct OrganizerRichTextEditor: View {
     @Binding var html: String
     @StateObject private var controller = OrganizerRichTextEditorController()
-    @State private var showingLinkPrompt = false
-    @State private var showingImagePrompt = false
-    @State private var pendingLink = ""
-    @State private var pendingImage = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -20542,8 +20474,6 @@ private struct OrganizerRichTextEditor: View {
                 .foregroundStyle(Brand.foreground)
 
             VStack(spacing: 0) {
-                toolbar
-                Divider().overlay(Brand.inputBorder)
                 OrganizerRichTextTextView(html: $html, controller: controller)
                     .frame(maxWidth: .infinity, minHeight: 230, alignment: .leading)
                     .padding(10)
@@ -20553,151 +20483,6 @@ private struct OrganizerRichTextEditor: View {
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.inputBorder, lineWidth: 1))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .alert("Link", isPresented: $showingLinkPrompt) {
-            TextField("URL", text: $pendingLink)
-            Button("Applica") {
-                controller.apply(.link(pendingLink))
-            }
-            Button("Annulla", role: .cancel) {}
-        }
-        .alert("Immagine", isPresented: $showingImagePrompt) {
-            TextField("URL immagine", text: $pendingImage)
-            Button("Inserisci") {
-                controller.apply(.image(pendingImage))
-            }
-            Button("Annulla", role: .cancel) {}
-        }
-    }
-
-    private var toolbar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                Button { controller.apply(.bold) } label: {
-                    Text("B")
-                        .font(.body.weight(.bold))
-                        .richTextToolbarButton()
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Grassetto")
-
-                Button { controller.apply(.italic) } label: {
-                    Text("I")
-                        .font(.body.italic())
-                        .richTextToolbarButton()
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Corsivo")
-
-                Button { controller.apply(.underline) } label: {
-                    Text("U")
-                        .font(.body.weight(.semibold))
-                        .underline()
-                        .richTextToolbarButton()
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Sottolineato")
-
-                Button { controller.apply(.strikethrough) } label: {
-                    Text("S")
-                        .font(.body.weight(.semibold))
-                        .strikethrough()
-                        .richTextToolbarButton()
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Barrato")
-
-                toolbarDivider
-
-                Button { controller.apply(.heading(1)) } label: {
-                    Text("H1")
-                        .font(.subheadline.weight(.bold))
-                        .richTextToolbarButton()
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Titolo 1")
-
-                Button { controller.apply(.heading(2)) } label: {
-                    Text("H2")
-                        .font(.subheadline.weight(.bold))
-                        .richTextToolbarButton()
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Titolo 2")
-
-                Button { controller.apply(.heading(3)) } label: {
-                    Text("H3")
-                        .font(.subheadline.weight(.bold))
-                        .richTextToolbarButton()
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Titolo 3")
-
-                toolbarDivider
-
-                richTextIconButton("list.bullet", label: "Elenco puntato") {
-                    controller.apply(.bulletList)
-                }
-                richTextIconButton("list.number", label: "Elenco numerato") {
-                    controller.apply(.numberedList)
-                }
-
-                toolbarDivider
-
-                richTextIconButton("link", label: "Link") {
-                    pendingLink = ""
-                    showingLinkPrompt = true
-                }
-                richTextIconButton("photo", label: "Immagine") {
-                    pendingImage = ""
-                    showingImagePrompt = true
-                }
-
-                toolbarDivider
-
-                richTextIconButton("arrow.uturn.backward", label: "Annulla") {
-                    controller.apply(.undo)
-                }
-                richTextIconButton("arrow.uturn.forward", label: "Ripristina") {
-                    controller.apply(.redo)
-                }
-            }
-            .padding(10)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var toolbarDivider: some View {
-        Rectangle()
-            .fill(Brand.inputBorder)
-            .frame(width: 1, height: 28)
-            .padding(.horizontal, 2)
-    }
-
-    private func richTextIconButton(_ systemName: String, label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 17, weight: .semibold))
-                .richTextToolbarButton()
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(label)
-    }
-}
-
-private struct RichTextToolbarButtonModifier: ViewModifier {
-    func body(content: Content) -> some View {
-        content
-            .foregroundStyle(Brand.inputForeground)
-            .frame(width: 34, height: 34)
-            .background(Brand.muted.opacity(0.35), in: RoundedRectangle(cornerRadius: 9))
-            .overlay(RoundedRectangle(cornerRadius: 9).stroke(Brand.inputBorder, lineWidth: 1))
-            .contentShape(RoundedRectangle(cornerRadius: 9))
-    }
-}
-
-private extension View {
-    func richTextToolbarButton() -> some View {
-        modifier(RichTextToolbarButtonModifier())
     }
 }
 
@@ -20911,86 +20696,6 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
               savedRange = range.cloneRange();
             }
           }
-
-          function restoreSelection() {
-            editor.focus();
-            const selection = window.getSelection();
-            if (!selection) return;
-            selection.removeAllRanges();
-            if (savedRange) {
-              selection.addRange(savedRange);
-              return;
-            }
-            const range = document.createRange();
-            range.selectNodeContents(editor);
-            range.collapse(false);
-            selection.addRange(range);
-            savedRange = range.cloneRange();
-          }
-
-          function currentBlock() {
-            const selection = window.getSelection();
-            if (!selection || selection.rangeCount === 0) return null;
-            let node = selection.anchorNode;
-            if (node && node.nodeType === Node.TEXT_NODE) node = node.parentNode;
-            while (node && node !== editor) {
-              if (/^(P|H1|H2|H3|LI|DIV)$/i.test(node.nodeName)) return node;
-              node = node.parentNode;
-            }
-            return null;
-          }
-
-          function escapeHTML(value) {
-            return String(value)
-              .replace(/&/g, '&amp;')
-              .replace(/</g, '&lt;')
-              .replace(/>/g, '&gt;')
-              .replace(/"/g, '&quot;')
-              .replace(/'/g, '&#39;');
-          }
-
-          function escapeAttribute(value) {
-            return escapeHTML(value);
-          }
-
-          function insertHTML(html) {
-            document.execCommand('insertHTML', false, html);
-          }
-
-          window.scampEditorCommand = (command) => {
-            restoreSelection();
-            document.execCommand(command, false, null);
-            post('update');
-            saveSelection();
-          };
-
-          window.scampEditorHeading = (level) => {
-            restoreSelection();
-            const tag = `H${level}`;
-            const block = currentBlock();
-            document.execCommand('formatBlock', false, block && block.nodeName === tag ? 'P' : tag);
-            post('update');
-            saveSelection();
-          };
-
-          window.scampEditorLink = (url, text) => {
-            restoreSelection();
-            const selection = window.getSelection();
-            if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
-              insertHTML(`<a href="${escapeAttribute(url)}">${escapeHTML(text)}</a>`);
-            } else {
-              document.execCommand('createLink', false, url);
-            }
-            post('update');
-            saveSelection();
-          };
-
-          window.scampEditorImage = (url) => {
-            restoreSelection();
-            insertHTML(`<img src="${escapeAttribute(url)}">`);
-            post('update');
-            saveSelection();
-          };
 
           window.scampSetHTML = (html) => {
             editor.innerHTML = html || '';
