@@ -19514,59 +19514,60 @@ struct OrganizerEventEditorView: View {
                 ProgressView()
                     .tint(Brand.primary)
             } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        if let validationMessage {
-                            Text(validationMessage)
-                                .font(.footnote.weight(.semibold))
-                                .foregroundStyle(Brand.destructive)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .padding(12)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Brand.destructive.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
-                        }
+                GeometryReader { proxy in
+                    ScrollView(.vertical) {
+                        VStack(alignment: .leading, spacing: 16) {
+                            if let validationMessage {
+                                Text(validationMessage)
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(Brand.destructive)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .padding(12)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Brand.destructive.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+                            }
 
-                        OrganizerEditorSection(title: "Informazioni base") {
-                            Field("Titolo", text: $draft.title)
-                            OrganizerRichTextEditor(html: $draft.description)
-                            OrganizerEventDatePickerField("Data", dateString: $draft.date)
-                            OrganizerEventTimePickerField("Ora", timeString: $draft.time)
-                            OrganizerAddressAutocompleteField("Luogo", text: $draft.location, label: $draft.locationLabel)
-                            Field("Etichetta luogo", text: $draft.locationLabel)
-                            Text("Categoria evento")
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(Brand.foreground)
-                            Picker("Categoria evento", selection: $draft.categoryId) {
-                                Text("Nessuna").tag("")
-                                ForEach(store.categories) { category in
-                                    Text(categoryLabel(category)).tag(category.id ?? "")
+                            OrganizerEditorSection(title: "Informazioni base") {
+                                Field("Titolo", text: $draft.title)
+                                OrganizerRichTextEditor(html: $draft.description)
+                                OrganizerEventDatePickerField("Data", dateString: $draft.date)
+                                OrganizerEventTimePickerField("Ora", timeString: $draft.time)
+                                OrganizerAddressAutocompleteField("Luogo", text: $draft.location, label: $draft.locationLabel)
+                                Field("Etichetta luogo", text: $draft.locationLabel)
+                                Text("Categoria evento")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(Brand.foreground)
+                                Picker("Categoria evento", selection: $draft.categoryId) {
+                                    Text("Nessuna").tag("")
+                                    ForEach(store.categories) { category in
+                                        Text(categoryLabel(category)).tag(category.id ?? "")
+                                    }
                                 }
-                            }
-                            .editableControlSurface()
-                            Text("Categoria fit score principale")
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(Brand.foreground)
-                            Picker("Categoria fit score principale", selection: $draft.fitScoreMainCategory) {
-                                Text("Nessuna").tag("")
-                                ForEach(OrganizerEventDraft.fitScoreCategories, id: \.self) { category in
-                                    Text(category).tag(category)
+                                .editableControlSurface()
+                                Text("Categoria fit score principale")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(Brand.foreground)
+                                Picker("Categoria fit score principale", selection: $draft.fitScoreMainCategory) {
+                                    Text("Nessuna").tag("")
+                                    ForEach(OrganizerEventDraft.fitScoreCategories, id: \.self) { category in
+                                        Text(category).tag(category)
+                                    }
                                 }
-                            }
-                            .editableControlSurface()
-                            OrganizerFitCategoryMultiSelector(title: "Categorie fit score secondarie", categories: OrganizerEventDraft.fitScoreCategories, mainCategory: draft.fitScoreMainCategory, selected: $draft.fitScoreSecondaryCategories)
-                            if !specialBadges.isEmpty {
-                                Text("Badge speciali evento")
-                                    .font(.subheadline.weight(.bold))
-                                    .padding(.top, 8)
-                                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
-                                    ForEach(specialBadges) { badge in
-                                        OrganizerToggleChip(title: badge.name, selected: draft.specialBadgeIds.contains(badge.id)) {
-                                            toggleValue(badge.id, in: &draft.specialBadgeIds)
+                                .editableControlSurface()
+                                OrganizerFitCategoryMultiSelector(title: "Categorie fit score secondarie", categories: OrganizerEventDraft.fitScoreCategories, mainCategory: draft.fitScoreMainCategory, selected: $draft.fitScoreSecondaryCategories)
+                                if !specialBadges.isEmpty {
+                                    Text("Badge speciali evento")
+                                        .font(.subheadline.weight(.bold))
+                                        .padding(.top, 8)
+                                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                                        ForEach(specialBadges) { badge in
+                                            OrganizerToggleChip(title: badge.name, selected: draft.specialBadgeIds.contains(badge.id)) {
+                                                toggleValue(badge.id, in: &draft.specialBadgeIds)
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
 
                         OrganizerEditorSection(title: "Galleria") {
                             if draft.imageUrl.nilIfBlank != nil {
@@ -19843,11 +19844,13 @@ struct OrganizerEventEditorView: View {
                             .buttonStyle(SecondaryButtonStyle())
                         }
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(16)
-                    .padding(.bottom, keyboardInset > 0 ? keyboardInset + 16 : 0)
+                        .padding(16)
+                        .padding(.bottom, keyboardInset > 0 ? keyboardInset + 16 : 0)
+                        .frame(width: proxy.size.width, alignment: .leading)
+                    }
+                    .clipped()
+                    .scrollDismissesKeyboard(.interactively)
                 }
-                .scrollDismissesKeyboard(.interactively)
             }
         }
         .ignoresSafeArea(.keyboard, edges: .bottom)
