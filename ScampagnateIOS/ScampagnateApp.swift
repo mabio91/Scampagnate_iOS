@@ -3603,14 +3603,8 @@ struct Event: Codable, Identifiable, Hashable {
         return priceOptions.contains { $0.canJoinWaitlist(in: self) }
     }
     var availabilityLabel: String {
-        if !acceptsRegistrations {
-            return statusStyle.label
-        }
-        if isSoldOut && !shouldShowPublicCapacity {
-            return "Sold out"
-        }
-        if hasBookableParticipationOption {
-            let remaining = priceOptions.isEmpty ? bookableSpots : (priceOptions.map { $0.realRemainingSpots(in: self) }.max() ?? bookableSpots)
+        let remaining = priceOptions.isEmpty ? bookableSpots : (priceOptions.map { $0.realRemainingSpots(in: self) }.max() ?? bookableSpots)
+        if remaining > 0 {
             return remaining == 1 ? "1 posto disponibile" : "\(remaining) posti disponibili"
         }
         return hasWaitlistParticipationOption ? "Lista d'attesa" : "Sold out"
