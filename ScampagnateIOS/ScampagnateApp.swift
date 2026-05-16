@@ -21359,6 +21359,7 @@ struct OrganizerAddressAutocompleteField: View {
     let labelSpacing: CGFloat
     let borderWidth: CGFloat
     let showsLeadingIcon: Bool
+    let help: String?
     @StateObject private var autocomplete = OrganizerAddressAutocompleteModel()
     @FocusState private var isFocused: Bool
     @State private var resolving = false
@@ -21370,7 +21371,8 @@ struct OrganizerAddressAutocompleteField: View {
         labelFont: Font = .subheadline.weight(.semibold),
         labelSpacing: CGFloat = 6,
         borderWidth: CGFloat = 1,
-        showsLeadingIcon: Bool = true
+        showsLeadingIcon: Bool = true,
+        help: String? = nil
     ) {
         self.title = title
         self._text = text
@@ -21379,13 +21381,20 @@ struct OrganizerAddressAutocompleteField: View {
         self.labelSpacing = labelSpacing
         self.borderWidth = borderWidth
         self.showsLeadingIcon = showsLeadingIcon
+        self.help = help
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: labelSpacing) {
-            Text(title)
-                .font(labelFont)
-                .foregroundStyle(Brand.foreground)
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(labelFont)
+                    .foregroundStyle(Brand.foreground)
+                    .lineLimit(1)
+                if let help {
+                    InfoTooltipButton(text: help)
+                }
+            }
             HStack(spacing: showsLeadingIcon ? 10 : 0) {
                 if showsLeadingIcon {
                     Image(systemName: "mappin.and.ellipse")
@@ -26585,13 +26594,15 @@ struct ProfileEditSheet: View {
                 labelFont: ProfileSheetFieldStyle.labelFont,
                 labelSpacing: ProfileSheetFieldStyle.labelSpacing,
                 borderWidth: ProfileSheetFieldStyle.inputBorderWidth,
-                showsLeadingIcon: false
+                showsLeadingIcon: false,
+                help: #"Inserisci via e numero civico (es. "Via Roma 12")."#
             )
-            Text(#"Inserisci via e numero civico (es. "Via Roma 12")."#)
-                .font(.caption)
-                .foregroundStyle(Brand.mutedForeground)
             HStack(alignment: .top, spacing: 14) {
-                ProfileSheetField("Città di residenza", text: $input.cityOfResidence)
+                ProfileSheetField(
+                    "Città di residenza",
+                    text: $input.cityOfResidence,
+                    help: #"Inserisci la città di residenza. Se vivi all'estero, inserisci il nome della nazione (es. "Francia", "Romania")."#
+                )
                 ProvinceProfileSheetField(
                     "Provincia di residenza",
                     text: $input.provinceOfResidence,
