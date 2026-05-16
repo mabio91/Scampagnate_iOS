@@ -2874,7 +2874,7 @@ struct SupabaseAPI {
             throw AppError.message("La lista d'attesa non è attiva per questo evento.")
         }
         if shouldWaitlist, let selectedOption, selectedOption.waitlistEnabled == false {
-            throw AppError.message("Questa opzione non ha lista d'attesa attiva.")
+            throw AppError.message("Questa formula non ha lista d'attesa attiva.")
         }
         let paymentType = selectedOption?.effectivePaymentType(fallback: event) ?? event.paymentType ?? "free"
         let requiresOnlinePayment = selectedOption?.requiresOnlinePayment(fallback: event) ?? event.requiresOnlinePayment
@@ -4760,7 +4760,7 @@ struct OrganizerEventDraft: Equatable {
     var cancellationPolicy = "flexible_24h"
     var imageUrl = ""
     var visibility = "public"
-    var status = "published"
+    var status = "open"
     var galleryImageURLs: [String] = []
     var manualBadges: [String] = []
     var customBadge = ""
@@ -4807,7 +4807,7 @@ struct OrganizerEventDraft: Equatable {
         cancellationPolicy = Self.normalizedCancellationPolicy(event.cancellationPolicy)
         imageUrl = event.imageUrl ?? ""
         visibility = duplicate ? "private" : (event.visibility ?? "public")
-        status = duplicate ? "published" : Self.editableStatus(event.status)
+        status = duplicate ? "open" : Self.editableStatus(event.status)
         galleryImageURLs = event.gallery.compactMap(\.url)
         manualBadges = (event.eventBadges ?? []).filter { OrganizerEventDraft.manualBadgeOptions.map(\.id).contains($0) }
         customBadge = (event.eventBadges ?? []).first { !OrganizerEventDraft.manualBadgeOptions.map(\.id).contains($0) } ?? ""
@@ -4861,22 +4861,22 @@ struct OrganizerEventDraft: Equatable {
         locationLabel = proposal.locationLabel ?? ""
         categoryId = proposal.categoryId ?? ""
         spotsTotal = proposal.maxParticipants ?? 20
-        status = "published"
+        status = "open"
         visibility = "private"
     }
 
     static func editableStatus(_ status: String?) -> String {
         switch status {
-        case "available", "open":
-            return "published"
+        case "available", "published":
+            return "open"
         case "unpublished":
             return "draft"
         case "past", "completed":
             return "closed"
-        case "draft", "upcoming", "published", "closed", "full", "rescheduled", "cancelled":
-            return status ?? "published"
+        case "draft", "upcoming", "open", "closed", "full", "rescheduled", "cancelled":
+            return status ?? "open"
         default:
-            return "published"
+            return "open"
         }
     }
 
@@ -4941,7 +4941,7 @@ struct OrganizerEventDraft: Equatable {
             if paymentType == "deposit" && deposit <= 0 { messages.append("Acconto evento") }
             if paymentType == "deposit" && price - deposit <= 0 { messages.append("Saldo evento maggiore di zero") }
         }
-        if validOptions.contains(where: { $0.paymentType != "free" && $0.paymentType != "location" && $0.price <= 0 }) { messages.append("Prezzo per ogni opzione a pagamento online") }
+        if validOptions.contains(where: { $0.paymentType != "free" && $0.paymentType != "location" && $0.price <= 0 }) { messages.append("Prezzo per ogni formula a pagamento online") }
         if validOptions.contains(where: { $0.paymentType == "deposit" && $0.depositAmount <= 0 }) { messages.append("Acconto per le opzioni con acconto") }
         if validOptions.contains(where: { $0.paymentType == "deposit" && ($0.price - $0.depositAmount) <= 0 }) { messages.append("Saldo per le opzioni con acconto") }
         if validOptions.contains(where: { $0.hasDedicatedSpots && $0.dedicatedSpots < 1 }) { messages.append("Posti dedicati per le opzioni con limite attivo") }
@@ -9562,7 +9562,7 @@ struct EventDetailView: View {
         if let duration = event.duration?.nilIfBlank {
             metrics.append(DetailMetric(title: duration, subtitle: "Durata", icon: "clock"))
         }
-        metrics.append(DetailMetric(title: "\(activeParticipantCount)/\(event.spotsTotal ?? 0)", subtitle: "Posti", icon: "person.2"))
+        metrics.append(DetailMetric(title: event.shouldShowPublicCapacity ? "\(activeParticipantCount)/\(event.spotsTotal ?? 0)" : "Sold out", subtitle: "Posti", icon: "person.2"))
         return metrics
     }
 
@@ -10192,7 +10192,7 @@ struct OrganizerProfileEventRow: View {
                     Text(event.displayPrice)
                         .font(.system(.subheadline, design: .rounded, weight: .heavy))
                         .foregroundStyle(Brand.foreground)
-                    if let total = event.spotsTotal {
+                    if let total = event.spotsTotal, event.shouldShowPublicCapacity {
                         Label("\(event.spotsTaken ?? event.attendeeSpotsTaken)/\(total)", systemImage: "person.2")
                             .labelStyle(.titleAndIcon)
                     }
@@ -17193,7 +17193,7 @@ struct OrganizerParticipationOptionsBreakdown: View {
     var body: some View {
         if !sortedOptions.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
-                Label("Opzioni di partecipazione", systemImage: "ticket")
+                Label("Modalità di partecipazione", systemImage: "ticket")
                     .font(.headline.weight(.bold))
                     .foregroundStyle(Brand.foreground)
                 ForEach(sortedOptions) { option in
@@ -17400,7 +17400,7 @@ struct OrganizerParticipantsSection: View {
                     .disabled(registrations.isEmpty)
                     Picker("Filtro", selection: $selectedParticipantFilter) {
                         Text("Tutti").tag(Self.allParticipantFilter)
-                        Text("Per opzione").tag(Self.optionParticipantFilter)
+                        Text("Per formula").tag(Self.optionParticipantFilter)
                         Text("Acconto pagato").tag(Self.depositParticipantFilter)
                         Text("Presenti").tag(Self.attendedParticipantFilter)
                         Text("Lista d'attesa").tag(Self.waitlistParticipantFilter)
@@ -17429,16 +17429,16 @@ struct OrganizerParticipantsSection: View {
 
                 if selectedParticipantFilter == Self.optionParticipantFilter, !filterOptions.isEmpty {
                     HStack(spacing: 10) {
-	                        Label("Opzione", systemImage: "ticket")
+	                        Label("Formula", systemImage: "ticket")
 	                            .font(.subheadline.weight(.semibold))
 	                            .foregroundStyle(Brand.foreground)
 	                        Spacer()
-	                        Picker("Opzione", selection: $selectedPriceOptionFilter) {
+	                        Picker("Formula", selection: $selectedPriceOptionFilter) {
 	                            Text("Tutte").tag(Self.allPriceOptionsFilter)
 	                            ForEach(filterOptions) { option in
 	                                Text(option.displayName).tag(option.id)
 	                            }
-	                            Text("Senza opzione").tag(Self.withoutPriceOptionFilter)
+	                            Text("Senza formula").tag(Self.withoutPriceOptionFilter)
 	                        }
 	                        .pickerStyle(.menu)
 	                        .tint(Brand.primary)
@@ -17547,7 +17547,7 @@ struct OrganizerParticipantsSection: View {
     private var selectedFilterLabel: String {
         switch selectedParticipantFilter {
         case Self.optionParticipantFilter:
-            return "Filtro opzione"
+            return "Filtro formula"
         case Self.depositParticipantFilter:
             return "Acconto pagato"
         case Self.attendedParticipantFilter:
@@ -17577,7 +17577,7 @@ struct OrganizerParticipantsSection: View {
     private var selectedEmptyMessage: String {
         switch selectedParticipantFilter {
         case Self.optionParticipantFilter:
-            return "Non ci sono partecipanti per questa opzione."
+            return "Non ci sono partecipanti per questa formula."
         case Self.depositParticipantFilter:
             return "Non ci sono partecipanti con acconto pagato."
         case Self.attendedParticipantFilter:
@@ -18693,7 +18693,7 @@ struct OrganizerParticipantRow: View {
                         }
                         if !priceOptions.isEmpty {
                             Divider()
-                            Button("Nessuna opzione prezzo") { onPriceOption(nil) }
+                            Button("Nessuna formula") { onPriceOption(nil) }
                             ForEach(priceOptions) { option in
                                 Button(option.displayName) { onPriceOption(option.id) }
                             }
@@ -18940,7 +18940,7 @@ struct OrganizerEventStatusSheet: View {
     let event: Event
     let onSelect: (String) -> Void
 
-    private let statuses = ["draft", "upcoming", "published", "closed", "full", "rescheduled", "cancelled"]
+    private let statuses = ["draft", "upcoming", "open", "closed", "full", "rescheduled", "cancelled"]
 
     var body: some View {
         NavigationStack {
@@ -18991,7 +18991,7 @@ struct OrganizerEventStatusSheet: View {
         switch status {
         case "draft": return "doc.text"
         case "upcoming": return "calendar.badge.clock"
-        case "published": return "eye"
+        case "open": return "eye"
         case "full": return "person.2.slash"
         case "closed": return "lock"
         case "rescheduled": return "calendar.badge.exclamationmark"
@@ -19004,7 +19004,7 @@ struct OrganizerEventStatusSheet: View {
         switch status {
         case "draft", "closed": return Brand.mutedForeground
         case "upcoming", "rescheduled": return Brand.warning
-        case "published": return Brand.success
+        case "open": return Brand.success
         case "full", "cancelled": return Brand.destructive
         default: return Brand.primary
         }
@@ -19014,9 +19014,9 @@ struct OrganizerEventStatusSheet: View {
         switch status {
         case "draft": return "Non pubblicato: visibile solo ad admin e organizzatori."
         case "upcoming": return "Evento annunciabile, ma iscrizioni non ancora aperte."
-        case "published": return "Aperto: visibile e disponibile alle iscrizioni."
+        case "open": return "Aperto: visibile e disponibile alle iscrizioni."
         case "closed": return "Chiude nuove iscrizioni senza cancellare l'evento."
-        case "full": return "Sold out: la lista d'attesa dipende dall'opzione dedicata."
+        case "full": return "Sold out: la lista d'attesa dipende dalla formula dedicata."
         case "rescheduled": return "Evento da riprogrammare, iscrizioni bloccate."
         case "cancelled": return "Annullato. Usa l'azione dedicata per notifiche e rimborsi."
         default: return ""
@@ -19131,7 +19131,7 @@ struct OrganizerAddParticipantSheet: View {
 
                 Section("Dettagli") {
                     if !priceOptions.isEmpty {
-                        Picker("Opzione", selection: $priceOptionId) {
+                        Picker("Formula", selection: $priceOptionId) {
                             ForEach(priceOptions) { option in
                                 Text(option.displayName).tag(option.id)
                             }
@@ -20948,7 +20948,7 @@ struct OrganizerEventStatusEditor: View {
     private let options: [(id: String, label: String, description: String)] = [
         ("draft", "Non pubblicato", "Visibile solo ad admin e organizzatori. Iscrizioni non attive."),
         ("upcoming", "In arrivo", "Evento annunciabile, ma iscrizioni non ancora aperte."),
-        ("published", "Aperto", "Evento visibile e iscrizioni attive."),
+        ("open", "Aperto", "Evento visibile e iscrizioni attive."),
         ("closed", "Iscrizioni chiuse", "Evento visibile, ma iscrizioni bloccate."),
         ("full", "Sold out", "Evento sold out. La lista d'attesa resta una funzione separata."),
         ("rescheduled", "Riprogrammato", "Evento da riprogrammare. Iscrizioni non attive."),
