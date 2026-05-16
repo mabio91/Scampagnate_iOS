@@ -28789,7 +28789,6 @@ struct OnboardingBurstPiece: Identifiable {
 
 struct NotificationsView: View {
     @EnvironmentObject private var store: AppStore
-    @EnvironmentObject private var pushNotifications: PushNotificationService
     @Environment(\.dismiss) private var dismiss
     let onNavigate: (NotificationDestination) -> Void
     @State private var expandedNotificationIds: Set<String> = []
@@ -28887,17 +28886,6 @@ struct NotificationsView: View {
 
             Spacer(minLength: 8)
 
-            Button {
-                Task { await togglePushNotifications() }
-            } label: {
-                Label(pushNotifications.isPushActive ? "Attive" : "Push", systemImage: "bell.badge")
-                    .font(.subheadline.weight(.semibold))
-                    .labelStyle(.titleAndIcon)
-            }
-            .foregroundStyle(pushNotifications.isPushActive ? Brand.primary : Brand.mutedForeground)
-            .buttonStyle(.plain)
-            .disabled(pushNotifications.isRegistering)
-
             if !unreadNotifications.isEmpty {
                 Button {
                     Task {
@@ -28930,19 +28918,6 @@ struct NotificationsView: View {
         .background(Brand.background)
         .overlay(alignment: .bottom) {
             Divider().overlay(Brand.muted)
-        }
-    }
-
-    private func togglePushNotifications() async {
-        guard let session = store.session else { return }
-        if pushNotifications.canOpenSettings {
-            pushNotifications.openAppSettings()
-            return
-        }
-        if pushNotifications.isPushActive {
-            await pushNotifications.unregister(session: session)
-        } else {
-            await pushNotifications.requestPermissionAndRegister(session: session)
         }
     }
 
