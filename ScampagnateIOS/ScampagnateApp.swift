@@ -22629,6 +22629,7 @@ struct ProfileView: View {
                                             .id(ProfileScrollTarget.activity)
                                         HelpSection()
                                             .id(ProfileScrollTarget.help)
+                                        ProfilePrivacySection()
                                         AccountSettingsSection()
                                     }
                                     .frame(width: max(proxy.size.width - 32, 0), alignment: .leading)
@@ -25523,185 +25524,136 @@ struct ProfileGroupLabel: View {
     }
 }
 
-struct AccountSettingsSection: View {
+struct ProfilePrivacySection: View {
     @EnvironmentObject private var store: AppStore
-    @EnvironmentObject private var pushNotifications: PushNotificationService
-    @State private var deleteDialog: DeleteAccountDialog?
-    @State private var isDeletingAccount = false
+    @State private var marketingConsent = false
+    @State private var mediaConsent = false
+    @State private var consentsLoaded = false
+    @State private var loadingConsents = false
+    @State private var savingConsentTypes: Set<ConsentPreferenceType> = []
 
     var body: some View {
-        ZStack {
-            VStack(alignment: .leading, spacing: 12) {
-                SectionTitle("Impostazioni account")
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 18) {
+                ProfileGroupLabel("Le tue preferenze")
+                ProfilePushNotificationRow()
+                ProfileConsentRow(
+                    title: "Non perderti le prossime scampagnate 🌿",
+                    subtitle: "Ti avvisiamo su nuovi eventi, posti che si liberano e chicche della community",
+                    isOn: consentBinding(for: .marketing),
+                    isBusy: isConsentBusy(.marketing)
+                )
+                ProfileConsentRow(
+                    title: "Fai parte delle nostre storie 📸",
+                    subtitle: "Possiamo condividere foto e momenti delle esperienze sui nostri canali",
+                    isOn: consentBinding(for: .media),
+                    isBusy: isConsentBusy(.media)
+                )
+            }
+
+            VStack(alignment: .leading, spacing: 14) {
+                ProfileGroupLabel("Documenti legali")
+                NavigationLink {
+                    HelpContentView(slug: "termini-di-servizio", fallbackTitle: "Termini & Condizioni")
+                } label: {
+                    ProfileSettingsRow(icon: "doc.text", iconColor: Brand.secondary, title: "Termini & Condizioni", subtitle: "", showChevron: true)
+                }
+                NavigationLink {
+                    HelpContentView(slug: "privacy-policy", fallbackTitle: "Informativa Privacy")
+                } label: {
+                    ProfileSettingsRow(icon: "shield", iconColor: Brand.secondary, title: "Informativa Privacy", subtitle: "", showChevron: true)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .task(id: store.session?.user.id) {
+            await loadConsentPreferences()
+        }
+    }
+
+    private func loadConsentPreferences() async {
+        guard !loadingConsents else { return }
+        loadingConsents = true
+        defer { loadingConsents = false }
+
+        guard let preferences = await store.fetchConsentPreferences() else { return }
+        marketingConsent = preferences.marketing
+        mediaConsent = preferences.media
+        consentsLoaded = true
+    }
+
+    private func consentBinding(for type: ConsentPreferenceType) -> Binding<Bool> {
+        Binding {
+            consentValue(for: type)
+        } set: { newValue in
+            guard consentsLoaded, !savingConsentTypes.contains(type) else { return }
+            let previousValue = consentValue(for: type)
+            guard previousValue != newValue else { return }
+
+            setConsentValue(newValue, for: type)
+            savingConsentTypes.insert(type)
+            Task { await saveConsentPreference(type, granted: newValue, previousValue: previousValue) }
+        }
+    }
+
+    private func consentValue(for type: ConsentPreferenceType) -> Bool {
+        switch type {
+        case .marketing:
+            return marketingConsent
+        case .media:
+            return mediaConsent
+        }
+    }
+
+    private func setConsentValue(_ value: Bool, for type: ConsentPreferenceType) {
+        switch type {
+        case .marketing:
+            marketingConsent = value
+        case .media:
+            mediaConsent = value
+        }
+    }
+
+    private func isConsentBusy(_ type: ConsentPreferenceType) -> Bool {
+        loadingConsents || !consentsLoaded || savingConsentTypes.contains(type)
+    }
+
+    private func saveConsentPreference(_ type: ConsentPreferenceType, granted: Bool, previousValue: Bool) async {
+        let saved = await store.updateConsentPreference(type, granted: granted)
+        if !saved {
+            setConsentValue(previousValue, for: type)
+        }
+        savingConsentTypes.remove(type)
+    }
+}
+
+struct AccountSettingsSection: View {
+    @EnvironmentObject private var store: AppStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionTitle("Impostazioni account")
+            Button {
+                store.signOut()
+            } label: {
                 HStack(spacing: 12) {
-                    Image(systemName: pushNotificationIconName)
-                        .foregroundStyle(pushNotificationIconColor)
+                    Image(systemName: "rectangle.portrait.and.arrow.right")
+                        .foregroundStyle(Brand.secondary)
                         .frame(width: 32)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Push iOS")
+                        Text("Esci")
                             .font(.subheadline.weight(.semibold))
-                        Text(pushNotificationSubtitle)
+                        Text("Termina la sessione")
                             .font(.caption)
                             .foregroundStyle(Brand.mutedForeground)
                     }
                     Spacer()
-                    if pushNotifications.isRegistering {
-                        ProgressView()
-                            .tint(Brand.primary)
-                    } else {
-                        Toggle("Push iOS", isOn: notificationToggleBinding)
-                            .labelsHidden()
-                            .tint(Brand.primary)
-                    }
                 }
                 .padding(.vertical, 8)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    if pushNotifications.canOpenSettings {
-                        pushNotifications.openAppSettings()
-                    }
-                }
-                .task {
-                    await pushNotifications.refreshAuthorizationStatus()
-                }
-
-                Button {
-                    store.signOut()
-                } label: {
-                    HStack(spacing: 12) {
-                        Image(systemName: "rectangle.portrait.and.arrow.right")
-                            .foregroundStyle(Brand.secondary)
-                            .frame(width: 32)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Esci")
-                                .font(.subheadline.weight(.semibold))
-                            Text("Termina la sessione")
-                                .font(.caption)
-                                .foregroundStyle(Brand.mutedForeground)
-                        }
-                        Spacer()
-                    }
-                    .padding(.vertical, 8)
-                }
-                .buttonStyle(.plain)
-                .disabled(isDeletingAccount || store.isLoading)
-
-                Button {
-                    withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                        deleteDialog = .confirm
-                    }
-                } label: {
-                    HStack(spacing: 12) {
-                        Image(systemName: isDeletingAccount ? "hourglass" : "trash")
-                            .foregroundStyle(Brand.destructive)
-                            .frame(width: 32)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Cancella account")
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(Brand.destructive)
-                            Text("Elimina profilo, accesso e dati collegati")
-                                .font(.caption)
-                                .foregroundStyle(Brand.mutedForeground)
-                        }
-                        Spacer()
-                        if isDeletingAccount {
-                            ProgressView()
-                                .tint(Brand.destructive)
-                        } else {
-                            Image(systemName: "chevron.right")
-                                .font(.caption.weight(.bold))
-                                .foregroundStyle(Brand.mutedForeground)
-                        }
-                    }
-                    .padding(.vertical, 8)
-                }
-                .buttonStyle(.plain)
-                .disabled(isDeletingAccount || store.isLoading)
             }
-
-            if let deleteDialog {
-                ProfileDeleteAccountDialog(
-                    state: deleteDialog,
-                    onCancel: {
-                        guard !isDeletingAccount else { return }
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                            self.deleteDialog = nil
-                        }
-                    },
-                    onConfirm: {
-                        Task { await deleteAccount() }
-                    },
-                    onFinish: {
-                        store.finishDeletedAccountSession()
-                        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                            self.deleteDialog = nil
-                        }
-                    }
-                )
-                .transition(.opacity.combined(with: .scale(scale: 0.98)))
-            }
+            .buttonStyle(.plain)
+            .disabled(store.isLoading)
         }
-        .animation(.spring(response: 0.28, dampingFraction: 0.86), value: deleteDialog)
-    }
-
-    private func deleteAccount() async {
-        guard !isDeletingAccount else { return }
-        store.errorMessage = nil
-        isDeletingAccount = true
-        withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-            deleteDialog = .deleting
-        }
-        let deleted = await store.deleteAccount()
-        isDeletingAccount = false
-        if deleted {
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                deleteDialog = .success
-            }
-        } else {
-            let message = store.errorMessage ?? "Non siamo riusciti a completare la cancellazione. Riprova tra poco."
-            store.errorMessage = nil
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.86)) {
-                deleteDialog = .failure(message)
-            }
-        }
-    }
-
-    private var pushNotificationIconName: String {
-        if pushNotifications.canOpenSettings { return "bell.slash" }
-        return pushNotifications.isPushActive ? "bell.badge" : "bell"
-    }
-
-    private var pushNotificationIconColor: Color {
-        pushNotifications.isPushActive ? Brand.success : Brand.mutedForeground
-    }
-
-    private var pushNotificationSubtitle: String {
-        pushNotifications.canOpenSettings
-            ? "Gestisci dalle Impostazioni di iOS"
-            : "Avvisi su eventi e aggiornamenti utili"
-    }
-
-    private var notificationToggleBinding: Binding<Bool> {
-        Binding(
-            get: { pushNotifications.isPushActive },
-            set: { isEnabled in
-                Task { await setNotificationsEnabled(isEnabled) }
-            }
-        )
-    }
-
-    private func setNotificationsEnabled(_ isEnabled: Bool) async {
-        guard let session = store.session else { return }
-        if isEnabled {
-            if pushNotifications.canOpenSettings {
-                pushNotifications.openAppSettings()
-                return
-            }
-            await pushNotifications.requestPermissionAndRegister(session: session)
-            return
-        }
-
-        await pushNotifications.unregister(session: session)
     }
 }
 
@@ -26400,11 +26352,6 @@ struct ProfileEditSheet: View {
     @State private var updatingAccount = false
     @State private var deleteDialog: DeleteAccountDialog?
     @State private var isDeletingAccount = false
-    @State private var marketingConsent = false
-    @State private var mediaConsent = false
-    @State private var consentsLoaded = false
-    @State private var loadingConsents = false
-    @State private var savingConsentTypes: Set<ConsentPreferenceType> = []
 
     var body: some View {
         NavigationStack {
@@ -26436,7 +26383,6 @@ struct ProfileEditSheet: View {
 
                         preferencesSection
                         accountSection
-                        privacySection
                     }
                     .padding(.horizontal, 22)
                     .padding(.top, 22)
@@ -26468,7 +26414,6 @@ struct ProfileEditSheet: View {
             .animation(.spring(response: 0.28, dampingFraction: 0.86), value: deleteDialog)
             .onAppear {
                 resetInput()
-                Task { await loadConsentPreferences() }
             }
             .onChange(of: selectedAvatarItem) { _, item in
                 Task { await uploadSelectedAvatar(item) }
@@ -26660,42 +26605,6 @@ struct ProfileEditSheet: View {
         }
     }
 
-    private var privacySection: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 18) {
-                ProfileSheetLabel("Le tue preferenze")
-                ProfilePushNotificationRow()
-                ProfileConsentRow(
-                    title: "Non perderti le prossime scampagnate 🌿",
-                    subtitle: "Ti avvisiamo su nuovi eventi, posti che si liberano e chicche della community",
-                    isOn: consentBinding(for: .marketing),
-                    isBusy: isConsentBusy(.marketing)
-                )
-                ProfileConsentRow(
-                    title: "Fai parte delle nostre storie 📸",
-                    subtitle: "Possiamo condividere foto e momenti delle esperienze sui nostri canali",
-                    isOn: consentBinding(for: .media),
-                    isBusy: isConsentBusy(.media)
-                )
-            }
-
-            VStack(alignment: .leading, spacing: 14) {
-                ProfileSheetLabel("Documenti legali")
-                NavigationLink {
-                    HelpContentView(slug: "termini-di-servizio", fallbackTitle: "Termini & Condizioni")
-                } label: {
-                    ProfileSettingsRow(icon: "doc.text", iconColor: Brand.secondary, title: "Termini & Condizioni", subtitle: "", showChevron: true)
-                }
-                NavigationLink {
-                    HelpContentView(slug: "privacy-policy", fallbackTitle: "Informativa Privacy")
-                } label: {
-                    ProfileSettingsRow(icon: "shield", iconColor: Brand.secondary, title: "Informativa Privacy", subtitle: "", showChevron: true)
-                }
-            }
-        }
-        .buttonStyle(.plain)
-    }
-
     private var hasChanges: Bool {
         input.firstName != (profile.firstName ?? "") ||
         input.lastName != (profile.lastName ?? "") ||
@@ -26734,61 +26643,6 @@ struct ProfileEditSheet: View {
             dismiss()
         }
         saving = false
-    }
-
-    private func loadConsentPreferences() async {
-        guard !loadingConsents else { return }
-        loadingConsents = true
-        defer { loadingConsents = false }
-
-        guard let preferences = await store.fetchConsentPreferences() else { return }
-        marketingConsent = preferences.marketing
-        mediaConsent = preferences.media
-        consentsLoaded = true
-    }
-
-    private func consentBinding(for type: ConsentPreferenceType) -> Binding<Bool> {
-        Binding {
-            consentValue(for: type)
-        } set: { newValue in
-            guard consentsLoaded, !savingConsentTypes.contains(type) else { return }
-            let previousValue = consentValue(for: type)
-            guard previousValue != newValue else { return }
-
-            setConsentValue(newValue, for: type)
-            savingConsentTypes.insert(type)
-            Task { await saveConsentPreference(type, granted: newValue, previousValue: previousValue) }
-        }
-    }
-
-    private func consentValue(for type: ConsentPreferenceType) -> Bool {
-        switch type {
-        case .marketing:
-            return marketingConsent
-        case .media:
-            return mediaConsent
-        }
-    }
-
-    private func setConsentValue(_ value: Bool, for type: ConsentPreferenceType) {
-        switch type {
-        case .marketing:
-            marketingConsent = value
-        case .media:
-            mediaConsent = value
-        }
-    }
-
-    private func isConsentBusy(_ type: ConsentPreferenceType) -> Bool {
-        loadingConsents || !consentsLoaded || savingConsentTypes.contains(type)
-    }
-
-    private func saveConsentPreference(_ type: ConsentPreferenceType, granted: Bool, previousValue: Bool) async {
-        let saved = await store.updateConsentPreference(type, granted: granted)
-        if !saved {
-            setConsentValue(previousValue, for: type)
-        }
-        savingConsentTypes.remove(type)
     }
 
     private func validateProfileInput() -> Bool {
