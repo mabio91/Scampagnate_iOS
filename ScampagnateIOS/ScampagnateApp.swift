@@ -20305,147 +20305,79 @@ private enum OrganizerRichTextCommand {
     case bulletList
     case numberedList
     case link(String)
+    case image(String)
     case undo
     case redo
 }
 
 @MainActor
 private final class OrganizerRichTextEditorController: ObservableObject {
-    weak var textView: UITextView?
-    var syncHTML: ((UITextView) -> Void)?
+    weak var webView: WKWebView?
 
     func apply(_ command: OrganizerRichTextCommand) {
-        guard let textView else { return }
-        textView.becomeFirstResponder()
-
         switch command {
         case .bold:
-            textView.toggleBoldface(nil)
+            runEditorCommand("bold")
         case .italic:
-            textView.toggleItalics(nil)
+            runEditorCommand("italic")
         case .underline:
-            textView.toggleUnderline(nil)
+            runEditorCommand("underline")
         case .strikethrough:
-            toggleAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, in: textView)
+            runEditorCommand("strikeThrough")
         case .heading(let level):
-            applyHeading(level, in: textView)
+            evaluate("window.scampEditorHeading(\(level));")
         case .bulletList:
-            applyList(ordered: false, in: textView)
+            runEditorCommand("insertUnorderedList")
         case .numberedList:
-            applyList(ordered: true, in: textView)
+            runEditorCommand("insertOrderedList")
         case .link(let urlString):
-            applyLink(urlString, in: textView)
+            guard let url = normalizedURL(urlString, allowsMail: true) else { return }
+            evaluate("window.scampEditorLink(\(Self.jsStringLiteral(url)), \(Self.jsStringLiteral(url)));")
+        case .image(let urlString):
+            guard let url = normalizedURL(urlString, allowsMail: false) else { return }
+            evaluate("window.scampEditorImage(\(Self.jsStringLiteral(url)));")
         case .undo:
-            textView.undoManager?.undo()
+            runEditorCommand("undo")
         case .redo:
-            textView.undoManager?.redo()
+            runEditorCommand("redo")
         }
-
-        OrganizerRichTextHTML.applyReadableColors(to: textView.textStorage)
-        syncHTML?(textView)
     }
 
-    private func toggleAttribute(_ key: NSAttributedString.Key, value: Any, in textView: UITextView) {
-        let range = textView.selectedRange
-        if range.length == 0 {
-            var attributes = textView.typingAttributes
-            if attributes[key] == nil {
-                attributes[key] = value
-            } else {
-                attributes.removeValue(forKey: key)
-            }
-            textView.typingAttributes = attributes
-            return
-        }
+    func setHTML(_ html: String) {
+        evaluate("window.scampSetHTML(\(Self.jsStringLiteral(html)));")
+    }
 
-        let mutableText = NSMutableAttributedString(attributedString: textView.attributedText)
-        var isAppliedEverywhere = true
-        mutableText.enumerateAttribute(key, in: range) { attribute, _, stop in
-            if attribute == nil {
-                isAppliedEverywhere = false
-                stop.pointee = true
-            }
-        }
+    private func runEditorCommand(_ command: String) {
+        evaluate("window.scampEditorCommand(\(Self.jsStringLiteral(command)));")
+    }
 
-        if isAppliedEverywhere {
-            mutableText.removeAttribute(key, range: range)
+    private func evaluate(_ javaScript: String) {
+        webView?.evaluateJavaScript(javaScript)
+    }
+
+    private func normalizedURL(_ raw: String, allowsMail: Bool) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let normalized: String
+        if trimmed.range(of: "://") == nil,
+           !(allowsMail && trimmed.lowercased().hasPrefix("mailto:")) {
+            normalized = "https://\(trimmed)"
         } else {
-            mutableText.addAttribute(key, value: value, range: range)
+            normalized = trimmed
         }
-
-        textView.attributedText = mutableText
-        textView.selectedRange = range
+        guard let url = URL(string: normalized),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" || (allowsMail && scheme == "mailto")
+        else { return nil }
+        return normalized
     }
 
-    private func applyHeading(_ level: Int, in textView: UITextView) {
-        let fontSize: CGFloat
-        switch level {
-        case 1:
-            fontSize = 27
-        case 2:
-            fontSize = 23
-        default:
-            fontSize = 19
-        }
-
-        let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
-        let selectedRange = textView.selectedRange
-        guard textView.attributedText.length > 0 else {
-            var attributes = textView.typingAttributes
-            attributes[.font] = font
-            textView.typingAttributes = attributes
-            return
-        }
-
-        let paragraphRange = (textView.text as NSString).paragraphRange(for: selectedRange)
-        let mutableText = NSMutableAttributedString(attributedString: textView.attributedText)
-        mutableText.addAttribute(.font, value: font, range: paragraphRange)
-        textView.attributedText = mutableText
-        textView.selectedRange = selectedRange
-    }
-
-    private func applyList(ordered: Bool, in textView: UITextView) {
-        let selectedRange = textView.selectedRange
-        let source = textView.text as NSString
-        let lineRange = source.lineRange(for: selectedRange)
-        let selectedText = source.substring(with: lineRange)
-        var itemIndex = 1
-        let transformed = selectedText
-            .components(separatedBy: "\n")
-            .map { line -> String in
-                guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { return line }
-                let stripped = line.replacingOccurrences(
-                    of: #"^\s*(?:•|\d+\.)\s*"#,
-                    with: "",
-                    options: .regularExpression
-                )
-                defer { itemIndex += 1 }
-                return ordered ? "\(itemIndex). \(stripped)" : "• \(stripped)"
-            }
-            .joined(separator: "\n")
-
-        textView.textStorage.replaceCharacters(in: lineRange, with: transformed)
-        textView.selectedRange = NSRange(location: lineRange.location, length: (transformed as NSString).length)
-    }
-
-    private func applyLink(_ urlString: String, in textView: UITextView) {
-        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let normalized = trimmed.range(of: "://") == nil ? "https://\(trimmed)" : trimmed
-        guard let url = URL(string: normalized) else { return }
-
-        let selectedRange = textView.selectedRange
-        if selectedRange.length == 0 {
-            let linkedText = NSAttributedString(
-                string: trimmed,
-                attributes: OrganizerRichTextHTML.typingAttributes().merging([.link: url]) { _, new in new }
-            )
-            textView.textStorage.replaceCharacters(in: selectedRange, with: linkedText)
-            textView.selectedRange = NSRange(location: selectedRange.location + (trimmed as NSString).length, length: 0)
-        } else {
-            textView.textStorage.addAttribute(.link, value: url, range: selectedRange)
-            textView.selectedRange = selectedRange
-        }
+    private static func jsStringLiteral(_ value: String) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: [value], options: []),
+              let arrayLiteral = String(data: data, encoding: .utf8),
+              arrayLiteral.count >= 2
+        else { return "\"\"" }
+        return String(arrayLiteral.dropFirst().dropLast())
     }
 }
 
@@ -20453,7 +20385,9 @@ private struct OrganizerRichTextEditor: View {
     @Binding var html: String
     @StateObject private var controller = OrganizerRichTextEditorController()
     @State private var showingLinkPrompt = false
+    @State private var showingImagePrompt = false
     @State private var pendingLink = ""
+    @State private var pendingImage = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -20475,6 +20409,13 @@ private struct OrganizerRichTextEditor: View {
             TextField("URL", text: $pendingLink)
             Button("Applica") {
                 controller.apply(.link(pendingLink))
+            }
+            Button("Annulla", role: .cancel) {}
+        }
+        .alert("Immagine", isPresented: $showingImagePrompt) {
+            TextField("URL immagine", text: $pendingImage)
+            Button("Inserisci") {
+                controller.apply(.image(pendingImage))
             }
             Button("Annulla", role: .cancel) {}
         }
@@ -20558,6 +20499,10 @@ private struct OrganizerRichTextEditor: View {
                     pendingLink = ""
                     showingLinkPrompt = true
                 }
+                richTextIconButton("photo", label: "Immagine") {
+                    pendingImage = ""
+                    showingImagePrompt = true
+                }
 
                 toolbarDivider
 
@@ -20607,50 +20552,44 @@ private extension View {
     }
 }
 
-private final class OrganizerPastingTextView: UITextView {
-    var richPasteHandler: ((OrganizerPastingTextView) -> Bool)?
-
-    override func paste(_ sender: Any?) {
-        if richPasteHandler?(self) == true {
-            return
-        }
-        super.paste(sender)
-    }
-}
-
 private struct OrganizerRichTextTextView: UIViewRepresentable {
     @Binding var html: String
     @ObservedObject var controller: OrganizerRichTextEditorController
 
-    func makeUIView(context: Context) -> UITextView {
-        let textView = OrganizerPastingTextView()
-        textView.delegate = context.coordinator
-        textView.richPasteHandler = { [weak coordinator = context.coordinator] textView in
-            coordinator?.handlePaste(in: textView) ?? false
-        }
-        textView.backgroundColor = .clear
-        textView.textColor = UIColor(Brand.inputForeground)
-        textView.tintColor = UIColor(Brand.primary)
-        textView.font = .preferredFont(forTextStyle: .body)
-        textView.adjustsFontForContentSizeCategory = true
-        textView.isScrollEnabled = true
-        textView.alwaysBounceVertical = true
-        textView.keyboardDismissMode = .interactive
-        textView.allowsEditingTextAttributes = true
-        textView.textContainerInset = .zero
-        textView.textContainer.lineFragmentPadding = 0
-        textView.typingAttributes = OrganizerRichTextHTML.typingAttributes()
-        context.coordinator.attach(textView)
-        context.coordinator.apply(html, to: textView)
-        return textView
+    func makeUIView(context: Context) -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+        configuration.userContentController.add(context.coordinator, name: Coordinator.messageHandlerName)
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.navigationDelegate = context.coordinator
+        webView.isOpaque = false
+        webView.backgroundColor = .clear
+        webView.scrollView.backgroundColor = .clear
+        webView.scrollView.keyboardDismissMode = .interactive
+        webView.scrollView.alwaysBounceVertical = true
+        webView.scrollView.showsHorizontalScrollIndicator = false
+        webView.scrollView.contentInset = .zero
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
+        context.coordinator.attach(webView)
+        context.coordinator.lastSyncedHTML = EventDescriptionHTML.cleanStoredHTML(from: html)
+        webView.loadHTMLString(Self.editorDocument(for: context.coordinator.lastSyncedHTML), baseURL: nil)
+        return webView
     }
 
-    func updateUIView(_ textView: UITextView, context: Context) {
-        textView.textColor = UIColor(Brand.inputForeground)
-        textView.tintColor = UIColor(Brand.primary)
-        OrganizerRichTextHTML.applyReadableColors(to: textView.textStorage)
-        if context.coordinator.lastSyncedHTML != html {
-            context.coordinator.apply(html, to: textView)
+    func updateUIView(_ webView: WKWebView, context: Context) {
+        let cleanHTML = EventDescriptionHTML.cleanStoredHTML(from: html)
+        guard context.coordinator.isReady,
+              !context.coordinator.isReceivingHTML,
+              context.coordinator.lastSyncedHTML != cleanHTML
+        else { return }
+        context.coordinator.lastSyncedHTML = cleanHTML
+        controller.setHTML(cleanHTML)
+    }
+
+    static func dismantleUIView(_ webView: WKWebView, coordinator: Coordinator) {
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: Coordinator.messageHandlerName)
+        if coordinator.controller?.webView === webView {
+            coordinator.controller?.webView = nil
         }
     }
 
@@ -20658,10 +20597,12 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
         Coordinator(html: $html, controller: controller)
     }
 
-    final class Coordinator: NSObject, UITextViewDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+        static let messageHandlerName = "richTextEditor"
         @Binding private var html: String
-        private weak var controller: OrganizerRichTextEditorController?
-        private var isApplyingHTML = false
+        weak var controller: OrganizerRichTextEditorController?
+        var isReady = false
+        var isReceivingHTML = false
         var lastSyncedHTML = ""
 
         init(html: Binding<String>, controller: OrganizerRichTextEditorController) {
@@ -20669,75 +20610,255 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             self.controller = controller
         }
 
-        func attach(_ textView: UITextView) {
-            controller?.textView = textView
-            controller?.syncHTML = { [weak self] textView in
-                self?.syncHTML(from: textView)
+        func attach(_ webView: WKWebView) {
+            controller?.webView = webView
+        }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard let body = message.body as? [String: Any],
+                  let type = body["type"] as? String else { return }
+            if type == "ready" {
+                isReady = true
+            }
+            guard let rawHTML = body["html"] as? String else { return }
+            let cleanHTML = EventDescriptionHTML.cleanStoredHTML(from: rawHTML)
+            lastSyncedHTML = cleanHTML
+            guard html != cleanHTML else { return }
+            isReceivingHTML = true
+            html = cleanHTML
+            DispatchQueue.main.async { [weak self] in
+                self?.isReceivingHTML = false
             }
         }
+    }
 
-        func apply(_ html: String, to textView: UITextView) {
-            isApplyingHTML = true
-            let selectedRange = textView.selectedRange
-            textView.attributedText = OrganizerRichTextHTML.attributedString(from: html)
-            textView.typingAttributes = OrganizerRichTextHTML.typingAttributes()
-            if selectedRange.location <= textView.attributedText.length {
-                textView.selectedRange = NSRange(
-                    location: selectedRange.location,
-                    length: min(selectedRange.length, textView.attributedText.length - selectedRange.location)
-                )
+    private static func editorDocument(for html: String) -> String {
+        """
+        <!doctype html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+        <style>
+        :root { color-scheme: light dark; }
+        html, body {
+          margin: 0;
+          padding: 0;
+          background: transparent;
+          min-height: 100%;
+          overflow-x: hidden;
+        }
+        body {
+          color: #15281F;
+          font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+          font-size: 16px;
+          line-height: 1.55;
+          -webkit-font-smoothing: antialiased;
+        }
+        #editor {
+          min-height: 210px;
+          outline: none;
+          overflow-wrap: anywhere;
+          -webkit-user-select: text;
+          user-select: text;
+        }
+        #editor:empty::before {
+          content: attr(data-placeholder);
+          color: #7B8B80;
+          pointer-events: none;
+        }
+        h1 {
+          font-size: 24px;
+          font-weight: 800;
+          line-height: 1.2;
+          margin: 24px 0 12px;
+        }
+        h2 {
+          font-size: 21px;
+          font-weight: 800;
+          line-height: 1.25;
+          margin: 22px 0 10px;
+        }
+        h3 {
+          font-size: 17px;
+          font-weight: 700;
+          line-height: 1.35;
+          margin: 18px 0 8px;
+        }
+        p {
+          margin: 0 0 12px;
+          line-height: 1.55;
+        }
+        ul, ol {
+          margin: 8px 0 14px;
+          padding-left: 24px;
+        }
+        li {
+          margin: 0 0 6px;
+          line-height: 1.5;
+        }
+        strong, b { font-weight: 800; }
+        em, i { font-style: italic; }
+        u {
+          text-decoration-thickness: 1px;
+          text-underline-offset: 3px;
+        }
+        s { text-decoration-thickness: 1px; }
+        a {
+          color: #224E38;
+          font-weight: 700;
+          text-decoration-thickness: 1px;
+          text-underline-offset: 3px;
+        }
+        img {
+          display: block;
+          max-width: 100%;
+          height: auto;
+          border-radius: 14px;
+          margin: 14px 0;
+        }
+        h1:first-child, h2:first-child, h3:first-child, p:first-child, ul:first-child, ol:first-child, img:first-child { margin-top: 0; }
+        p:last-child, ul:last-child, ol:last-child, li:last-child, img:last-child { margin-bottom: 0; }
+        @media (prefers-color-scheme: dark) {
+          body { color: #EBE7E0; }
+          #editor:empty::before { color: #B8B0A4; }
+          a { color: #64B48C; }
+        }
+        </style>
+        </head>
+        <body>
+        <div id="editor" contenteditable="true" data-placeholder="Inizia a scrivere...">\(html)</div>
+        <script>
+        (() => {
+          const editor = document.getElementById('editor');
+          let savedRange = null;
+
+          function post(type) {
+            window.webkit.messageHandlers.\(Coordinator.messageHandlerName).postMessage({
+              type,
+              html: editor.innerHTML
+            });
+          }
+
+          function nodeInsideEditor(node) {
+            return node && (node === editor || editor.contains(node));
+          }
+
+          function saveSelection() {
+            const selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0) return;
+            const range = selection.getRangeAt(0);
+            if (nodeInsideEditor(range.commonAncestorContainer)) {
+              savedRange = range.cloneRange();
             }
-            lastSyncedHTML = html
-            isApplyingHTML = false
-        }
+          }
 
-        func textViewDidChange(_ textView: UITextView) {
-            syncHTML(from: textView)
-        }
-
-        func syncHTML(from textView: UITextView) {
-            guard !isApplyingHTML else { return }
-            let nextHTML = OrganizerRichTextHTML.html(from: textView.attributedText)
-            lastSyncedHTML = nextHTML
-            if html != nextHTML {
-                html = nextHTML
+          function restoreSelection() {
+            editor.focus();
+            const selection = window.getSelection();
+            if (!selection) return;
+            selection.removeAllRanges();
+            if (savedRange) {
+              selection.addRange(savedRange);
+              return;
             }
-        }
+            const range = document.createRange();
+            range.selectNodeContents(editor);
+            range.collapse(false);
+            selection.addRange(range);
+            savedRange = range.cloneRange();
+          }
 
-        func handlePaste(in textView: OrganizerPastingTextView) -> Bool {
-            guard let cleanHTML = EventDescriptionHTML.cleanHTMLFromPasteboard(.general) else {
-                return false
+          function currentBlock() {
+            const selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0) return null;
+            let node = selection.anchorNode;
+            if (node && node.nodeType === Node.TEXT_NODE) node = node.parentNode;
+            while (node && node !== editor) {
+              if (/^(P|H1|H2|H3|LI|DIV)$/i.test(node.nodeName)) return node;
+              node = node.parentNode;
             }
-            let replacement = EventDescriptionHTML.attributedStringForEditing(from: cleanHTML)
-            let range = textView.selectedRange
-            textView.textStorage.replaceCharacters(in: range, with: replacement)
-            textView.selectedRange = NSRange(location: range.location + replacement.length, length: 0)
-            OrganizerRichTextHTML.applyReadableColors(to: textView.textStorage)
-            syncHTML(from: textView)
-            return true
-        }
-    }
-}
+            return null;
+          }
 
-private enum OrganizerRichTextHTML {
-    static func typingAttributes() -> [NSAttributedString.Key: Any] {
-        EventDescriptionHTML.editorTypingAttributes()
-    }
+          function escapeHTML(value) {
+            return String(value)
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;')
+              .replace(/"/g, '&quot;')
+              .replace(/'/g, '&#39;');
+          }
 
-    static func attributedString(from html: String) -> NSMutableAttributedString {
-        EventDescriptionHTML.attributedStringForEditing(from: html)
-    }
+          function escapeAttribute(value) {
+            return escapeHTML(value);
+          }
 
-    static func html(from attributedString: NSAttributedString) -> String {
-        EventDescriptionHTML.cleanHTML(from: attributedString)
-    }
+          function insertHTML(html) {
+            document.execCommand('insertHTML', false, html);
+          }
 
-    static func applyReadableColors(to attributedString: NSMutableAttributedString) {
-        let range = NSRange(location: 0, length: attributedString.length)
-        guard range.length > 0 else { return }
-        attributedString.removeAttribute(.foregroundColor, range: range)
-        attributedString.removeAttribute(.backgroundColor, range: range)
-        attributedString.addAttribute(.foregroundColor, value: UIColor(Brand.inputForeground), range: range)
+          window.scampEditorCommand = (command) => {
+            restoreSelection();
+            document.execCommand(command, false, null);
+            post('update');
+            saveSelection();
+          };
+
+          window.scampEditorHeading = (level) => {
+            restoreSelection();
+            const tag = `H${level}`;
+            const block = currentBlock();
+            document.execCommand('formatBlock', false, block && block.nodeName === tag ? 'P' : tag);
+            post('update');
+            saveSelection();
+          };
+
+          window.scampEditorLink = (url, text) => {
+            restoreSelection();
+            const selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0 || selection.isCollapsed) {
+              insertHTML(`<a href="${escapeAttribute(url)}">${escapeHTML(text)}</a>`);
+            } else {
+              document.execCommand('createLink', false, url);
+            }
+            post('update');
+            saveSelection();
+          };
+
+          window.scampEditorImage = (url) => {
+            restoreSelection();
+            insertHTML(`<img src="${escapeAttribute(url)}">`);
+            post('update');
+            saveSelection();
+          };
+
+          window.scampSetHTML = (html) => {
+            editor.innerHTML = html || '';
+            post('update');
+            saveSelection();
+          };
+
+          editor.addEventListener('input', () => {
+            post('update');
+            saveSelection();
+          });
+          editor.addEventListener('keyup', saveSelection);
+          editor.addEventListener('mouseup', saveSelection);
+          editor.addEventListener('touchend', () => setTimeout(saveSelection, 0));
+          document.addEventListener('selectionchange', () => {
+            if (document.activeElement === editor) saveSelection();
+          });
+
+          setTimeout(() => {
+            post('ready');
+            saveSelection();
+          }, 0);
+        })();
+        </script>
+        </body>
+        </html>
+        """
     }
 }
 
