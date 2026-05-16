@@ -1206,7 +1206,7 @@ final class AppStore: ObservableObject {
     func addManualParticipant(eventId: String, name: String, level: String?, meetingPointId: String?, priceOptionId: String?, paymentStatus: String) async -> Bool {
         do {
             let authSession = try await authenticatedSession()
-            try await api.addManualParticipant(eventId: eventId, organizerId: authSession.user.id, name: name, level: level, meetingPointId: meetingPointId, priceOptionId: priceOptionId, paymentStatus: paymentStatus, session: authSession)
+            try await api.addManualParticipant(eventId: eventId, name: name, level: level, meetingPointId: meetingPointId, priceOptionId: priceOptionId, paymentStatus: paymentStatus, session: authSession)
             await loadOrganizerEvents(reportingErrors: false)
             return true
         } catch {
@@ -1824,6 +1824,7 @@ struct SupabaseAPI {
     private static let eventSelect = "id,title,date,time,location,location_label,status,price,deposit,payment_type,balance_payment_mode,image_url,difficulty,distance,elevation,duration,spots_total,spots_taken,reserved_spots,featured,event_badges,organizer_id,organizer_name,description,cancellation_policy,equipment_list,additional_fields,visibility,gallery_images,access_rules,event_categories(name,icon),event_meeting_points(id,name,location,time,notes),event_price_options(\(priceOptionSelect))"
     private static let registrationSelect = "*,events(\(eventSelect)),meeting_point:event_meeting_points(id,name,location,time)"
     private static let organizerRegistrationSelect = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,sport_level,amount_paid,refund_amount,last_balance_reminder_sent_at,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,avatar_url,total_points,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade,interests,birth_date),price_option:event_price_options(\(priceOptionSelect))"
+    private static let nonManualRegistrationFilter = "&or=(sport_level.is.null,sport_level.not.like.manual:%25)"
 
     private let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
@@ -2079,7 +2080,7 @@ struct SupabaseAPI {
 
     func fetchDiscountEventOptions(session: AuthSession) async throws -> [DiscountEventOption] {
         let select = "id,title,date,status"
-        let path = "/rest/v1/events?select=\(select.urlEncoded)&status=in.(available,published,full)&order=date.asc"
+        let path = "/rest/v1/events?select=\(select.urlEncoded)&status=in.(available,published,open,upcoming,full,closed,rescheduled)&order=date.asc"
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [DiscountEventOption].self)
     }
 
@@ -2220,35 +2221,30 @@ struct SupabaseAPI {
     }
 
     func fetchMyEvents(session: AuthSession) async throws -> [Registration] {
-        let path = "/rest/v1/event_registrations?select=\(Self.registrationSelect.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)&order=created_at.desc"
+        let path = "/rest/v1/event_registrations?select=\(Self.registrationSelect.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)\(Self.nonManualRegistrationFilter)&order=created_at.desc"
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [Registration].self)
     }
 
     func fetchRegistrationForEvent(eventId: String, session: AuthSession) async throws -> Registration? {
-        let path = "/rest/v1/event_registrations?select=\(Self.registrationSelect.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)&event_id=eq.\(eventId.urlEncoded)&order=created_at.desc&limit=1"
+        let path = "/rest/v1/event_registrations?select=\(Self.registrationSelect.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)&event_id=eq.\(eventId.urlEncoded)\(Self.nonManualRegistrationFilter)&order=created_at.desc&limit=1"
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [Registration].self).first
     }
 
     func fetchEventParticipants(eventId: String, session: AuthSession?) async throws -> [EventParticipant] {
-        if let people = try? await fetchPublicEventPeople(eventId: eventId, session: session), !people.isEmpty {
-            return people
-        }
-
-        if let avatars = try? await fetchPublicEventAvatars(eventId: eventId, session: session), !avatars.isEmpty {
-            return avatars
-        }
+        let publicPeople = (try? await fetchPublicEventPeople(eventId: eventId, session: session)) ?? []
 
         do {
             let select = "id,event_id,user_id,status,payment_status,sport_level"
-            let path = "/rest/v1/event_registrations?select=\(select.urlEncoded)&event_id=eq.\(eventId)&status=in.(registered,deposit_paid,paid,attended,no_show)&payment_status=neq.pending"
+            let path = "/rest/v1/event_registrations?select=\(select.urlEncoded)&event_id=eq.\(eventId.urlEncoded)&status=in.(registered,deposit_paid,paid,attended,no_show)&payment_status=neq.pending"
             let registrations = try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [EventParticipantRegistration].self)
-            let userIds = registrations.map(\.userId).filter { !$0.isEmpty }
+            let userIds = registrations.compactMap { $0.userId?.nilIfBlank }
             let profiles = try await fetchPublicProfiles(userIds: userIds, session: session)
-            return registrations.map { registration in
+            let organizerRows = publicPeople.filter(\.isOrganizer)
+            let participantRows = registrations.map { registration in
                 if let manual = registration.manualParticipant {
                     return EventParticipant(id: registration.id, userId: registration.userId, firstName: manual, lastNameInitial: nil, avatarUrl: nil)
                 }
-                let profile = profiles[registration.userId]
+                let profile = registration.userId.flatMap { profiles[$0] }
                 return EventParticipant(
                     id: registration.id,
                     userId: registration.userId,
@@ -2258,7 +2254,11 @@ struct SupabaseAPI {
                     totalPoints: profile?.totalPoints
                 )
             }
+            return organizerRows + participantRows
         } catch {
+            if !publicPeople.isEmpty {
+                return publicPeople
+            }
             return try await fetchPublicEventAvatars(eventId: eventId, session: session)
         }
     }
@@ -2269,8 +2269,9 @@ struct SupabaseAPI {
 
     private func fetchPublicEventAvatars(eventId: String, session: AuthSession?) async throws -> [EventParticipant] {
         let avatars = try await request(path: "/rest/v1/rpc/get_event_participant_avatars", method: "POST", body: ["p_event_id": eventId], auth: session, decode: [PublicEventAvatar].self)
-        return avatars.map { avatar in
-            EventParticipant(id: avatar.userId, userId: avatar.userId, firstName: avatar.firstName, lastNameInitial: avatar.lastNameInitial, avatarUrl: avatar.avatarUrl)
+        return avatars.enumerated().map { index, avatar in
+            let id = avatar.userId ?? "manual-\(index)-\(avatar.firstName)"
+            return EventParticipant(id: id, userId: avatar.userId, firstName: avatar.firstName, lastNameInitial: avatar.lastNameInitial, avatarUrl: avatar.avatarUrl)
         }
     }
 
@@ -2586,13 +2587,14 @@ struct SupabaseAPI {
         let _: EmptyResponse = try await request(path: "/rest/v1/event_registrations?id=eq.\(id.urlEncoded)", method: "PATCH", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
     }
 
-    func addManualParticipant(eventId: String, organizerId: String, name: String, level: String?, meetingPointId: String?, priceOptionId: String?, paymentStatus: String, session: AuthSession) async throws {
+    func addManualParticipant(eventId: String, name: String, level: String?, meetingPointId: String?, priceOptionId: String?, paymentStatus: String, session: AuthSession) async throws {
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanLevel = level?.nilIfBlank
         let levelPayload = cleanLevel.map { "|level:\($0)" } ?? ""
         var payload: [String: JSONValue] = [
             "event_id": .string(eventId),
-            "user_id": .string(organizerId),
+            "user_id": .null,
+            "added_by": .string(session.user.id),
             "meeting_point_id": meetingPointId.map { .string($0) } ?? .null,
             "status": .string("registered"),
             "payment_status": .string(paymentStatus),
@@ -2607,6 +2609,7 @@ struct SupabaseAPI {
         var payload: [String: JSONValue] = [
             "event_id": .string(eventId),
             "user_id": .string(userId),
+            "added_by": .string(session.user.id),
             "meeting_point_id": meetingPointId.map { .string($0) } ?? .null,
             "status": .string("registered"),
             "payment_status": .string(paymentStatus)
@@ -2806,11 +2809,17 @@ struct SupabaseAPI {
     }
 
     func sendBalanceReminders(event: Event, recipients: [OrganizerRegistration], session: AuthSession) async throws -> Int {
+        let reminderCooldown: TimeInterval = 12 * 60 * 60
         let candidates = recipients.filter { registration in
             guard registration.normalizedStatus == "deposit_paid",
                   !registration.isManual,
                   registration.userId?.nilIfBlank != nil
             else { return false }
+            if let rawDate = registration.lastBalanceReminderSentAt,
+               let lastReminder = ISO8601DateFormatter().date(from: rawDate),
+               Date().timeIntervalSince(lastReminder) < reminderCooldown {
+                return false
+            }
             return (registration.priceOption?.effectiveBalancePaymentMode(fallback: event) ?? event.balancePaymentMode ?? "online") == "online"
         }
         guard !candidates.isEmpty else { throw AppError.message("Nessun partecipante da sollecitare") }
@@ -2861,6 +2870,9 @@ struct SupabaseAPI {
         }
         let optionIsBookable = selectedOption?.isBookable(in: event) ?? !event.isFull
         let shouldWaitlist = input.asWaitlist || !optionIsBookable
+        if shouldWaitlist && !event.hasWaitlistParticipationOption {
+            throw AppError.message("La lista d'attesa non è attiva per questo evento.")
+        }
         if shouldWaitlist, let selectedOption, selectedOption.waitlistEnabled == false {
             throw AppError.message("Questa opzione non ha lista d'attesa attiva.")
         }
@@ -2868,7 +2880,9 @@ struct SupabaseAPI {
         let requiresOnlinePayment = selectedOption?.requiresOnlinePayment(fallback: event) ?? event.requiresOnlinePayment
 
         let paymentStatus: String
-        if (!requiresOnlinePayment || paymentType == "free"), profile?.hasActiveMembership == true {
+        if shouldWaitlist {
+            paymentStatus = "not_required"
+        } else if (!requiresOnlinePayment || paymentType == "free"), profile?.hasActiveMembership == true {
             paymentStatus = "not_required"
         } else if paymentType == "location", profile?.hasActiveMembership == true {
             paymentStatus = "pay_on_location"
@@ -2974,7 +2988,7 @@ struct SupabaseAPI {
             "cancelled_at": .string(ISO8601DateFormatter().string(from: Date()))
         ]
         let data = try JSONEncoder().encode(payload)
-        let path = "/rest/v1/event_registrations?event_id=eq.\(eventId.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)&or=(status.is.null,status.in.(registered,deposit_paid,paid,pending_payment,pending_approval,waitlist))"
+        let path = "/rest/v1/event_registrations?event_id=eq.\(eventId.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)&status=in.(registered,deposit_paid,paid,pending_payment,pending_approval,waitlist)\(Self.nonManualRegistrationFilter)"
         let _: EmptyResponse = try await request(path: path, method: "PATCH", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
     }
 
@@ -3516,14 +3530,22 @@ struct Event: Codable, Identifiable, Hashable {
     var availableSpots: Int { max(0, (spotsTotal ?? 0) - attendeeSpotsTaken) }
     var bookableSpots: Int { max(0, (spotsTotal ?? 0) - (spotsTaken ?? 0)) }
     var hasBookableParticipationOption: Bool {
+        guard acceptsRegistrations, !isSoldOut else { return false }
         guard !priceOptions.isEmpty else { return bookableSpots > 0 }
         return priceOptions.contains { $0.isBookable(in: self) }
     }
+    var waitingListEnabled: Bool {
+        additionalFields?.bool(at: "waiting_list_enabled") == true
+    }
     var hasWaitlistParticipationOption: Bool {
-        guard !priceOptions.isEmpty else { return normalizedStatus == "full" || bookableSpots <= 0 }
+        guard acceptsRegistrations else { return false }
+        guard !priceOptions.isEmpty else { return isSoldOut && waitingListEnabled }
         return priceOptions.contains { $0.canJoinWaitlist(in: self) }
     }
     var availabilityLabel: String {
+        if isSoldOut && !shouldShowPublicCapacity {
+            return "Sold out"
+        }
         if hasBookableParticipationOption {
             let remaining = priceOptions.isEmpty ? bookableSpots : (priceOptions.map { $0.realRemainingSpots(in: self) }.max() ?? bookableSpots)
             return remaining == 1 ? "1 posto disponibile" : "\(remaining) posti disponibili"
@@ -3533,29 +3555,34 @@ struct Event: Codable, Identifiable, Hashable {
     private var organizerSpotOffset: Int {
         organizerId?.nilIfBlank != nil || organizerName?.nilIfBlank != nil ? 1 : 0
     }
-    var isFull: Bool {
-        normalizedStatus == "full" || ((spotsTotal ?? 0) > 0 && !hasBookableParticipationOption)
-    }
+    var isManualSoldOut: Bool { normalizedStatus == "full" && bookableSpots > 0 }
+    var isSoldOut: Bool { normalizedStatus == "full" || ((spotsTotal ?? 0) > 0 && bookableSpots <= 0) }
+    var shouldShowPublicCapacity: Bool { !isManualSoldOut }
+    var isFull: Bool { isSoldOut }
     var requiresOnlinePayment: Bool { paymentType == "paid" || paymentType == "deposit" }
     var acceptsRegistrations: Bool {
-        guard !["draft", "closed", "cancelled", "past", "archived"].contains(normalizedStatus) else { return false }
+        guard ["available", "published", "open"].contains(normalizedStatus) else { return false }
         guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return true }
         return eventDate >= Calendar.current.startOfDay(for: Date())
     }
     var isVisibleInUpcomingList: Bool {
-        guard !["draft", "past", "cancelled", "archived"].contains(normalizedStatus) else { return false }
+        guard !["draft", "unpublished", "past", "completed", "cancelled", "archived"].contains(normalizedStatus) else { return false }
         guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return true }
         return eventDate >= Calendar.current.startOfDay(for: Date())
     }
     var registrationUnavailableMessage: String {
         switch normalizedStatus {
-        case "draft":
+        case "draft", "unpublished":
+            return "Le iscrizioni non sono ancora aperte per questo evento."
+        case "upcoming":
             return "Le iscrizioni non sono ancora aperte per questo evento."
         case "closed":
             return "Le iscrizioni per questo evento sono chiuse."
+        case "rescheduled":
+            return "Questo evento è in riprogrammazione."
         case "cancelled":
             return "Questo evento è stato annullato."
-        case "past":
+        case "past", "completed":
             return "Questo evento è già passato."
         case "archived":
             return "Questo evento non è più disponibile."
@@ -3989,7 +4016,7 @@ struct PriceOption: Codable, Identifiable, Hashable {
     let waitlistEnabled: Bool?
 
     var displayName: String {
-        name?.nilIfBlank ?? "Opzione"
+        name?.nilIfBlank ?? "Formula"
     }
 
     var detailText: String {
@@ -4069,11 +4096,13 @@ struct PriceOption: Codable, Identifiable, Hashable {
     }
 
     func isBookable(in event: Event) -> Bool {
-        realRemainingSpots(in: event) > 0
+        guard event.acceptsRegistrations, !event.isSoldOut else { return false }
+        return realRemainingSpots(in: event) > 0
     }
 
     func canJoinWaitlist(in event: Event) -> Bool {
-        !isBookable(in: event) && waitlistEnabled != false
+        guard event.acceptsRegistrations, event.isSoldOut || realRemainingSpots(in: event) <= 0 else { return false }
+        return !isBookable(in: event) && (waitlistEnabled == true || event.waitingListEnabled)
     }
 
     func availabilityText(in event: Event) -> String {
@@ -4081,7 +4110,7 @@ struct PriceOption: Codable, Identifiable, Hashable {
             let remaining = realRemainingSpots(in: event)
             return remaining == 1 ? "1 posto disponibile" : "\(remaining) posti disponibili"
         }
-        return waitlistEnabled == false ? "Sold out" : "Lista d'attesa disponibile"
+        return canJoinWaitlist(in: event) ? "Lista d'attesa disponibile" : "Sold out"
     }
 
     func paymentSummary(in event: Event) -> String {
@@ -4738,7 +4767,9 @@ struct OrganizerEventDraft: Equatable {
     var specialBadgeIds: [String] = []
     var fitScoreMainCategory = ""
     var fitScoreSecondaryCategories: [String] = []
+    var closingSentenceMode = "random"
     var closingSentence = ""
+    var waitingListEnabled = false
     var askCarAvailability = false
     var weatherOverrideCondition = ""
     var weatherOverrideTempMin = ""
@@ -4776,7 +4807,7 @@ struct OrganizerEventDraft: Equatable {
         cancellationPolicy = Self.normalizedCancellationPolicy(event.cancellationPolicy)
         imageUrl = event.imageUrl ?? ""
         visibility = duplicate ? "private" : (event.visibility ?? "public")
-        status = duplicate ? "published" : (event.status ?? "published")
+        status = duplicate ? "published" : Self.editableStatus(event.status)
         galleryImageURLs = event.gallery.compactMap(\.url)
         manualBadges = (event.eventBadges ?? []).filter { OrganizerEventDraft.manualBadgeOptions.map(\.id).contains($0) }
         customBadge = (event.eventBadges ?? []).first { !OrganizerEventDraft.manualBadgeOptions.map(\.id).contains($0) } ?? ""
@@ -4785,10 +4816,19 @@ struct OrganizerEventDraft: Equatable {
         fitScoreSecondaryCategories = Array((event.additionalFields?.stringArray(at: "fit_score_secondary_categories") ?? [])
             .filter { $0 != fitScoreMainCategory }
             .prefix(2))
-        closingSentence = duplicate
-            ? deterministicClosingSentence(seed: UUID().uuidString)
-            : (event.additionalFields?.string(at: "closing_sentence")?.normalizedClosingSentence ?? "")
+        let savedClosingSentence = event.additionalFields?.string(at: "closing_sentence")?.normalizedClosingSentence ?? ""
+        if duplicate || savedClosingSentence.nilIfBlank == nil {
+            closingSentenceMode = "random"
+            closingSentence = ""
+        } else if eventClosingSentences.contains(savedClosingSentence) {
+            closingSentenceMode = "preset"
+            closingSentence = savedClosingSentence
+        } else {
+            closingSentenceMode = "manual"
+            closingSentence = savedClosingSentence
+        }
         askCarAvailability = event.additionalFields?.bool(at: "ask_car_availability") ?? false
+        waitingListEnabled = event.additionalFields?.bool(at: "waiting_list_enabled") ?? false
         weatherOverrideCondition = event.additionalFields?.string(at: "weather_override_condition") ?? ""
         weatherOverrideTempMin = event.additionalFields?.double(at: "weather_override_temp_min").map { $0.cleanInputString } ?? ""
         weatherOverrideTempMax = event.additionalFields?.double(at: "weather_override_temp_max").map { $0.cleanInputString } ?? ""
@@ -4823,6 +4863,21 @@ struct OrganizerEventDraft: Equatable {
         spotsTotal = proposal.maxParticipants ?? 20
         status = "published"
         visibility = "private"
+    }
+
+    static func editableStatus(_ status: String?) -> String {
+        switch status {
+        case "available", "open":
+            return "published"
+        case "unpublished":
+            return "draft"
+        case "past", "completed":
+            return "closed"
+        case "draft", "upcoming", "published", "closed", "full", "rescheduled", "cancelled":
+            return status ?? "published"
+        default:
+            return "published"
+        }
     }
 
     static let manualBadgeOptions: [(id: String, label: String)] = [
@@ -4905,11 +4960,12 @@ struct OrganizerEventDraft: Equatable {
             JSONValue.object(["url": .string(url), "order": .number(Double(index))])
         }
         var additionalObject: [String: JSONValue] = [
-            "closing_sentence": closingSentence.nilIfBlank.map { .string($0) } ?? .null,
+            "closing_sentence": closingSentenceMode == "random" ? .null : (closingSentence.nilIfBlank.map { .string($0) } ?? .null),
             "fit_score_main_category": fitScoreMainCategory.nilIfBlank.map { .string($0) } ?? .null,
             "fit_score_secondary_categories": .array(fitScoreSecondaryCategories.compactMap { $0.nilIfBlank }.map { .string($0) }),
             "fields": .array(additionalFields.filter { $0.label.nilIfBlank != nil }.map(\.jsonValue)),
-            "ask_car_availability": .bool(askCarAvailability)
+            "ask_car_availability": .bool(askCarAvailability),
+            "waiting_list_enabled": .bool(waitingListEnabled)
         ]
         if let value = weatherOverrideCondition.nilIfBlank { additionalObject["weather_override_condition"] = .string(value) }
         if let value = Double(weatherOverrideTempMin.replacingOccurrences(of: ",", with: ".")) { additionalObject["weather_override_temp_min"] = .number(value) }
@@ -5094,7 +5150,7 @@ struct EventParticipant: Identifiable, Hashable, Codable {
 struct EventParticipantRegistration: Codable {
     let id: String
     let eventId: String?
-    let userId: String
+    let userId: String?
     let status: String?
     let paymentStatus: String?
     let sportLevel: String?
@@ -5127,7 +5183,7 @@ struct OrganizerContactFields: Codable {
 }
 
 struct PublicEventAvatar: Codable {
-    let userId: String
+    let userId: String?
     let firstName: String
     let avatarUrl: String?
     let lastNameInitial: String?
@@ -5170,10 +5226,10 @@ struct Registration: Codable, Identifiable, Hashable {
         if isCancelled { return "Cancellato" }
         if normalizedStatus == "no_show" { return "No-show" }
         if checkedIn == true || normalizedStatus == "attended" { return "Partecipato" }
+        if normalizedStatus == "waitlist" { return "In lista d'attesa" }
         if paymentStatus == "deposit_paid" { return "Acconto pagato" }
         if paymentStatus == "pending" || normalizedStatus == "pending_payment" { return "Pagamento in sospeso" }
         if normalizedStatus == "pending_approval" { return "In approvazione" }
-        if normalizedStatus == "waitlist" { return "In attesa" }
         return "Iscritto"
     }
     var statusStyle: (background: Color, foreground: Color) {
@@ -5232,7 +5288,9 @@ private extension Registration {
     }
 
     func resumeActionTitle(in event: Event) -> String {
-        if waitlistSpotAvailable(in: event) { return "Completa prenotazione" }
+        if waitlistSpotAvailable(in: event) {
+            return requiresOnlinePayment(in: event) ? "Completa prenotazione" : "Conferma il posto"
+        }
         if hasOnlineBalanceDue(in: event) { return "Completa il saldo" }
         return "Completa pagamento"
     }
@@ -8480,10 +8538,17 @@ struct EventCard: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                RemoteImage(urlString: event.imageUrl)
-                    .frame(width: 86, height: 86)
-                    .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .saturation(event.isFull ? 0 : 1)
+                ZStack {
+                    RemoteImage(urlString: event.imageUrl)
+                        .frame(width: 86, height: 86)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .saturation(event.isSoldOut ? 0 : 1)
+                    if event.isSoldOut {
+                        SoldOutRibbon(fontSize: 8)
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                    }
+                }
+                .frame(width: 86, height: 86)
             }
 
             HStack(alignment: .bottom) {
@@ -8501,21 +8566,23 @@ struct EventCard: View {
                 .font(.caption)
                 .foregroundStyle(Brand.mutedForeground)
                 Spacer()
-                HStack {
-                    Label("\(event.attendeeSpotsTaken)/\(event.spotsTotal ?? 0) posti", systemImage: "person.2")
-                }
-                .font(.caption)
-                .foregroundStyle(Brand.mutedForeground)
-                .overlay(alignment: .bottom) {
-                    GeometryReader { proxy in
-                        ZStack(alignment: .leading) {
-                            Capsule().fill(Brand.muted)
-                            Capsule().fill(event.isFull ? Brand.destructive : Brand.success)
-                                .frame(width: proxy.size.width * fillPercent)
-                        }
+                if event.shouldShowPublicCapacity {
+                    HStack {
+                        Label("\(event.attendeeSpotsTaken)/\(event.spotsTotal ?? 0) posti", systemImage: "person.2")
                     }
-                    .frame(height: 4)
-                    .offset(y: 9)
+                    .font(.caption)
+                    .foregroundStyle(Brand.mutedForeground)
+                    .overlay(alignment: .bottom) {
+                        GeometryReader { proxy in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Brand.muted)
+                                Capsule().fill(event.isSoldOut ? Brand.destructive : Brand.success)
+                                    .frame(width: proxy.size.width * fillPercent)
+                            }
+                        }
+                        .frame(height: 4)
+                        .offset(y: 9)
+                    }
                 }
             }
         }
@@ -8523,6 +8590,25 @@ struct EventCard: View {
         .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
         .frame(maxWidth: .infinity)
+    }
+}
+
+struct SoldOutRibbon: View {
+    var fontSize: CGFloat = 9
+
+    var body: some View {
+        GeometryReader { proxy in
+            Text("SOLD OUT")
+                .font(.system(size: fontSize, weight: .black, design: .rounded))
+                .tracking(1.1)
+                .foregroundStyle(.white)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 4)
+                .background(Brand.destructive)
+                .rotationEffect(.degrees(45))
+                .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
+        }
+        .allowsHitTesting(false)
     }
 }
 
@@ -8607,8 +8693,7 @@ struct PersonalizedEventRecommendation: Identifiable {
 
     private static func joinedCategoryCounts(from registrations: [Registration]) -> [String: Int] {
         var counts: [String: Int] = [:]
-        let joinedStatuses = Set(["registered", "paid", "waitlist", "attended", "deposit_paid"])
-        for registration in registrations where joinedStatuses.contains(registration.normalizedStatus) || registration.checkedIn == true {
+        for registration in registrations where registration.normalizedStatus == "attended" || registration.checkedIn == true {
             guard let event = registration.event else { continue }
             for category in recommendationCategories(for: event) {
                 counts[category, default: 0] += 1
@@ -8665,10 +8750,13 @@ struct RecommendedEventsSection: View {
     let recommendations: [PersonalizedEventRecommendation]
     let availableWidth: CGFloat
     @Binding var selectedEvent: Event?
-    private let cardWidth: CGFloat = 300
+
+    private var cardWidth: CGFloat {
+        min(300, max(238, availableWidth * 0.72))
+    }
 
     private var trailingInset: CGFloat {
-        max(0, availableWidth - cardWidth)
+        16
     }
 
     var body: some View {
@@ -8696,6 +8784,7 @@ struct RecommendedEventsSection: View {
                 .padding(.vertical, 2)
                 .padding(.trailing, trailingInset)
             }
+            .contentMargins(.leading, 0, for: .scrollContent)
             .scrollClipDisabled(false)
             .scrollTargetBehavior(.viewAligned)
         }
@@ -8722,6 +8811,10 @@ struct RecommendedEventCard: View {
                 RemoteImage(urlString: event.imageUrl)
                     .frame(width: width, height: 132)
                     .clipShape(UnevenRoundedRectangle(topLeadingRadius: 18, topTrailingRadius: 18))
+                    .saturation(event.isSoldOut ? 0 : 1)
+                if event.isSoldOut {
+                    SoldOutRibbon(fontSize: 10)
+                }
                 EventCardPillLabel(text: status.label, color: status.background, foreground: status.foreground)
                     .padding(10)
             }
@@ -9132,6 +9225,7 @@ struct EventDetailView: View {
 
     private func hero(_ event: Event, width: CGFloat, topInset: CGFloat) -> some View {
         let heroHeight: CGFloat = 340
+        let safeTop = max(topInset, 22)
         return ZStack(alignment: .bottomLeading) {
             RemoteImage(urlString: event.imageUrl)
                 .frame(width: width, height: heroHeight)
@@ -9155,7 +9249,7 @@ struct EventDetailView: View {
                     }
                 }
                 .padding(.horizontal, 16)
-                .padding(.top, topInset + 14)
+                .padding(.top, safeTop + 10)
                 Spacer()
             }
             .frame(width: width, height: heroHeight)
@@ -9437,7 +9531,7 @@ struct EventDetailView: View {
                         .frame(height: 50)
                         .background(event.statusStyle.background, in: RoundedRectangle(cornerRadius: 18))
                 } else {
-                    Button(check.isBlocking ? "Requisiti" : (event.isFull ? "Lista d'attesa" : "Partecipa")) {
+                    Button(check.isBlocking ? "Requisiti" : (event.isFull ? "Entra in lista d'attesa" : "Partecipa")) {
                         if !store.isAuthenticated {
                             showAuth = true
                         } else if check.isBlocking || check.hasWarnings {
@@ -12368,6 +12462,7 @@ struct RegistrationCheckoutSheet: View {
     @State private var sportLevel = ""
     @State private var customResponses: [String: String] = [:]
     @State private var submitting = false
+    @State private var attemptedSubmit = false
     @State private var showMembershipProfileEditor = false
 
     var priceEligibilityContext: PriceEligibilityContext {
@@ -12467,6 +12562,15 @@ struct RegistrationCheckoutSheet: View {
         canUseDiscount && discountCode.nilIfBlank != nil && appliedDiscount == nil
     }
 
+    var missingCheckoutMessage: String? {
+        if !event.meetingPoints.isEmpty && selectedMeetingPointId == nil { return "Scegli un punto di ritrovo per continuare." }
+        if !eligiblePriceOptions.isEmpty && selectedPriceOptionId == nil { return "Scegli una formula di partecipazione." }
+        if hasIncompleteRequiredCustomFields { return "Completa i campi obbligatori evidenziati." }
+        if hasMandatoryEquipment && !equipmentConfirmed { return "Conferma l'attrezzatura obbligatoria per completare l'iscrizione." }
+        if hasUnappliedDiscountCode { return "Applica o rimuovi il codice sconto prima di continuare." }
+        return nil
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -12502,6 +12606,10 @@ struct RegistrationCheckoutSheet: View {
                     summarySection
 
                     Button {
+                        if missingCheckoutMessage != nil {
+                            attemptedSubmit = true
+                            return
+                        }
                         Task {
                             guard ensureMembershipProfileDataIfNeeded() else { return }
                             submitting = true
@@ -12532,7 +12640,13 @@ struct RegistrationCheckoutSheet: View {
                         }
                     }
                     .buttonStyle(PrimaryButtonStyle())
-                    .disabled(submitting || !event.acceptsRegistrations || selectedOptionIsUnavailable || (!event.meetingPoints.isEmpty && selectedMeetingPointId == nil) || (!eligiblePriceOptions.isEmpty && selectedPriceOptionId == nil) || hasUnappliedDiscountCode || hasIncompleteRequiredCustomFields || (hasMandatoryEquipment && !equipmentConfirmed))
+                    .disabled(submitting || !event.acceptsRegistrations || selectedOptionIsUnavailable)
+                    if attemptedSubmit, let missingCheckoutMessage {
+                        Text(missingCheckoutMessage)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Brand.destructive)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
                 .padding(20)
             }
@@ -12582,6 +12696,11 @@ struct RegistrationCheckoutSheet: View {
                                 selectedMeetingPointId = point.id
                             }
                         }
+                    }
+                    if attemptedSubmit && selectedMeetingPointId == nil {
+                        Text("Scegli un punto di ritrovo per continuare.")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Brand.destructive)
                     }
                 }
 
@@ -12663,6 +12782,7 @@ struct RegistrationCheckoutSheet: View {
         }
     }
 
+    @ViewBuilder
     private var equipmentConfirmationRow: some View {
         Button {
             equipmentConfirmed.toggle()
@@ -12681,9 +12801,17 @@ struct RegistrationCheckoutSheet: View {
             .padding()
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.yellow.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
-            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.yellow.opacity(0.55), lineWidth: 1))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(attemptedSubmit && !equipmentConfirmed ? Brand.destructive : Color.yellow.opacity(0.55), lineWidth: attemptedSubmit && !equipmentConfirmed ? 2 : 1)
+            )
         }
         .buttonStyle(.plain)
+        if attemptedSubmit && !equipmentConfirmed {
+            Text("Conferma l'attrezzatura obbligatoria per continuare.")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Brand.destructive)
+        }
     }
 
     private var priceAndMembershipSection: some View {
@@ -12691,7 +12819,7 @@ struct RegistrationCheckoutSheet: View {
             CheckoutSectionTitle("Prezzo e tessera")
 
             if !eligiblePriceOptions.isEmpty {
-                Text("Scegli l'opzione di partecipazione *")
+                Text("Scegli la formula *")
                     .font(.headline.weight(.bold))
                     .foregroundStyle(Brand.foreground)
 
@@ -12709,6 +12837,11 @@ struct RegistrationCheckoutSheet: View {
                             paymentChoice = "deposit"
                         }
                     }
+                }
+                if attemptedSubmit && selectedPriceOptionId == nil {
+                    Text("Scegli una formula di partecipazione.")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Brand.destructive)
                 }
             }
 
@@ -12881,7 +13014,7 @@ struct RegistrationCheckoutSheet: View {
             } else if selectedOptionIsWaitlist {
                 CheckoutSummaryCard(title: "Lista d'attesa", tone: .warning) {
                     SummaryRow("Pagamento oggi", "€0", bold: true)
-                    SummaryRow("Opzione", selectedPriceOption?.displayName ?? "Partecipazione")
+                    SummaryRow("Formula", selectedPriceOption?.displayName ?? "Partecipazione")
                 }
             } else {
                 CheckoutSummaryCard(title: "Da pagare oggi") {
@@ -12925,7 +13058,7 @@ struct RegistrationCheckoutSheet: View {
 
     private var ctaTitle: String {
         if !event.acceptsRegistrations { return "Iscrizioni chiuse" }
-        if selectedOptionIsUnavailable { return "Opzione sold out" }
+        if selectedOptionIsUnavailable { return "Formula sold out" }
         if shouldRequestApproval { return "Invia richiesta di iscrizione" }
         if selectedOptionIsWaitlist { return "Entra in lista d'attesa" }
         if selectedPaymentType == "deposit" { return paymentChoice == "full" ? "Paga tutto e iscriviti" : "Paga acconto e iscriviti" }
@@ -16762,7 +16895,7 @@ struct OrganizerEventManageView: View {
     }
 
     private func exportCSV() {
-        let header = "Nome,Cognome,Telefono,Livello,Opzione prezzo,Stato,Pagamento,Importo pagato,Rimborso,Ritrovo,Check-in,Registrato"
+        let header = "Nome,Cognome,Telefono,Livello,Formula,Stato,Pagamento,Importo pagato,Rimborso,Ritrovo,Check-in,Registrato"
         let rows = registrations.map { registration in
             let meetingPoint = meetingPoints.first { $0.id == registration.meetingPointId }?.name ?? ""
             let firstName = registration.isManual ? (registration.manualName ?? registration.displayName) : (registration.profiles?.firstName ?? "")
@@ -18807,7 +18940,7 @@ struct OrganizerEventStatusSheet: View {
     let event: Event
     let onSelect: (String) -> Void
 
-    private let statuses = ["draft", "published", "full", "closed", "past"]
+    private let statuses = ["draft", "upcoming", "published", "closed", "full", "rescheduled", "cancelled"]
 
     var body: some View {
         NavigationStack {
@@ -18831,7 +18964,7 @@ struct OrganizerEventStatusSheet: View {
                                         .foregroundStyle(Brand.mutedForeground)
                                 }
                                 Spacer()
-                                if event.normalizedStatus == status {
+                                if OrganizerEventDraft.editableStatus(event.normalizedStatus) == status {
                                     Image(systemName: "checkmark")
                                         .foregroundStyle(Brand.primary)
                                 }
@@ -18857,31 +18990,35 @@ struct OrganizerEventStatusSheet: View {
     private func icon(for status: String) -> String {
         switch status {
         case "draft": return "doc.text"
+        case "upcoming": return "calendar.badge.clock"
         case "published": return "eye"
         case "full": return "person.2.slash"
         case "closed": return "lock"
-        case "past": return "archivebox"
+        case "rescheduled": return "calendar.badge.exclamationmark"
+        case "cancelled": return "xmark.octagon"
         default: return "circle"
         }
     }
 
     private func tint(for status: String) -> Color {
         switch status {
-        case "draft": return Brand.warning
+        case "draft", "closed": return Brand.mutedForeground
+        case "upcoming", "rescheduled": return Brand.warning
         case "published": return Brand.success
-        case "full": return Brand.destructive
-        case "closed", "past": return Brand.mutedForeground
+        case "full", "cancelled": return Brand.destructive
         default: return Brand.primary
         }
     }
 
     private func description(for status: String) -> String {
         switch status {
-        case "draft": return "Nasconde l'evento dalle iscrizioni pubbliche."
-        case "published": return "Rende l'evento aperto alle iscrizioni."
-        case "full": return "Segna l'evento come completo."
+        case "draft": return "Non pubblicato: visibile solo ad admin e organizzatori."
+        case "upcoming": return "Evento annunciabile, ma iscrizioni non ancora aperte."
+        case "published": return "Aperto: visibile e disponibile alle iscrizioni."
         case "closed": return "Chiude nuove iscrizioni senza cancellare l'evento."
-        case "past": return "Archivia l'evento come concluso."
+        case "full": return "Sold out: la lista d'attesa dipende dall'opzione dedicata."
+        case "rescheduled": return "Evento da riprogrammare, iscrizioni bloccate."
+        case "cancelled": return "Annullato. Usa l'azione dedicata per notifiche e rimborsi."
         default: return ""
         }
     }
@@ -18963,17 +19100,30 @@ struct OrganizerAddParticipantSheet: View {
                             Text("Intermedio").tag("intermediate")
                             Text("Avanzato").tag("advanced")
                         }
+                        .pickerStyle(.menu)
                         .editableControlSurface()
                     } else {
                         TextField("Cerca per nome o email", text: $searchQuery)
                             .textInputAutocapitalization(.words)
                             .editableTextInput()
-                        ForEach(searchResults) { profile in
-                            Button {
-                                selectedProfile = profile
-                                searchQuery = profile.displayName
-                            } label: {
-                                OrganizerSearchProfileRow(profile: profile, selected: selectedProfile?.id == profile.id)
+                        if let selectedProfile {
+                            OrganizerSearchProfileRow(profile: selectedProfile, selected: true)
+                            Button("Cambia profilo") {
+                                self.selectedProfile = nil
+                                searchQuery = ""
+                                searchResults = []
+                            }
+                        } else {
+                            ForEach(searchResults) { profile in
+                                Button {
+                                    selectedProfile = profile
+                                    searchQuery = profile.displayName
+                                    searchResults = []
+                                    dismissKeyboard()
+                                } label: {
+                                    OrganizerSearchProfileRow(profile: profile, selected: false)
+                                }
+                                .buttonStyle(.plain)
                             }
                         }
                     }
@@ -18986,6 +19136,7 @@ struct OrganizerAddParticipantSheet: View {
                                 Text(option.displayName).tag(option.id)
                             }
                         }
+                        .pickerStyle(.menu)
                         .editableControlSurface()
                     }
                     Picker("Ritrovo", selection: $meetingPointId) {
@@ -18994,12 +19145,14 @@ struct OrganizerAddParticipantSheet: View {
                             Text(point.name ?? "Ritrovo").tag(point.id)
                         }
                     }
+                    .pickerStyle(.menu)
                     .editableControlSurface()
                     Picker("Pagamento", selection: $paymentStatus) {
                         ForEach(["deposit_paid", "paid", "pending", "pay_on_location", "not_required", "failed"], id: \.self) {
                             Text($0.paymentStatusLabel).tag($0)
                         }
                     }
+                    .pickerStyle(.menu)
                     .editableControlSurface()
                 }
             }
@@ -19016,12 +19169,20 @@ struct OrganizerAddParticipantSheet: View {
                 }
             }
             .task(id: searchQuery) {
-                guard mode == 1, searchQuery.count >= 2 else {
+                guard mode == 1, selectedProfile == nil, searchQuery.count >= 2 else {
                     searchResults = []
                     return
                 }
                 try? await Task.sleep(nanoseconds: 250_000_000)
+                guard selectedProfile == nil else { return }
                 searchResults = await store.searchOrganizerProfiles(searchQuery)
+            }
+            .onChange(of: mode) { _, newMode in
+                if newMode == 0 {
+                    searchQuery = ""
+                    searchResults = []
+                    selectedProfile = nil
+                }
             }
             .onAppear {
                 if priceOptionId.isEmpty, let firstOption = priceOptions.first {
@@ -19471,14 +19632,14 @@ struct OrganizerEventEditorView: View {
                             }
                         }
 
-                        OrganizerEditorSection(title: "Opzioni di partecipazione") {
+                        OrganizerEditorSection(title: "Modalità di partecipazione") {
                             ForEach($draft.priceOptions) { optionBinding in
                                 OrganizerPriceOptionEditor(option: optionBinding, specialBadges: allBadges) {
                                     let optionId = optionBinding.wrappedValue.id
                                     draft.priceOptions.removeAll { $0.id == optionId }
                                 }
                             }
-                            Button("Aggiungi opzione") {
+                            Button("Aggiungi formula") {
                                 var option = OrganizerPriceOptionDraft()
                                 option.paymentType = draft.paymentType
                                 option.price = draft.paymentType == "free" ? 0 : draft.price
@@ -19510,7 +19671,29 @@ struct OrganizerEventEditorView: View {
                                 }
                             }
                             Field("Badge custom", text: $draft.customBadge)
-                            Field("Frase conclusiva", text: $draft.closingSentence)
+                            Picker("Frase conclusiva", selection: $draft.closingSentenceMode) {
+                                Text("Random").tag("random")
+                                Text("Scegli frase").tag("preset")
+                                Text("Frase manuale").tag("manual")
+                            }
+                            .editableControlSurface()
+                            if draft.closingSentenceMode == "preset" {
+                                Picker("Frase", selection: $draft.closingSentence) {
+                                    ForEach(eventClosingSentences, id: \.self) { sentence in
+                                        Text(sentence).tag(sentence)
+                                    }
+                                }
+                                .editableControlSurface()
+                                .onAppear {
+                                    if draft.closingSentence.nilIfBlank == nil {
+                                        draft.closingSentence = eventClosingSentences[0]
+                                    }
+                                }
+                            } else if draft.closingSentenceMode == "manual" {
+                                Field("Frase manuale", text: $draft.closingSentence)
+                            }
+                            Text("Previsioni meteo")
+                                .font(.subheadline.weight(.bold))
                             Picker("Meteo manuale", selection: $draft.weatherOverrideCondition) {
                                 Text("Nessun override").tag("")
                                 Text("Sereno").tag("sereno")
@@ -19536,7 +19719,12 @@ struct OrganizerEventEditorView: View {
                                 .font(.caption)
                                 .foregroundStyle(Brand.mutedForeground)
                             OrganizerVisibilityPickerField(visibility: $draft.visibility)
-                            OrganizerRegistrationOpenField(isOpen: registrationOpenBinding)
+                            Toggle("Lista d'attesa", isOn: $draft.waitingListEnabled)
+                                .editableControlSurface()
+                            Text("Se l'evento e sold out, gli utenti possono entrare in lista senza occupare posti o generare pagamenti.")
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedForeground)
+                            OrganizerEventStatusEditor(status: $draft.status)
                             OrganizerAccessRulesEditor(rules: $draft.accessRules, specialBadges: allBadges)
                             if !draft.accessRules.isEmpty {
                                 Picker("Etichetta esclusivita", selection: $draft.exclusivityLabel) {
@@ -19551,7 +19739,7 @@ struct OrganizerEventEditorView: View {
                             }
                             OrganizerRegistrationRulesSummary(
                                 visibility: draft.visibility,
-                                registrationOpen: draft.status != "closed",
+                                registrationOpen: ["available", "published", "open"].contains(draft.status),
                                 accessRulesCount: draft.accessRules.count,
                                 priceOptionCount: draft.priceOptions.filter { $0.name.nilIfBlank != nil }.count
                             )
@@ -19727,14 +19915,6 @@ struct OrganizerEventEditorView: View {
         return "Salva"
     }
 
-    private var registrationOpenBinding: Binding<Bool> {
-        Binding {
-            draft.status != "closed"
-        } set: { isOpen in
-            draft.status = isOpen ? "published" : "closed"
-        }
-    }
-
     private func keyboardHeight(from notification: Notification) -> CGFloat {
         guard let frame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else {
             return 0
@@ -19774,9 +19954,6 @@ struct OrganizerEventEditorView: View {
         guard !uploadingImages else {
             validationMessage = "Attendi il completamento del caricamento immagini."
             return
-        }
-        if draft.status != "closed" {
-            draft.status = "published"
         }
         let messages = draft.validationMessages
         validationMessage = messages.isEmpty ? nil : "Completa prima:\n" + messages.map { "- \($0)" }.joined(separator: "\n")
@@ -20765,14 +20942,29 @@ struct OrganizerVisibilityPickerField: View {
     }
 }
 
-struct OrganizerRegistrationOpenField: View {
-    @Binding var isOpen: Bool
+struct OrganizerEventStatusEditor: View {
+    @Binding var status: String
+
+    private let options: [(id: String, label: String, description: String)] = [
+        ("draft", "Non pubblicato", "Visibile solo ad admin e organizzatori. Iscrizioni non attive."),
+        ("upcoming", "In arrivo", "Evento annunciabile, ma iscrizioni non ancora aperte."),
+        ("published", "Aperto", "Evento visibile e iscrizioni attive."),
+        ("closed", "Iscrizioni chiuse", "Evento visibile, ma iscrizioni bloccate."),
+        ("full", "Sold out", "Evento sold out. La lista d'attesa resta una funzione separata."),
+        ("rescheduled", "Riprogrammato", "Evento da riprogrammare. Iscrizioni non attive."),
+        ("cancelled", "Annullato", "Evento annullato. Usa il flusso dedicato per notifiche e rimborsi.")
+    ]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Toggle("Iscrizioni", isOn: $isOpen)
+            Picker("Stato evento", selection: $status) {
+                ForEach(options, id: \.id) { option in
+                    Text(option.label).tag(option.id)
+                }
+            }
+            .pickerStyle(.menu)
                 .editableControlSurface()
-            Text(isOpen ? "Le iscrizioni sono aperte. Gli utenti possono registrarsi." : "Le iscrizioni sono chiuse. L'evento è visibile ma nessuno può registrarsi.")
+            Text(options.first(where: { $0.id == status })?.description ?? "Stato evento personalizzato.")
                 .font(.caption)
                 .foregroundStyle(Brand.mutedForeground)
         }
@@ -21455,14 +21647,14 @@ struct OrganizerPriceOptionEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Opzione")
+                Text("Formula")
                     .font(.subheadline.weight(.bold))
                 Spacer()
                 Button(role: .destructive, action: onDelete) {
                     Image(systemName: "trash")
                 }
             }
-            Field("Nome", text: $option.name)
+            Field("Nome formula", text: $option.name)
             Picker("Modalita pagamento", selection: paymentModeBinding) {
                 Text("Gratis").tag("free")
                 Text("Pagamento online").tag("paid")
@@ -21493,7 +21685,7 @@ struct OrganizerPriceOptionEditor: View {
             if option.hasDedicatedSpots {
                 OrganizerIntegerStepperField("Posti dedicati", value: $option.dedicatedSpots, range: 1...300)
             }
-            Toggle("Waiting list", isOn: $option.waitlistEnabled)
+            Toggle("Lista d'attesa formula", isOn: $option.waitlistEnabled)
                 .editableControlSurface(cornerRadius: 12)
             Picker("Gruppo idoneo", selection: eligibleGroupModeBinding) {
                 Text("Tutti").tag("all")
@@ -27092,7 +27284,7 @@ struct KeyboardDismissOnTapView: UIViewRepresentable {
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
             var touchedView: UIView? = touch.view
             while let current = touchedView {
-                if current is UITextField || current is UITextView {
+                if current is UIControl || current is UITextField || current is UITextView {
                     return false
                 }
                 touchedView = current.superview
@@ -29709,7 +29901,6 @@ private extension View {
             .frame(minHeight: 48)
             .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: cornerRadius))
             .overlay(RoundedRectangle(cornerRadius: cornerRadius).stroke(Brand.inputBorder, lineWidth: 1))
-            .simultaneousGesture(TapGesture().onEnded { dismissKeyboard() })
     }
 
     func editableTextInput(cornerRadius: CGFloat = 12) -> some View {
@@ -30264,11 +30455,14 @@ struct EventDetailCircleButton: View {
             Image(systemName: systemImage)
                 .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(.white.opacity(0.92))
-                .frame(width: 36, height: 36)
-                .background(.black.opacity(0.16), in: Circle())
-                .frame(width: 44, height: 44)
+                .frame(width: 40, height: 40)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay(Circle().stroke(.white.opacity(0.28), lineWidth: 1))
+                .shadow(color: .black.opacity(0.18), radius: 12, y: 6)
+                .frame(width: 48, height: 48)
         }
         .buttonStyle(.plain)
+        .contentShape(Circle())
     }
 }
 
@@ -30605,11 +30799,23 @@ private extension Event {
     }
 
     var statusStyle: EventStatusStyle {
-        if normalizedStatus == "draft" {
-            return EventStatusStyle(label: "In arrivo", background: Brand.warning.opacity(0.15), foreground: Brand.warning)
+        if ["draft", "unpublished"].contains(normalizedStatus) {
+            return EventStatusStyle(label: "Non pubblicato", background: Brand.muted, foreground: Brand.mutedForeground)
         }
-        if ["closed", "cancelled", "past", "archived"].contains(normalizedStatus) || isPastOrCancelled {
-            return EventStatusStyle(label: "Chiuso", background: Brand.muted, foreground: Brand.mutedForeground)
+        if normalizedStatus == "cancelled" {
+            return EventStatusStyle(label: "Annullato", background: Brand.destructive.opacity(0.12), foreground: Brand.destructive)
+        }
+        if normalizedStatus == "rescheduled" {
+            return EventStatusStyle(label: "Riprogrammato", background: Brand.warning.opacity(0.15), foreground: Brand.warning)
+        }
+        if ["past", "completed"].contains(normalizedStatus) || isPastOrCancelled {
+            return EventStatusStyle(label: "Concluso", background: Brand.muted, foreground: Brand.mutedForeground)
+        }
+        if normalizedStatus == "closed" || normalizedStatus == "archived" {
+            return EventStatusStyle(label: "Iscrizioni chiuse", background: Brand.muted, foreground: Brand.mutedForeground)
+        }
+        if normalizedStatus == "upcoming" {
+            return EventStatusStyle(label: "In arrivo", background: Brand.warning.opacity(0.15), foreground: Brand.warning)
         }
         if normalizedStatus == "full" || isFull {
             if hasWaitlistParticipationOption {
@@ -30632,7 +30838,7 @@ private extension Event {
             case "registered", "paid", "attended", "deposit_paid":
                 return EventStatusStyle(label: "Iscritto", background: Brand.success.opacity(0.16), foreground: Brand.success)
             case "waitlist":
-                return EventStatusStyle(label: "Waitlist", background: Brand.warning.opacity(0.16), foreground: Brand.warning)
+                return EventStatusStyle(label: "In lista d'attesa", background: Brand.warning.opacity(0.16), foreground: Brand.warning)
             case "pending_approval":
                 return EventStatusStyle(label: "Da approvare", background: Brand.warning.opacity(0.16), foreground: Brand.warning)
             case "pending_payment":
@@ -30642,17 +30848,29 @@ private extension Event {
             }
         }
 
-        if normalizedStatus == "draft" {
-            return EventStatusStyle(label: "In arrivo", background: Brand.warning.opacity(0.15), foreground: Brand.warning)
+        if ["draft", "unpublished"].contains(normalizedStatus) {
+            return EventStatusStyle(label: "Non pubblicato", background: Brand.muted, foreground: Brand.mutedForeground)
         }
-        if ["closed", "cancelled", "past", "archived"].contains(normalizedStatus) || isPastOrCancelled {
-            return EventStatusStyle(label: "Chiuso", background: Brand.muted, foreground: Brand.mutedForeground)
+        if normalizedStatus == "cancelled" {
+            return EventStatusStyle(label: "Annullato", background: Brand.destructive.opacity(0.12), foreground: Brand.destructive)
+        }
+        if normalizedStatus == "rescheduled" {
+            return EventStatusStyle(label: "Riprogrammato", background: Brand.warning.opacity(0.15), foreground: Brand.warning)
+        }
+        if ["past", "completed"].contains(normalizedStatus) || isPastOrCancelled {
+            return EventStatusStyle(label: "Concluso", background: Brand.muted, foreground: Brand.mutedForeground)
+        }
+        if normalizedStatus == "closed" || normalizedStatus == "archived" {
+            return EventStatusStyle(label: "Iscrizioni chiuse", background: Brand.muted, foreground: Brand.mutedForeground)
+        }
+        if normalizedStatus == "upcoming" {
+            return EventStatusStyle(label: "In arrivo", background: Brand.warning.opacity(0.15), foreground: Brand.warning)
         }
         if normalizedStatus == "full" || isFull {
             if hasWaitlistParticipationOption {
-                return EventStatusStyle(label: "Waitlist", background: Brand.warning.opacity(0.16), foreground: Brand.warning)
+                return EventStatusStyle(label: "Lista d'attesa", background: Brand.warning.opacity(0.16), foreground: Brand.warning)
             }
-            return EventStatusStyle(label: "Chiuso", background: Brand.muted, foreground: Brand.mutedForeground)
+            return EventStatusStyle(label: "Sold out", background: Brand.destructive.opacity(0.14), foreground: Brand.destructive)
         }
         return EventStatusStyle(label: "Aperto", background: Brand.success.opacity(0.16), foreground: Brand.success)
     }
@@ -31112,16 +31330,18 @@ private extension String {
 
     var organizerStatusLabel: String {
         switch self {
-        case "draft": return "Bozza"
-        case "published", "available": return "Pubblicato"
-        case "full": return "Completo"
-        case "closed": return "Chiuso"
+        case "draft", "unpublished": return "Non pubblicato"
+        case "upcoming": return "In arrivo"
+        case "published", "available", "open": return "Aperto"
+        case "full": return "Sold out"
+        case "closed": return "Iscrizioni chiuse"
+        case "rescheduled": return "Riprogrammato"
         case "cancelled": return "Annullato"
-        case "past": return "Passato"
+        case "past", "completed": return "Concluso"
         case "registered": return "Iscritto"
         case "deposit_paid": return "Acconto pagato"
         case "paid": return "Pagato"
-        case "waitlist": return "Waitlist"
+        case "waitlist": return "In lista d'attesa"
         case "attended": return "Presente"
         case "no_show": return "No-show"
         case "pending_approval": return "Da approvare"
@@ -31376,19 +31596,20 @@ private extension Array where Element: Hashable {
     }
 }
 
+private let eventClosingSentences = [
+    "Porta leggerezza, al resto pensiamo noi",
+    "Una community che arriva per i sentieri... e resta per le persone",
+    "Il difficile è venire. Poi non vorrai più andare via",
+    "Fidati: sarà una di quelle giornate che ricordi",
+    "Vieni con lo spirito giusto - il resto viene da sé",
+    "Qui si conoscono persone, non solo posti"
+]
+
 private func deterministicClosingSentence(seed: String) -> String {
-    let values = [
-        "Porta leggerezza, al resto pensiamo noi",
-        "Una community che arriva per i sentieri... e resta per le persone",
-        "Il difficile è venire. Poi non vorrai più andare via",
-        "Fidati: sarà una di quelle giornate che ricordi",
-        "Vieni con lo spirito giusto - il resto viene da sé",
-        "Qui si conoscono persone, non solo posti"
-    ]
     let hash = seed.enumerated().reduce(0) { partial, pair in
         partial + Int(pair.element.unicodeScalars.first?.value ?? 0) * (pair.offset + 1)
     }
-    return values[hash % values.count]
+    return eventClosingSentences[hash % eventClosingSentences.count]
 }
 
 private func normalizeInterestCategory(_ value: String?) -> String? {
