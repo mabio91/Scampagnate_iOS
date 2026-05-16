@@ -6498,8 +6498,7 @@ extension JSONValue {
 // MARK: - Root
 
 private enum AppChrome {
-    static let topSafeAreaClearance: CGFloat = 14
-    static let navigationGlassBleed: CGFloat = 14
+    static let topSafeAreaClearance: CGFloat = 6
 }
 
 struct RootView: View {
@@ -6965,7 +6964,7 @@ private struct StatusBarShield: View {
     var body: some View {
         GeometryReader { proxy in
             Brand.background
-                .frame(height: proxy.safeAreaInsets.top + AppChrome.navigationGlassBleed)
+                .frame(height: proxy.safeAreaInsets.top)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .ignoresSafeArea(edges: .top)
         }
