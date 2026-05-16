@@ -3945,6 +3945,8 @@ extension Event {
         let rawFields: [JSONValue]
         if let fields = additionalFields?.array(at: "fields") {
             rawFields = fields
+        } else if let fields = additionalFields?.array(at: "custom_fields") {
+            rawFields = fields
         } else if let fields = additionalFields?.arrayValue {
             rawFields = fields
         } else {
@@ -4811,6 +4813,8 @@ struct OrganizerEventDraft: Equatable {
     var equipmentItems: [OrganizerEquipmentItemDraft] = []
     var additionalFields: [OrganizerAdditionalFieldDraft] = []
     var accessRules: [OrganizerAccessRuleDraft] = []
+    private var originalAdditionalFields: [String: JSONValue] = [:]
+    private var originalAccessRules: [String: JSONValue] = [:]
 
     init() {}
 
@@ -4841,6 +4845,8 @@ struct OrganizerEventDraft: Equatable {
         manualBadges = (event.eventBadges ?? []).filter { OrganizerEventDraft.manualBadgeOptions.map(\.id).contains($0) }
         customBadge = (event.eventBadges ?? []).first { !OrganizerEventDraft.manualBadgeOptions.map(\.id).contains($0) } ?? ""
         self.specialBadgeIds = duplicate ? [] : specialBadgeIds
+        originalAdditionalFields = duplicate ? [:] : (event.additionalFields?.objectValue ?? [:])
+        originalAccessRules = duplicate ? [:] : (event.accessRules?.objectValue ?? [:])
         fitScoreMainCategory = event.additionalFields?.string(at: "fit_score_main_category") ?? ""
         fitScoreSecondaryCategories = Array((event.additionalFields?.stringArray(at: "fit_score_secondary_categories") ?? [])
             .filter { $0 != fitScoreMainCategory }
@@ -4856,7 +4862,7 @@ struct OrganizerEventDraft: Equatable {
             closingSentenceMode = "manual"
             closingSentence = savedClosingSentence
         }
-        askCarAvailability = event.additionalFields?.bool(at: "ask_car_availability") ?? false
+        askCarAvailability = event.additionalFields?.bool(at: "ask_car_availability") ?? event.additionalFields?.bool(at: "car_availability_enabled") ?? false
         waitingListEnabled = event.additionalFields?.bool(at: "waiting_list_enabled") ?? false
         weatherOverrideCondition = event.additionalFields?.string(at: "weather_override_condition") ?? ""
         weatherOverrideTempMin = event.additionalFields?.double(at: "weather_override_temp_min").map { $0.cleanInputString } ?? ""
@@ -4876,7 +4882,7 @@ struct OrganizerEventDraft: Equatable {
             return draft
         }
         equipmentItems = event.equipmentItems.map(OrganizerEquipmentItemDraft.init(item:))
-        additionalFields = (event.additionalFields?.array(at: "fields") ?? event.additionalFields?.arrayValue)?
+        additionalFields = (event.additionalFields?.array(at: "fields") ?? event.additionalFields?.array(at: "custom_fields") ?? event.additionalFields?.arrayValue)?
             .map(OrganizerAdditionalFieldDraft.init(json:)) ?? []
         accessRules = event.accessRules?.array(at: "rules")?.map(OrganizerAccessRuleDraft.init(json:)) ?? []
     }
@@ -4988,24 +4994,36 @@ struct OrganizerEventDraft: Equatable {
         let gallery = galleryImageURLs.enumerated().map { index, url in
             JSONValue.object(["url": .string(url), "order": .number(Double(index))])
         }
-        var additionalObject: [String: JSONValue] = [
+        let customFieldValues = additionalFields.filter { $0.label.nilIfBlank != nil }.map(\.jsonValue)
+        var additionalObject = originalAdditionalFields
+        additionalObject.merge([
             "closing_sentence": closingSentenceMode == "random" ? .null : (closingSentence.nilIfBlank.map { .string($0) } ?? .null),
             "fit_score_main_category": fitScoreMainCategory.nilIfBlank.map { .string($0) } ?? .null,
             "fit_score_secondary_categories": .array(fitScoreSecondaryCategories.compactMap { $0.nilIfBlank }.map { .string($0) }),
-            "fields": .array(additionalFields.filter { $0.label.nilIfBlank != nil }.map(\.jsonValue)),
+            "fields": .array(customFieldValues),
+            "custom_fields": .array(customFieldValues),
             "ask_car_availability": .bool(askCarAvailability),
             "waiting_list_enabled": .bool(waitingListEnabled)
-        ]
-        if let value = weatherOverrideCondition.nilIfBlank { additionalObject["weather_override_condition"] = .string(value) }
-        if let value = Double(weatherOverrideTempMin.replacingOccurrences(of: ",", with: ".")) { additionalObject["weather_override_temp_min"] = .number(value) }
-        if let value = Double(weatherOverrideTempMax.replacingOccurrences(of: ",", with: ".")) { additionalObject["weather_override_temp_max"] = .number(value) }
-        if let value = Double(weatherOverrideTempAvg.replacingOccurrences(of: ",", with: ".")) { additionalObject["weather_override_temp_avg"] = .number(value) }
+        ]) { _, new in new }
+        if originalAdditionalFields["car_availability_enabled"] != nil {
+            additionalObject["car_availability_enabled"] = .bool(askCarAvailability)
+        }
+        if originalAdditionalFields["show_car_availability"] != nil {
+            additionalObject["show_car_availability"] = .bool(askCarAvailability)
+        }
+        additionalObject["weather_override_condition"] = weatherOverrideCondition.nilIfBlank.map { .string($0) } ?? .null
+        additionalObject["weather_override_temp_min"] = Double(weatherOverrideTempMin.replacingOccurrences(of: ",", with: ".")).map { .number($0) } ?? .null
+        additionalObject["weather_override_temp_max"] = Double(weatherOverrideTempMax.replacingOccurrences(of: ",", with: ".")).map { .number($0) } ?? .null
+        let averageOverride = Double(weatherOverrideTempAvg.replacingOccurrences(of: ",", with: "."))
+        additionalObject["weather_override_temp_avg"] = averageOverride.map { .number($0) } ?? .null
+        if originalAdditionalFields["weather_override_temp"] != nil {
+            additionalObject["weather_override_temp"] = averageOverride.map { .number($0) } ?? .null
+        }
         let validAccessRules = accessRules.filter { $0.type.nilIfBlank != nil }
-        var accessObject: [String: JSONValue] = [
-            "rules": .array(validAccessRules.map(\.jsonValue))
-        ]
-        if let value = exclusivityLabel.nilIfBlank { accessObject["exclusivity_label"] = .string(value) }
-        if let value = restrictionMessage.nilIfBlank { accessObject["restriction_message"] = .string(value) }
+        var accessObject = originalAccessRules
+        accessObject["rules"] = .array(validAccessRules.map(\.jsonValue))
+        accessObject["exclusivity_label"] = exclusivityLabel.nilIfBlank.map { .string($0) } ?? .null
+        accessObject["restriction_message"] = restrictionMessage.nilIfBlank.map { .string($0) } ?? .null
         let eventBadges = manualBadges + [customBadge.nilIfBlank].compactMap { $0 }
         let cleanDescription = EventDescriptionHTML.cleanStoredHTML(from: description).nilIfBlank ?? title
         let validPriceOptions = priceOptions.filter { $0.name.nilIfBlank != nil }
@@ -5039,7 +5057,7 @@ struct OrganizerEventDraft: Equatable {
             "gallery_images": .array(gallery),
             "equipment_list": .array(equipmentItems.filter { $0.name.nilIfBlank != nil }.map(\.jsonValue)),
             "additional_fields": .object(additionalObject),
-            "access_rules": validAccessRules.isEmpty ? .null : .object(accessObject),
+            "access_rules": validAccessRules.isEmpty && originalAccessRules.isEmpty ? .null : .object(accessObject),
             "event_badges": .array(eventBadges.map { .string($0) }),
             "status": .string(status)
         ]
@@ -6452,6 +6470,13 @@ extension JSONValue {
     var arrayValue: [JSONValue]? {
         if case .array(let values) = self {
             return values
+        }
+        return nil
+    }
+
+    var objectValue: [String: JSONValue]? {
+        if case .object(let object) = self {
+            return object
         }
         return nil
     }
