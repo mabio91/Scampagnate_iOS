@@ -9258,8 +9258,20 @@ struct EventDetailView: View {
         return ZStack(alignment: .bottomLeading) {
             RemoteImage(urlString: event.imageUrl)
                 .frame(width: width, height: heroHeight)
+                .saturation(event.isSoldOut ? 0 : 1)
                 .overlay {
-                    LinearGradient(colors: [.black.opacity(0.18), Brand.primary.opacity(0.96)], startPoint: .top, endPoint: .bottom)
+                    LinearGradient(
+                        colors: event.isSoldOut
+                            ? [.black.opacity(0.10), .black.opacity(0.74)]
+                            : [.black.opacity(0.18), Brand.primary.opacity(0.96)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                }
+                .overlay {
+                    if event.isSoldOut {
+                        SoldOutRibbon(fontSize: 18)
+                    }
                 }
             VStack {
                 HStack {
