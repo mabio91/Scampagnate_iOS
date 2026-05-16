@@ -2657,10 +2657,17 @@ struct SupabaseAPI {
         preserveExistingOrganizer: Bool = false,
         session: AuthSession
     ) async throws -> String {
+        let preservedEvent: Event?
+        if let existingEventId {
+            preservedEvent = try await fetchEvent(eventId: existingEventId, session: session)
+        } else {
+            preservedEvent = nil
+        }
         let payload = draft.eventPayload(
             organizerId: organizerId,
             organizerName: organizerName,
-            includeOrganizerFields: !(preserveExistingOrganizer && existingEventId != nil)
+            includeOrganizerFields: !(preserveExistingOrganizer && existingEventId != nil),
+            preservedEvent: preservedEvent
         )
         let eventId: String
         let data = try JSONEncoder().encode(payload)
@@ -4815,6 +4822,8 @@ struct OrganizerEventDraft: Equatable {
     var accessRules: [OrganizerAccessRuleDraft] = []
     private var originalAdditionalFields: [String: JSONValue] = [:]
     private var originalAccessRules: [String: JSONValue] = [:]
+    private var originalCustomBadge = ""
+    private var preservedEventBadges: [String] = []
 
     init() {}
 
@@ -4842,8 +4851,12 @@ struct OrganizerEventDraft: Equatable {
         visibility = duplicate ? "private" : (event.visibility ?? "public")
         status = duplicate ? "open" : Self.editableStatus(event.status)
         galleryImageURLs = event.gallery.compactMap(\.url)
-        manualBadges = (event.eventBadges ?? []).filter { OrganizerEventDraft.manualBadgeOptions.map(\.id).contains($0) }
-        customBadge = (event.eventBadges ?? []).first { !OrganizerEventDraft.manualBadgeOptions.map(\.id).contains($0) } ?? ""
+        let manualBadgeIds = Set(OrganizerEventDraft.manualBadgeOptions.map(\.id))
+        let nonManualBadges = (event.eventBadges ?? []).filter { !manualBadgeIds.contains($0) }
+        manualBadges = (event.eventBadges ?? []).filter { manualBadgeIds.contains($0) }
+        customBadge = nonManualBadges.first ?? ""
+        originalCustomBadge = customBadge
+        preservedEventBadges = Array(nonManualBadges.dropFirst())
         self.specialBadgeIds = duplicate ? [] : specialBadgeIds
         originalAdditionalFields = duplicate ? [:] : (event.additionalFields?.objectValue ?? [:])
         originalAccessRules = duplicate ? [:] : (event.accessRules?.objectValue ?? [:])
@@ -4983,7 +4996,7 @@ struct OrganizerEventDraft: Equatable {
         return messages
     }
 
-    func eventPayload(organizerId: String, organizerName: String, includeOrganizerFields: Bool = true) -> [String: JSONValue] {
+    func eventPayload(organizerId: String, organizerName: String, includeOrganizerFields: Bool = true, preservedEvent: Event? = nil) -> [String: JSONValue] {
         let normalizedDistance = distance.nilIfBlank.map { value in
             value.lowercased().contains("km") ? value : "\(value) km"
         }
@@ -4995,7 +5008,9 @@ struct OrganizerEventDraft: Equatable {
             JSONValue.object(["url": .string(url), "order": .number(Double(index))])
         }
         let customFieldValues = additionalFields.filter { $0.label.nilIfBlank != nil }.map(\.jsonValue)
-        var additionalObject = originalAdditionalFields
+        let preservedAdditionalFields = preservedEvent?.additionalFields?.objectValue ?? originalAdditionalFields
+        let preservedAccessRules = preservedEvent?.accessRules?.objectValue ?? originalAccessRules
+        var additionalObject = preservedAdditionalFields
         additionalObject.merge([
             "closing_sentence": closingSentenceMode == "random" ? .null : (closingSentence.nilIfBlank.map { .string($0) } ?? .null),
             "fit_score_main_category": fitScoreMainCategory.nilIfBlank.map { .string($0) } ?? .null,
@@ -5005,10 +5020,10 @@ struct OrganizerEventDraft: Equatable {
             "ask_car_availability": .bool(askCarAvailability),
             "waiting_list_enabled": .bool(waitingListEnabled)
         ]) { _, new in new }
-        if originalAdditionalFields["car_availability_enabled"] != nil {
+        if preservedAdditionalFields["car_availability_enabled"] != nil {
             additionalObject["car_availability_enabled"] = .bool(askCarAvailability)
         }
-        if originalAdditionalFields["show_car_availability"] != nil {
+        if preservedAdditionalFields["show_car_availability"] != nil {
             additionalObject["show_car_availability"] = .bool(askCarAvailability)
         }
         additionalObject["weather_override_condition"] = weatherOverrideCondition.nilIfBlank.map { .string($0) } ?? .null
@@ -5016,15 +5031,21 @@ struct OrganizerEventDraft: Equatable {
         additionalObject["weather_override_temp_max"] = Double(weatherOverrideTempMax.replacingOccurrences(of: ",", with: ".")).map { .number($0) } ?? .null
         let averageOverride = Double(weatherOverrideTempAvg.replacingOccurrences(of: ",", with: "."))
         additionalObject["weather_override_temp_avg"] = averageOverride.map { .number($0) } ?? .null
-        if originalAdditionalFields["weather_override_temp"] != nil {
+        if preservedAdditionalFields["weather_override_temp"] != nil {
             additionalObject["weather_override_temp"] = averageOverride.map { .number($0) } ?? .null
         }
         let validAccessRules = accessRules.filter { $0.type.nilIfBlank != nil }
-        var accessObject = originalAccessRules
+        var accessObject = preservedAccessRules
         accessObject["rules"] = .array(validAccessRules.map(\.jsonValue))
         accessObject["exclusivity_label"] = exclusivityLabel.nilIfBlank.map { .string($0) } ?? .null
         accessObject["restriction_message"] = restrictionMessage.nilIfBlank.map { .string($0) } ?? .null
-        let eventBadges = manualBadges + [customBadge.nilIfBlank].compactMap { $0 }
+        let manualBadgeIds = Set(Self.manualBadgeOptions.map(\.id))
+        let originalUnknownBadges = ([originalCustomBadge.nilIfBlank].compactMap { $0 } + preservedEventBadges)
+        let baseUnknownBadges = (preservedEvent?.eventBadges ?? originalUnknownBadges)
+            .filter { !manualBadgeIds.contains($0) }
+            .filter { $0 != originalCustomBadge }
+        let eventBadges = (manualBadges + baseUnknownBadges + [customBadge.nilIfBlank].compactMap { $0 })
+            .removingDuplicates()
         let cleanDescription = EventDescriptionHTML.cleanStoredHTML(from: description).nilIfBlank ?? title
         let validPriceOptions = priceOptions.filter { $0.name.nilIfBlank != nil }
         let legacyOption = validPriceOptions.first
@@ -5057,7 +5078,7 @@ struct OrganizerEventDraft: Equatable {
             "gallery_images": .array(gallery),
             "equipment_list": .array(equipmentItems.filter { $0.name.nilIfBlank != nil }.map(\.jsonValue)),
             "additional_fields": .object(additionalObject),
-            "access_rules": validAccessRules.isEmpty && originalAccessRules.isEmpty ? .null : .object(accessObject),
+            "access_rules": validAccessRules.isEmpty && preservedAccessRules.isEmpty ? .null : .object(accessObject),
             "event_badges": .array(eventBadges.map { .string($0) }),
             "status": .string(status)
         ]
