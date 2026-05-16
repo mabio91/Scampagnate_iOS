@@ -250,6 +250,15 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func refreshEventDetail(eventId: String) async {
+        guard session != nil else {
+            await loadPublicData(reportingErrors: false)
+            await loadParticipants(eventId: eventId)
+            return
+        }
+        await refreshEventState(participantEventId: eventId)
+    }
+
     func refreshEventClosingSentences(reportingErrors: Bool = false) async {
         do {
             updateEventClosingSentences(try await api.fetchEventClosingSentences(session: session))
@@ -513,12 +522,12 @@ final class AppStore: ObservableObject {
         }
     }
 
-    func resumeCheckout(for registration: Registration) async -> CheckoutResult? {
+    func resumeCheckout(for registration: Registration, event overrideEvent: Event? = nil) async -> CheckoutResult? {
         guard session != nil else {
             errorMessage = "Devi effettuare il login"
             return nil
         }
-        guard let event = registration.event else {
+        guard let event = overrideEvent ?? registration.event else {
             errorMessage = "Evento non disponibile"
             return nil
         }
@@ -545,6 +554,13 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func pendingCheckout(for registration: Registration, event: Event) -> PendingPayment? {
+        guard let pendingPayment, pendingPayment.matches(registration: registration, event: event) else {
+            return nil
+        }
+        return pendingPayment
+    }
+
     func completeWaitlistBooking(for registration: Registration) async -> Bool {
         guard session != nil else {
             errorMessage = "Devi effettuare il login"
@@ -562,7 +578,7 @@ final class AppStore: ObservableObject {
             let selectedOption = registration.priceOptionId.flatMap { optionId in
                 freshEvent.priceOptions.first { $0.id == optionId }
             }
-            let hasSpot = selectedOption?.isBookable(in: freshEvent) ?? (freshEvent.bookableSpots > 0)
+            let hasSpot = freshEvent.acceptsWaitlistCompletion && (selectedOption?.realRemainingSpots(in: freshEvent) ?? freshEvent.bookableSpots) > 0
             guard hasSpot else {
                 errorMessage = "Il posto è stato preso da un altro partecipante. Resti in lista d'attesa."
                 await refreshEventState(session: authSession, participantEventId: freshEvent.id)
@@ -3542,6 +3558,14 @@ struct Event: Codable, Identifiable, Hashable {
     var equipmentItems: [EquipmentItem] { equipmentList ?? [] }
     var hasEquipment: Bool { !equipmentItems.isEmpty }
     var hasEventTopBadge: Bool { featured == true || (eventBadges ?? []).contains("evento_top") }
+    var customBadgeText: String? {
+        (eventBadges ?? []).compactMap { badge -> String? in
+            let cleanBadge = badge.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanBadge.isEmpty, !Self.managedEventBadgeIds.contains(cleanBadge) else { return nil }
+            return cleanBadge
+        }
+        .first
+    }
     var displayLocation: String { locationLabel ?? location ?? "Luogo da definire" }
     var normalizedStatus: String { status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "open" }
     var displayPrice: String {
@@ -3579,6 +3603,9 @@ struct Event: Codable, Identifiable, Hashable {
         return priceOptions.contains { $0.canJoinWaitlist(in: self) }
     }
     var availabilityLabel: String {
+        if !acceptsRegistrations {
+            return statusStyle.label
+        }
         if isSoldOut && !shouldShowPublicCapacity {
             return "Sold out"
         }
@@ -3598,6 +3625,11 @@ struct Event: Codable, Identifiable, Hashable {
     var requiresOnlinePayment: Bool { paymentType == "paid" || paymentType == "deposit" }
     var acceptsRegistrations: Bool {
         guard ["available", "published", "open"].contains(normalizedStatus) else { return false }
+        guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return true }
+        return eventDate >= Calendar.current.startOfDay(for: Date())
+    }
+    var acceptsWaitlistCompletion: Bool {
+        guard ["available", "published", "open", "full"].contains(normalizedStatus) else { return false }
         guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return true }
         return eventDate >= Calendar.current.startOfDay(for: Date())
     }
@@ -5332,9 +5364,9 @@ private extension Registration {
     }
 
     func waitlistSpotAvailable(in event: Event) -> Bool {
-        guard normalizedStatus == "waitlist" else { return false }
+        guard normalizedStatus == "waitlist", event.acceptsWaitlistCompletion else { return false }
         if let option = priceOption(in: event) {
-            return option.isBookable(in: event)
+            return option.realRemainingSpots(in: event) > 0
         }
         return event.bookableSpots > 0
     }
@@ -6185,6 +6217,10 @@ struct PendingPayment: Codable {
     var isFresh: Bool {
         guard let createdAt else { return false }
         return Date().timeIntervalSince(createdAt) <= Self.maxAge
+    }
+
+    func matches(registration: Registration, event: Event) -> Bool {
+        isFresh && registrationId == registration.id && eventId == event.id
     }
 
     func save() {
@@ -7270,6 +7306,16 @@ struct ActiveCheckout: Identifiable {
     let url: URL
     let sessionId: String?
     let kind: CheckoutKind
+    let eventId: String?
+    let registrationId: String?
+
+    init(url: URL, sessionId: String?, kind: CheckoutKind, eventId: String? = nil, registrationId: String? = nil) {
+        self.url = url
+        self.sessionId = sessionId
+        self.kind = kind
+        self.eventId = eventId
+        self.registrationId = registrationId
+    }
 }
 
 struct PaymentAuthenticationView: View {
@@ -7364,6 +7410,11 @@ struct PaymentAuthenticationView: View {
     private func finish(_ feedback: AppFeedback) {
         guard !completed else { return }
         completed = true
+        if let eventId = checkout.eventId {
+            Task {
+                await store.refreshEventDetail(eventId: eventId)
+            }
+        }
         onComplete(feedback)
         dismiss()
     }
@@ -8830,10 +8881,6 @@ struct RecommendedEventsSection: View {
         min(300, max(238, availableWidth * 0.72))
     }
 
-    private var trailingInset: CGFloat {
-        16
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
@@ -8857,7 +8904,6 @@ struct RecommendedEventsSection: View {
                 }
                 .scrollTargetLayout()
                 .padding(.vertical, 2)
-                .padding(.trailing, trailingInset)
             }
             .contentMargins(.leading, 0, for: .scrollContent)
             .scrollClipDisabled(false)
@@ -9204,7 +9250,13 @@ struct EventDetailView: View {
                                 )
                             }
                             if let url = result.url {
-                                activeCheckout = ActiveCheckout(url: url, sessionId: result.sessionId, kind: result.kind)
+                                activeCheckout = ActiveCheckout(
+                                    url: url,
+                                    sessionId: result.sessionId,
+                                    kind: result.kind,
+                                    eventId: event.id,
+                                    registrationId: store.pendingPayment?.registrationId
+                                )
                             }
                             requestApprovalOverride = false
                         }
@@ -9286,8 +9338,7 @@ struct EventDetailView: View {
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .tabBar)
         .task(id: eventId) {
-            await store.refreshEventData(reportingErrors: false)
-            await store.loadParticipants(eventId: eventId)
+            await store.refreshEventDetail(eventId: eventId)
             openInitialParticipantsIfNeeded()
         }
         .task(id: event?.organizerId ?? "") {
@@ -9588,8 +9639,9 @@ struct EventDetailView: View {
                 }
                 Spacer()
                 if let registration {
-                    if registration.canResumePayment(in: event) {
-                        Button(paymentLoading ? "Attendere..." : registration.resumeActionTitle(in: event)) {
+                    let pendingCheckout = store.pendingCheckout(for: registration, event: event)
+                    if pendingCheckout != nil || registration.canResumePayment(in: event) {
+                        Button(paymentLoading ? "Attendere..." : resumeActionTitle(for: registration, event: event, pendingCheckout: pendingCheckout)) {
                             Task { await continueRegistration(registration, event: event) }
                         }
                         .buttonStyle(PrimaryButtonStyle(width: 170))
@@ -9662,6 +9714,17 @@ struct EventDetailView: View {
         paymentLoading = true
         defer { paymentLoading = false }
 
+        if let pendingCheckout = store.pendingCheckout(for: registration, event: event) {
+            activeCheckout = ActiveCheckout(
+                url: pendingCheckout.checkoutURL,
+                sessionId: pendingCheckout.sessionId,
+                kind: .eventPayment,
+                eventId: event.id,
+                registrationId: registration.id
+            )
+            return
+        }
+
         if registration.waitlistSpotAvailable(in: event), !registration.requiresOnlinePayment(in: event) {
             if await store.completeWaitlistBooking(for: registration) {
                 feedback = AppFeedback(title: "Prenotazione completata", message: "Il posto è tuo. Abbiamo aggiornato i tuoi eventi.", icon: "checkmark.seal.fill", tone: .success)
@@ -9669,13 +9732,24 @@ struct EventDetailView: View {
             return
         }
 
-        if let result = await store.resumeCheckout(for: registration) {
+        if let result = await store.resumeCheckout(for: registration, event: event) {
             if result.free {
                 feedback = AppFeedback(title: "Prenotazione completata", message: "Abbiamo aggiornato i tuoi eventi.", icon: "checkmark.seal.fill", tone: .success)
             } else if let url = result.url {
-                activeCheckout = ActiveCheckout(url: url, sessionId: result.sessionId, kind: result.kind)
+                activeCheckout = ActiveCheckout(url: url, sessionId: result.sessionId, kind: result.kind, eventId: event.id, registrationId: registration.id)
             }
         }
+    }
+
+    private func resumeActionTitle(for registration: Registration, event: Event, pendingCheckout: PendingPayment?) -> String {
+        guard pendingCheckout != nil else { return registration.resumeActionTitle(in: event) }
+        if registration.normalizedStatus == "deposit_paid" || registration.paymentStatus == "deposit_paid" {
+            return "Completa il saldo"
+        }
+        if registration.waitlistSpotAvailable(in: event) {
+            return registration.requiresOnlinePayment(in: event) ? "Completa prenotazione" : "Conferma il posto"
+        }
+        return registration.resumeActionTitle(in: event)
     }
 
     private func toggleSaved(_ event: Event) async {
@@ -9788,6 +9862,10 @@ struct EventPillsRow: View {
             if let difficulty = event.difficultyLabel {
                 CompactEventPill(text: difficulty.text, color: difficulty.background, foreground: difficulty.foreground)
                     .overlay(Capsule().stroke(difficulty.foreground.opacity(0.55), lineWidth: 1))
+            }
+
+            if let customBadge = event.customBadgeText {
+                CompactEventPill(text: customBadge, color: Brand.accent.opacity(0.16), foreground: Brand.accent)
             }
 
             CompactEventPill(text: categoryLabel(event.category), color: Brand.muted, foreground: Brand.mutedForeground)
@@ -13800,7 +13878,7 @@ struct EventRegistrationCard: View {
 
     private var canCompletePayment: Bool {
         guard showActions, let event, registration.normalizedStatus != "cancelled" else { return false }
-        return registration.canResumePayment(in: event)
+        return store.pendingCheckout(for: registration, event: event) != nil || registration.canResumePayment(in: event)
     }
 
     private var canEditDetails: Bool {
@@ -13874,7 +13952,7 @@ struct EventRegistrationCard: View {
                                 showCalendar = true
                             }
                             if canCompletePayment {
-                                MyEventActionButton(icon: "bolt.fill", title: registration.resumeActionTitle(in: event), tint: Brand.primary, isLoading: paymentLoading, isDisabled: paymentLoading) {
+                                MyEventActionButton(icon: "bolt.fill", title: resumeActionTitle(for: event), tint: Brand.primary, isLoading: paymentLoading, isDisabled: paymentLoading) {
                                     Task { await resumePayment() }
                                 }
                             }
@@ -13949,6 +14027,17 @@ struct EventRegistrationCard: View {
         paymentLoading = true
         defer { paymentLoading = false }
 
+        if let pendingCheckout = store.pendingCheckout(for: registration, event: event) {
+            activeCheckout = ActiveCheckout(
+                url: pendingCheckout.checkoutURL,
+                sessionId: pendingCheckout.sessionId,
+                kind: .eventPayment,
+                eventId: event.id,
+                registrationId: registration.id
+            )
+            return
+        }
+
         if registration.waitlistSpotAvailable(in: event), !registration.requiresOnlinePayment(in: event) {
             if await store.completeWaitlistBooking(for: registration) {
                 feedback = AppFeedback(title: "Prenotazione completata", message: "Il posto è tuo. Abbiamo aggiornato i tuoi eventi.", icon: "checkmark.seal.fill", tone: .success)
@@ -13956,13 +14045,26 @@ struct EventRegistrationCard: View {
             return
         }
 
-        if let result = await store.resumeCheckout(for: registration) {
+        if let result = await store.resumeCheckout(for: registration, event: event) {
             if result.free {
                 feedback = AppFeedback(title: "Prenotazione completata", message: "Abbiamo aggiornato i tuoi eventi.", icon: "checkmark.seal.fill", tone: .success)
             } else if let url = result.url {
-                activeCheckout = ActiveCheckout(url: url, sessionId: result.sessionId, kind: result.kind)
+                activeCheckout = ActiveCheckout(url: url, sessionId: result.sessionId, kind: result.kind, eventId: event.id, registrationId: registration.id)
             }
         }
+    }
+
+    private func resumeActionTitle(for event: Event) -> String {
+        guard store.pendingCheckout(for: registration, event: event) != nil else {
+            return registration.resumeActionTitle(in: event)
+        }
+        if registration.normalizedStatus == "deposit_paid" || registration.paymentStatus == "deposit_paid" {
+            return "Completa il saldo"
+        }
+        if registration.waitlistSpotAvailable(in: event) {
+            return registration.requiresOnlinePayment(in: event) ? "Completa prenotazione" : "Conferma il posto"
+        }
+        return registration.resumeActionTitle(in: event)
     }
 }
 
@@ -21872,7 +21974,7 @@ struct OrganizerPriceOptionEditor: View {
             if option.paymentType == "deposit" {
                 OrganizerEuroField("Acconto", value: depositAmountBinding)
                 HStack {
-                    Text("Saldo calcolato")
+                    Text("Saldo")
                         .font(.caption.weight(.bold))
                         .foregroundStyle(Brand.mutedForeground)
                     Spacer()
@@ -31171,6 +31273,14 @@ private extension Event {
         let total = hours * 60 + minutes
         return total > 0 ? total : nil
     }
+
+    private static let managedEventBadgeIds: Set<String> = [
+        "evento_top",
+        "best_seller",
+        "consigliato",
+        "prezzo_speciale",
+        "early_bird"
+    ]
 }
 
 private func formatDate(_ value: String?) -> String {
