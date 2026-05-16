@@ -114,6 +114,7 @@ final class AppStore: ObservableObject {
     @Published var missions: [MissionCardModel] = []
     @Published var badges: [UserBadge] = []
     @Published var allBadges: [BadgeDefinition] = []
+    @Published var eventClosingSentences: [String] = defaultEventClosingSentences
     @Published var communityLevels: [CommunityLevelDefinition] = []
     @Published var roles: Set<AppRole> = []
     @Published var organizerEvents: [Event] = []
@@ -157,6 +158,7 @@ final class AppStore: ObservableObject {
         async let categoriesTask = api.fetchCategories(session: session)
         async let productsTask = api.fetchProducts()
         async let allBadgesTask = api.fetchAllBadges()
+        async let closingSentencesTask = api.fetchEventClosingSentences(session: session)
         async let communityLevelsTask = api.fetchCommunityLevels()
 
         var firstError: Error?
@@ -164,6 +166,7 @@ final class AppStore: ObservableObject {
         do { categories = try await categoriesTask } catch { remember(error, in: &firstError) }
         do { products = try await productsTask } catch { remember(error, in: &firstError) }
         do { allBadges = try await allBadgesTask } catch { remember(error, in: &firstError) }
+        do { updateEventClosingSentences(try await closingSentencesTask) } catch { eventClosingSentences = defaultEventClosingSentences }
         do { communityLevels = try await communityLevelsTask } catch { remember(error, in: &firstError) }
 
         report(firstError, when: reportingErrors)
@@ -188,6 +191,7 @@ final class AppStore: ObservableObject {
             async let missionsTask = api.fetchMissionCards(session: authSession)
             async let badgesTask = api.fetchUserBadges(session: authSession)
             async let allBadgesTask = api.fetchAllBadges()
+            async let closingSentencesTask = api.fetchEventClosingSentences(session: authSession)
             async let communityLevelsTask = api.fetchCommunityLevels()
             async let rolesTask = api.fetchUserRoles(session: authSession)
 
@@ -203,6 +207,7 @@ final class AppStore: ObservableObject {
             do { missions = try await missionsTask } catch { remember(error, in: &firstError) }
             do { badges = try await badgesTask } catch { remember(error, in: &firstError) }
             do { allBadges = try await allBadgesTask } catch { remember(error, in: &firstError) }
+            do { updateEventClosingSentences(try await closingSentencesTask) } catch { eventClosingSentences = defaultEventClosingSentences }
             do { communityLevels = try await communityLevelsTask } catch { remember(error, in: &firstError) }
             do { roles = Set(try await rolesTask) } catch { remember(error, in: &firstError) }
 
@@ -243,6 +248,20 @@ final class AppStore: ObservableObject {
                 report(error, when: reportingErrors)
             }
         }
+    }
+
+    func refreshEventClosingSentences(reportingErrors: Bool = false) async {
+        do {
+            updateEventClosingSentences(try await api.fetchEventClosingSentences(session: session))
+        } catch {
+            eventClosingSentences = defaultEventClosingSentences
+            report(error, when: reportingErrors)
+        }
+    }
+
+    private func updateEventClosingSentences(_ values: [String]) {
+        let cleaned = values.compactMap { $0.normalizedClosingSentence.nilIfBlank }
+        eventClosingSentences = cleaned.isEmpty ? defaultEventClosingSentences : cleaned
     }
 
     func signIn(email: String, password: String) async -> Bool {
@@ -1964,6 +1983,12 @@ struct SupabaseAPI {
         try await request(path: "/rest/v1/event_categories?select=*&order=sort_order.asc", method: "GET", bodyData: nil, auth: session, decode: [EventCategory].self)
     }
 
+    func fetchEventClosingSentences(session: AuthSession?) async throws -> [String] {
+        let path = "/rest/v1/event_closing_sentences?select=sentence&is_active=eq.true&order=sort_order.asc&order=sentence.asc"
+        let rows = try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [EventClosingSentenceRow].self)
+        return rows.map(\.sentence)
+    }
+
     func fetchOrganizerEvents(session: AuthSession, includeAll: Bool = false) async throws -> [Event] {
         var path = "/rest/v1/events?select=\(Self.eventSelect.urlEncoded)&order=date.asc"
         if !includeAll {
@@ -3202,6 +3227,10 @@ struct UserRoleRow: Decodable {
 struct OrganizerOwnerRoleRow: Decodable {
     let userId: String
     let role: AppRole
+}
+
+struct EventClosingSentenceRow: Decodable {
+    let sentence: String
 }
 
 struct AuthResponse: Decodable {
@@ -4820,7 +4849,7 @@ struct OrganizerEventDraft: Equatable {
         if duplicate || savedClosingSentence.nilIfBlank == nil {
             closingSentenceMode = "random"
             closingSentence = ""
-        } else if eventClosingSentences.contains(savedClosingSentence) {
+        } else if defaultEventClosingSentences.contains(savedClosingSentence) {
             closingSentenceMode = "preset"
             closingSentence = savedClosingSentence
         } else {
@@ -6469,7 +6498,8 @@ extension JSONValue {
 // MARK: - Root
 
 private enum AppChrome {
-    static let topSafeAreaClearance: CGFloat = 6
+    static let topSafeAreaClearance: CGFloat = 14
+    static let navigationGlassBleed: CGFloat = 14
 }
 
 struct RootView: View {
@@ -6935,7 +6965,7 @@ private struct StatusBarShield: View {
     var body: some View {
         GeometryReader { proxy in
             Brand.background
-                .frame(height: proxy.safeAreaInsets.top)
+                .frame(height: proxy.safeAreaInsets.top + AppChrome.navigationGlassBleed)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .ignoresSafeArea(edges: .top)
         }
@@ -16118,29 +16148,139 @@ private struct OrganizerEventBoardFilterBar: View {
     }
 }
 
+private enum OrganizerStatTileStyle {
+    case metric
+    case filter
+    case analytics
+}
+
+private struct OrganizerStatTile: View {
+    let style: OrganizerStatTileStyle
+    let title: String
+    let value: String
+    let subtitle: String
+    let icon: String
+    var tint: Color = Brand.primary
+    var isSelected = false
+    var progress: Double?
+
+    private var clampedProgress: Double {
+        guard let progress else { return 0 }
+        return min(max(progress, 0), 1)
+    }
+
+    private var foreground: Color {
+        isSelected ? .white : Brand.foreground
+    }
+
+    private var mutedForeground: Color {
+        isSelected ? .white.opacity(0.88) : Brand.mutedForeground
+    }
+
+    private var iconForeground: Color {
+        isSelected ? .white : tint
+    }
+
+    var body: some View {
+        switch style {
+        case .metric:
+            VStack(spacing: 7) {
+                Image(systemName: icon)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(tint)
+                Text(value)
+                    .font(.system(.title3, design: .rounded, weight: .bold))
+                    .foregroundStyle(Brand.foreground)
+                Text(subtitle)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Brand.mutedForeground)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+            .statTileSurface()
+        case .filter:
+            VStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(iconForeground)
+                    .frame(height: 18)
+                Text(value)
+                    .font(.system(.headline, design: .rounded, weight: .bold))
+                    .foregroundStyle(foreground)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(mutedForeground)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 74)
+            .statTileSurface(tint: tint, isSelected: isSelected)
+        case .analytics:
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: icon)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(tint)
+                        .frame(width: 26, height: 26)
+                        .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                    Text(title)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.mutedForeground)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                    Spacer(minLength: 0)
+                }
+
+                Text(value)
+                    .font(.system(.title2, design: .rounded, weight: .bold))
+                    .foregroundStyle(Brand.foreground)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+
+                Text(subtitle)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Brand.mutedForeground)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Brand.muted.opacity(0.75))
+                        if progress != nil {
+                            Capsule()
+                                .fill(tint)
+                                .frame(width: proxy.size.width * clampedProgress)
+                        }
+                    }
+                }
+                .frame(height: 6)
+                .opacity(progress == nil ? 0 : 1)
+            }
+            .frame(maxWidth: .infinity, minHeight: 132, alignment: .leading)
+            .padding(12)
+            .statTileSurface()
+        }
+    }
+}
+
+private extension View {
+    func statTileSurface(tint: Color = Brand.primary, isSelected: Bool = false) -> some View {
+        background(isSelected ? tint : Brand.card, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(isSelected ? tint : Brand.muted, lineWidth: 1))
+    }
+}
+
 struct OrganizerMetricCard: View {
     let title: String
     let subtitle: String
     let icon: String
 
     var body: some View {
-        VStack(spacing: 7) {
-            Image(systemName: icon)
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(Brand.primary)
-            Text(title)
-                .font(.system(.title3, design: .rounded, weight: .bold))
-                .foregroundStyle(Brand.foreground)
-            Text(subtitle)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(Brand.mutedForeground)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 14)
-        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+        OrganizerStatTile(style: .metric, title: subtitle, value: title, subtitle: subtitle, icon: icon)
     }
 }
 
@@ -16498,7 +16638,8 @@ struct OrganizerEventManageView: View {
     @State private var confirmation: OrganizerEventManageConfirmation?
     @State private var showStatusSheet = false
     @State private var showOwnerPicker = false
-    @State private var shareText: String?
+    @State private var sharePayload: SharePayload?
+    @State private var exportingCSV = false
 
     private var activeRegistrations: [OrganizerRegistration] {
         registrations.filter(\.isActive)
@@ -16589,11 +16730,8 @@ struct OrganizerEventManageView: View {
                 }
             }
         }
-        .sheet(item: Binding(
-            get: { shareText.map(ShareText.init(value:)) },
-            set: { shareText = $0?.value }
-        )) { item in
-            ShareSheet(activityItems: [item.value])
+        .sheet(item: $sharePayload) { item in
+            ShareSheet(activityItems: item.activityItems)
         }
         .alert(item: $confirmation) { confirmation in
             Alert(
@@ -16697,7 +16835,8 @@ struct OrganizerEventManageView: View {
                 onPayment: updatePayment,
                 onMeetingPoint: updateMeetingPoint,
                 onPriceOption: updatePriceOption,
-                onExport: exportCSV
+                onExport: exportCSV,
+                isExporting: exportingCSV
             )
         case 1:
             OrganizerCheckInSection(registrations: activeRegistrations, meetingPoints: meetingPoints, onToggleCheckIn: toggleCheckIn)
@@ -16895,14 +17034,57 @@ struct OrganizerEventManageView: View {
     }
 
     private func exportCSV() {
+        guard !exportingCSV else { return }
+        exportingCSV = true
+        let snapshot = registrations
+        let meetingPointsSnapshot = meetingPoints
+        let eventTitle = event?.title ?? "evento"
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let fileURL = try OrganizerParticipantCSVExporter.writeCSV(
+                    eventTitle: eventTitle,
+                    registrations: snapshot,
+                    meetingPoints: meetingPointsSnapshot
+                )
+                DispatchQueue.main.async {
+                    self.exportingCSV = false
+                    self.sharePayload = SharePayload(activityItems: [fileURL])
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.exportingCSV = false
+                    self.store.errorMessage = "Non sono riuscito a generare il CSV. Riprova tra poco."
+                }
+            }
+        }
+    }
+}
+
+struct SharePayload: Identifiable {
+    let id = UUID()
+    let activityItems: [Any]
+}
+
+private enum OrganizerParticipantCSVExporter {
+    static func writeCSV(eventTitle: String, registrations: [OrganizerRegistration], meetingPoints: [MeetingPoint]) throws -> URL {
+        let csv = makeCSV(registrations: registrations, meetingPoints: meetingPoints)
+        let filename = "partecipanti-\(safeFilenameComponent(eventTitle))-\(UUID().uuidString.prefix(8)).csv"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+        try csv.write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    private static func makeCSV(registrations: [OrganizerRegistration], meetingPoints: [MeetingPoint]) -> String {
         let header = "Nome,Cognome,Telefono,Livello,Formula,Stato,Pagamento,Importo pagato,Rimborso,Ritrovo,Check-in,Registrato"
+        let meetingPointNames = Dictionary(uniqueKeysWithValues: meetingPoints.map { ($0.id, $0.name ?? "") })
         let rows = registrations.map { registration in
-            let meetingPoint = meetingPoints.first { $0.id == registration.meetingPointId }?.name ?? ""
+            let meetingPoint = registration.meetingPointId.flatMap { meetingPointNames[$0] } ?? ""
             let firstName = registration.isManual ? (registration.manualName ?? registration.displayName) : (registration.profiles?.firstName ?? "")
             let lastName = registration.isManual ? "(manual)" : (registration.profiles?.lastName ?? "")
             return [
-                firstName.nilIfBlank?.csvEscaped ?? "-".csvEscaped,
-                lastName.nilIfBlank?.csvEscaped ?? "-".csvEscaped,
+                (firstName.nilIfBlank ?? "-").csvEscaped,
+                (lastName.nilIfBlank ?? "-").csvEscaped,
                 (registration.isManual ? "-" : (registration.profiles?.phone ?? "-")).csvEscaped,
                 (registration.isManual ? "-" : (registration.sportLevel ?? "-")).csvEscaped,
                 (registration.priceOption?.displayName ?? "-").csvEscaped,
@@ -16915,18 +17097,30 @@ struct OrganizerEventManageView: View {
                 formattedRegistrationDate(registration.createdAt).csvEscaped
             ].joined(separator: ",")
         }
-        shareText = ([header] + rows).joined(separator: "\n")
+        return ([header] + rows).joined(separator: "\n")
     }
 
-    private func formattedRegistrationDate(_ value: String?) -> String {
+    private static func formattedRegistrationDate(_ value: String?) -> String {
         guard let date = value?.iso8601Date else { return value?.nilIfBlank ?? "-" }
-        return DateFormatter.registrationCSV.string(from: date)
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "it_IT")
+        formatter.dateFormat = "dd/MM/yyyy HH:mm"
+        return formatter.string(from: date)
     }
-}
 
-struct ShareText: Identifiable {
-    let id = UUID()
-    let value: String
+    private static func safeFilenameComponent(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let cleaned = value
+            .lowercased()
+            .unicodeScalars
+            .map { allowed.contains($0) ? Character(String($0)) : "-" }
+        let compact = String(cleaned)
+            .split(separator: "-")
+            .joined(separator: "-")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return compact.nilIfBlank ?? "evento"
+    }
 }
 
 struct OrganizerManageHero: View {
@@ -17276,6 +17470,7 @@ struct OrganizerParticipantsSection: View {
     let onMeetingPoint: (OrganizerRegistration, String?) -> Void
     let onPriceOption: (OrganizerRegistration, String?) -> Void
     let onExport: () -> Void
+    let isExporting: Bool
 
     @State private var selectedParticipantFilter = "__all_participants__"
     @State private var selectedPriceOptionFilter = "__all_price_options__"
@@ -17391,13 +17586,13 @@ struct OrganizerParticipantsSection: View {
                         .foregroundStyle(Brand.foreground)
                     Spacer()
                     Button(action: onExport) {
-                        Label("CSV", systemImage: "square.and.arrow.down")
+                        Label(isExporting ? "CSV..." : "CSV", systemImage: "square.and.arrow.down")
                     }
                     .font(.caption.weight(.bold))
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .tint(Brand.primary)
-                    .disabled(registrations.isEmpty)
+                    .disabled(registrations.isEmpty || isExporting)
                     Picker("Filtro", selection: $selectedParticipantFilter) {
                         Text("Tutti").tag(Self.allParticipantFilter)
                         Text("Per formula").tag(Self.optionParticipantFilter)
@@ -17609,25 +17804,15 @@ private struct OrganizerParticipantFilterCard: View {
 
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(isSelected ? .white : tint)
-                    .frame(height: 18)
-                Text(title)
-                    .font(.system(.headline, design: .rounded, weight: .bold))
-                    .foregroundStyle(isSelected ? .white : Brand.foreground)
-                    .lineLimit(1)
-                Text(subtitle)
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(isSelected ? .white.opacity(0.88) : Brand.mutedForeground)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-            }
-            .frame(maxWidth: .infinity)
-            .frame(height: 74)
-            .background(isSelected ? tint : Brand.card, in: RoundedRectangle(cornerRadius: 16))
-            .overlay(RoundedRectangle(cornerRadius: 16).stroke(isSelected ? tint : Brand.muted, lineWidth: 1))
+            OrganizerStatTile(
+                style: .filter,
+                title: subtitle,
+                value: title,
+                subtitle: subtitle,
+                icon: icon,
+                tint: tint,
+                isSelected: isSelected
+            )
         }
         .buttonStyle(.plain)
         .accessibilityLabel("\(subtitle): \(title)")
@@ -18219,56 +18404,16 @@ private struct OrganizerAnalyticsMetricCard: View {
     let tint: Color
     var progress: Double?
 
-    private var clampedProgress: Double {
-        guard let progress else { return 0 }
-        return min(max(progress, 0), 1)
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: icon)
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(tint)
-                    .frame(width: 26, height: 26)
-                    .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
-                Text(title)
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(Brand.mutedForeground)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
-                Spacer(minLength: 0)
-            }
-
-            Text(value)
-                .font(.system(.title2, design: .rounded, weight: .bold))
-                .foregroundStyle(Brand.foreground)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-
-            Text(subtitle)
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(Brand.mutedForeground)
-                .lineLimit(1)
-                .minimumScaleFactor(0.72)
-
-            GeometryReader { proxy in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Brand.muted.opacity(0.75))
-                    if progress != nil {
-                        Capsule()
-                            .fill(tint)
-                            .frame(width: proxy.size.width * clampedProgress)
-                    }
-                }
-            }
-            .frame(height: 6)
-            .opacity(progress == nil ? 0 : 1)
-        }
-        .frame(maxWidth: .infinity, minHeight: 132, alignment: .leading)
-        .padding(12)
-        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+        OrganizerStatTile(
+            style: .analytics,
+            title: title,
+            value: value,
+            subtitle: subtitle,
+            icon: icon,
+            tint: tint,
+            progress: progress
+        )
     }
 }
 
@@ -19671,22 +19816,33 @@ struct OrganizerEventEditorView: View {
                                 }
                             }
                             Field("Badge custom", text: $draft.customBadge)
-                            Picker("Frase conclusiva", selection: $draft.closingSentenceMode) {
-                                Text("Random").tag("random")
-                                Text("Scegli frase").tag("preset")
-                                Text("Frase manuale").tag("manual")
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("Frase conclusiva")
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundStyle(Brand.foreground)
+                                Picker("Frase conclusiva", selection: $draft.closingSentenceMode) {
+                                    Text("Random").tag("random")
+                                    Text("Scegli frase").tag("preset")
+                                    Text("Frase manuale").tag("manual")
+                                }
+                                .editableControlSurface()
+                                Text("Scegli una frase salvata, lasciala casuale o inseriscila manualmente.")
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.mutedForeground)
                             }
-                            .editableControlSurface()
                             if draft.closingSentenceMode == "preset" {
+                                Text("Frase salvata")
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundStyle(Brand.foreground)
                                 Picker("Frase", selection: $draft.closingSentence) {
-                                    ForEach(eventClosingSentences, id: \.self) { sentence in
+                                    ForEach(closingSentenceOptions, id: \.self) { sentence in
                                         Text(sentence).tag(sentence)
                                     }
                                 }
                                 .editableControlSurface()
                                 .onAppear {
-                                    if draft.closingSentence.nilIfBlank == nil {
-                                        draft.closingSentence = eventClosingSentences[0]
+                                    if draft.closingSentence.nilIfBlank == nil, let firstSentence = closingSentenceOptions.first {
+                                        draft.closingSentence = firstSentence
                                     }
                                 }
                             } else if draft.closingSentenceMode == "manual" {
@@ -19915,6 +20071,14 @@ struct OrganizerEventEditorView: View {
         return "Salva"
     }
 
+    private var closingSentenceOptions: [String] {
+        var values = store.eventClosingSentences
+        if let selected = draft.closingSentence.nilIfBlank, !values.contains(selected) {
+            values.append(selected)
+        }
+        return values
+    }
+
     private func keyboardHeight(from notification: Notification) -> CGFloat {
         guard let frame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else {
             return 0
@@ -19929,6 +20093,7 @@ struct OrganizerEventEditorView: View {
         specialBadges = await badgesTask
         allBadges = store.allBadges.isEmpty ? specialBadges : store.allBadges
         equipmentTemplates = await equipmentTemplatesTask
+        await store.refreshEventClosingSentences(reportingErrors: false)
         switch route.mode {
         case .create:
             break
@@ -29890,6 +30055,7 @@ private extension View {
                         .minimumScaleFactor(0.78)
                 }
             }
+            .toolbarBackground(.visible, for: .navigationBar)
     }
 
     func editableControlSurface(cornerRadius: CGFloat = 14) -> some View {
@@ -31596,7 +31762,7 @@ private extension Array where Element: Hashable {
     }
 }
 
-private let eventClosingSentences = [
+private let defaultEventClosingSentences = [
     "Porta leggerezza, al resto pensiamo noi",
     "Una community che arriva per i sentieri... e resta per le persone",
     "Il difficile è venire. Poi non vorrai più andare via",
@@ -31609,7 +31775,7 @@ private func deterministicClosingSentence(seed: String) -> String {
     let hash = seed.enumerated().reduce(0) { partial, pair in
         partial + Int(pair.element.unicodeScalars.first?.value ?? 0) * (pair.offset + 1)
     }
-    return eventClosingSentences[hash % eventClosingSentences.count]
+    return defaultEventClosingSentences[hash % defaultEventClosingSentences.count]
 }
 
 private func normalizeInterestCategory(_ value: String?) -> String? {
