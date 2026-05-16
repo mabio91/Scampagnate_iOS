@@ -19843,6 +19843,7 @@ struct OrganizerEventEditorView: View {
                             .buttonStyle(SecondaryButtonStyle())
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(16)
                     .padding(.bottom, keyboardInset > 0 ? keyboardInset + 16 : 0)
                 }
@@ -20399,12 +20400,14 @@ private struct OrganizerRichTextEditor: View {
                 toolbar
                 Divider().overlay(Brand.inputBorder)
                 OrganizerRichTextTextView(html: $html, controller: controller)
-                    .frame(minHeight: 230)
+                    .frame(maxWidth: .infinity, minHeight: 230, alignment: .leading)
                     .padding(10)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 14))
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.inputBorder, lineWidth: 1))
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .alert("Link", isPresented: $showingLinkPrompt) {
             TextField("URL", text: $pendingLink)
             Button("Applica") {
@@ -20515,6 +20518,7 @@ private struct OrganizerRichTextEditor: View {
             }
             .padding(10)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var toolbarDivider: some View {
@@ -20567,6 +20571,8 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
         webView.scrollView.backgroundColor = .clear
         webView.scrollView.keyboardDismissMode = .interactive
         webView.scrollView.alwaysBounceVertical = true
+        webView.scrollView.alwaysBounceHorizontal = false
+        webView.scrollView.isDirectionalLockEnabled = true
         webView.scrollView.showsHorizontalScrollIndicator = false
         webView.scrollView.contentInset = .zero
         webView.scrollView.contentInsetAdjustmentBehavior = .never
@@ -20644,6 +20650,9 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
         html, body {
           margin: 0;
           padding: 0;
+          width: 100%;
+          max-width: 100%;
+          box-sizing: border-box;
           background: transparent;
           min-height: 100%;
           overflow-x: hidden;
@@ -20656,9 +20665,13 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
           -webkit-font-smoothing: antialiased;
         }
         #editor {
+          width: 100%;
+          max-width: 100%;
+          box-sizing: border-box;
           min-height: 210px;
           outline: none;
           overflow-wrap: anywhere;
+          word-break: break-word;
           -webkit-user-select: text;
           user-select: text;
         }
@@ -20713,6 +20726,7 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
         img {
           display: block;
           max-width: 100%;
+          box-sizing: border-box;
           height: auto;
           border-radius: 14px;
           margin: 14px 0;
@@ -21671,6 +21685,7 @@ struct OrganizerEditorSection<Content: View>: View {
         .padding(14)
         .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
