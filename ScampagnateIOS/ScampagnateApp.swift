@@ -2382,7 +2382,7 @@ struct SupabaseAPI {
     }
 
     func fetchRewards(session: AuthSession) async throws -> [Reward] {
-        let select = "*,missions(title,icon,category),source_reward:mission_rewards!user_rewards_source_mission_reward_id_fkey(title,reward_kind,physical_config,badges(name,icon,description))"
+        let select = "*,missions(title,icon,category,mission_rewards(title,reward_kind,physical_config)),source_reward:mission_rewards!user_rewards_source_mission_reward_id_fkey(title,reward_kind,physical_config,badges(name,icon,description))"
         let path = "/rest/v1/user_rewards?select=\(select.urlEncoded)&user_id=eq.\(session.user.id)&order=created_at.desc"
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [Reward].self)
     }
@@ -5630,6 +5630,7 @@ struct MissionInfo: Codable {
     let title: String?
     let icon: String?
     let category: String?
+    let missionRewards: [SourceMissionReward]?
 }
 
 struct SourceMissionReward: Codable {
@@ -5679,6 +5680,16 @@ private extension Reward {
 
     var normalizedType: String {
         type?.nilIfBlank?.lowercased() ?? ""
+    }
+
+    var physicalRewardConfig: PhysicalRewardConfig? {
+        let missionConfigs = missions?.missionRewards?
+            .filter { $0.rewardKind?.lowercased() == "physical" }
+            .compactMap(\.physicalConfig) ?? []
+        let configs = [sourceReward?.physicalConfig].compactMap { $0 } + missionConfigs
+
+        return configs.first { $0.claimInstructions?.nilIfBlank != nil }
+            ?? configs.first { $0.rewardName?.nilIfBlank != nil }
     }
 
     var effectiveStatus: String {
@@ -5742,7 +5753,7 @@ private extension Reward {
         case .coupon:
             return cleanTitle ?? "Coupon disponibile"
         case .physical:
-            return cleanTitle ?? "Premio"
+            return physicalRewardConfig?.rewardName?.nilIfBlank ?? cleanTitle ?? "Premio"
         case .other:
             return cleanTitle ?? "Ricompensa"
         }
@@ -23945,10 +23956,10 @@ struct RewardDetailItem: Identifiable {
             self.copyCode = reward.effectiveStatus == "active" ? code : nil
         case .physical:
             self.valueLabel = "Premio"
-            self.valueText = reward.value?.nilIfBlank
+            self.valueText = reward.physicalRewardConfig?.rewardName?.nilIfBlank
             self.sourceLabel = "Ottenuto grazie a"
             self.sourceText = reward.earnedDescription
-            let claimInstructions = reward.sourceReward?.physicalConfig?.claimInstructions?.nilIfBlank
+            let claimInstructions = reward.physicalRewardConfig?.claimInstructions?.nilIfBlank ?? reward.value?.nilIfBlank
             self.helpLabel = claimInstructions == nil ? "Nota" : "Istruzioni di riscatto"
             self.helpText = claimInstructions ?? (reward.effectiveStatus == "pending" ? "Potrai ritirarlo al prossimo evento." : nil)
             self.copyCode = nil
