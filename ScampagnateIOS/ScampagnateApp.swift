@@ -22825,7 +22825,7 @@ struct ProfileCompletenessCard: View {
 struct MembershipCard: View {
     @EnvironmentObject private var store: AppStore
     let profile: Profile
-    @State private var benefitsExpanded = true
+    @State private var benefitsExpanded = false
     @State private var isGeneratingWalletPass = false
     @State private var walletPassPayload: WalletPassPayload?
 
