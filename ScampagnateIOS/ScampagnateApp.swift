@@ -5692,6 +5692,10 @@ private extension Reward {
             ?? configs.first { $0.rewardName?.nilIfBlank != nil }
     }
 
+    var physicalClaimInstructions: String? {
+        physicalRewardConfig?.claimInstructions?.nilIfBlank ?? value?.nilIfBlank
+    }
+
     var effectiveStatus: String {
         let rawStatus = status?.nilIfBlank?.lowercased() ?? "active"
         if rawStatus == "active",
@@ -5784,6 +5788,12 @@ private extension Reward {
         case .other:
             return missions?.title?.nilIfBlank ?? value?.nilIfBlank ?? "Ricompensa ottenuta"
         }
+    }
+
+    var summaryDescription: String? {
+        guard let description = displayDescription.nilIfBlank else { return nil }
+        guard kind == .physical || kind == .other else { return description }
+        return description == physicalClaimInstructions ? nil : description
     }
 
     var badgeIconValue: String? {
@@ -23748,10 +23758,12 @@ struct RewardCard: View {
                     RewardStatusPill(text: reward.statusStyle.label, color: reward.statusStyle.color)
                 }
 
-                Text(reward.displayDescription)
-                    .font(.caption2)
-                    .foregroundStyle(Brand.mutedForeground)
-                    .lineLimit(2)
+                if let description = reward.summaryDescription {
+                    Text(description)
+                        .font(.caption2)
+                        .foregroundStyle(Brand.mutedForeground)
+                        .lineLimit(2)
+                }
 
                 if reward.kind == .coupon, let code = reward.value?.nilIfBlank {
                     HStack(spacing: 8) {
@@ -23899,7 +23911,7 @@ struct RewardStatusPill: View {
 struct RewardDetailItem: Identifiable {
     let id: String
     let title: String
-    let subtitle: String
+    let subtitle: String?
     let iconName: String?
     let badgeIcon: String?
     let accentColor: Color
@@ -23918,7 +23930,7 @@ struct RewardDetailItem: Identifiable {
     init(reward: Reward) {
         self.id = "reward-\(reward.id)"
         self.title = reward.displayTitle
-        self.subtitle = reward.displayDescription
+        self.subtitle = reward.summaryDescription
         self.iconName = reward.badgeIconValue == nil ? reward.iconName : nil
         self.badgeIcon = reward.badgeIconValue
         self.accentColor = reward.accentColor
@@ -23959,7 +23971,7 @@ struct RewardDetailItem: Identifiable {
             self.valueText = reward.physicalRewardConfig?.rewardName?.nilIfBlank
             self.sourceLabel = "Ottenuto grazie a"
             self.sourceText = reward.earnedDescription
-            let claimInstructions = reward.physicalRewardConfig?.claimInstructions?.nilIfBlank ?? reward.value?.nilIfBlank
+            let claimInstructions = reward.physicalClaimInstructions
             self.helpLabel = claimInstructions == nil ? "Nota" : "Istruzioni di riscatto"
             self.helpText = claimInstructions ?? (reward.effectiveStatus == "pending" ? "Potrai ritirarlo al prossimo evento." : nil)
             self.copyCode = nil
@@ -24027,10 +24039,12 @@ struct RewardDetailSheet: View {
                             }
                         }
 
-                        Text(detail.subtitle)
-                            .font(.subheadline)
-                            .foregroundStyle(Brand.mutedForeground)
-                            .fixedSize(horizontal: false, vertical: true)
+                        if let subtitle = detail.subtitle {
+                            Text(subtitle)
+                                .font(.subheadline)
+                                .foregroundStyle(Brand.mutedForeground)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
 
                         VStack(alignment: .leading, spacing: 10) {
                             if let categoryText = detail.categoryText {
