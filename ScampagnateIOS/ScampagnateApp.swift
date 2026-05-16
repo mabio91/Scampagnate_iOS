@@ -2382,7 +2382,7 @@ struct SupabaseAPI {
     }
 
     func fetchRewards(session: AuthSession) async throws -> [Reward] {
-        let select = "*,missions(title,icon,category),source_reward:mission_rewards!user_rewards_source_mission_reward_id_fkey(title,reward_kind,badges(name,icon,description))"
+        let select = "*,missions(title,icon,category),source_reward:mission_rewards!user_rewards_source_mission_reward_id_fkey(title,reward_kind,physical_config,badges(name,icon,description))"
         let path = "/rest/v1/user_rewards?select=\(select.urlEncoded)&user_id=eq.\(session.user.id)&order=created_at.desc"
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [Reward].self)
     }
@@ -2414,7 +2414,7 @@ struct SupabaseAPI {
             decode: [UserMissionProgress].self
         )
         async let activeTask: [ActiveMissionDefinition] = request(
-            path: "/rest/v1/missions?select=id,title,description,target_value,reward_points,type,icon,reward_type,reward_value,category,target_action,expires_at,mission_rewards(id,reward_kind,points_value,title,sort_order,visible_on_profile,badges(name,icon))&is_active=eq.true&status=eq.active&visibility=eq.visible&is_archived=eq.false&order=sort_order.asc&order=created_at.asc",
+            path: "/rest/v1/missions?select=id,title,description,target_value,reward_points,type,icon,reward_type,reward_value,category,target_action,expires_at,mission_rewards(id,reward_kind,points_value,title,sort_order,visible_on_profile,physical_config,badges(name,icon))&is_active=eq.true&status=eq.active&visibility=eq.visible&is_archived=eq.false&order=sort_order.asc&order=created_at.asc",
             method: "GET",
             bodyData: nil,
             auth: session,
@@ -2763,7 +2763,7 @@ struct SupabaseAPI {
                 "balance_payment_mode": option.paymentType == "deposit" ? .string(option.balancePaymentMode) : .null,
                 "has_dedicated_spots": .bool(option.hasDedicatedSpots),
                 "dedicated_spots": option.hasDedicatedSpots ? .number(Double(option.dedicatedSpots)) : .null,
-                "waitlist_enabled": .bool(option.waitlistEnabled)
+                "waitlist_enabled": .bool(false)
             ]
             let data = try JSONEncoder().encode(payload)
             if let serverId = option.serverId {
@@ -2920,9 +2920,6 @@ struct SupabaseAPI {
         let shouldWaitlist = input.asWaitlist || !optionIsBookable
         if shouldWaitlist && !event.hasWaitlistParticipationOption {
             throw AppError.message("La lista d'attesa non è attiva per questo evento.")
-        }
-        if shouldWaitlist, let selectedOption, selectedOption.waitlistEnabled == false {
-            throw AppError.message("Questa formula non ha lista d'attesa attiva.")
         }
         let paymentType = selectedOption?.effectivePaymentType(fallback: event) ?? event.paymentType ?? "free"
         let requiresOnlinePayment = selectedOption?.requiresOnlinePayment(fallback: event) ?? event.requiresOnlinePayment
@@ -4166,7 +4163,7 @@ struct PriceOption: Codable, Identifiable, Hashable {
 
     func canJoinWaitlist(in event: Event) -> Bool {
         guard event.acceptsRegistrations, event.isSoldOut || realRemainingSpots(in: event) <= 0 else { return false }
-        return !isBookable(in: event) && (waitlistEnabled == true || event.waitingListEnabled)
+        return !isBookable(in: event) && event.waitingListEnabled
     }
 
     func availabilityText(in event: Event) -> String {
@@ -4833,7 +4830,7 @@ struct OrganizerEventDraft: Equatable {
     var fitScoreSecondaryCategories: [String] = []
     var closingSentenceMode = "random"
     var closingSentence = ""
-    var waitingListEnabled = false
+    var waitingListEnabled = true
     var askCarAvailability = false
     var weatherOverrideCondition = ""
     var weatherOverrideTempMin = ""
@@ -5638,7 +5635,15 @@ struct MissionInfo: Codable {
 struct SourceMissionReward: Codable {
     let title: String?
     let rewardKind: String?
+    let physicalConfig: PhysicalRewardConfig?
     let badges: RewardBadgeInfo?
+}
+
+struct PhysicalRewardConfig: Codable {
+    let rewardName: String?
+    let stockQuantity: Int?
+    let claimInstructions: String?
+    let manualValidationRequired: Bool?
 }
 
 struct RewardBadgeInfo: Codable {
@@ -6031,6 +6036,7 @@ struct MissionRewardDefinition: Codable, Identifiable {
     let title: String?
     let sortOrder: Int?
     let visibleOnProfile: Bool?
+    let physicalConfig: PhysicalRewardConfig?
     let badges: RewardBadgeInfo?
 }
 
@@ -21689,8 +21695,6 @@ struct OrganizerPriceOptionEditor: View {
             if option.hasDedicatedSpots {
                 OrganizerIntegerStepperField("Posti dedicati", value: $option.dedicatedSpots, range: 1...300)
             }
-            Toggle("Lista d'attesa formula", isOn: $option.waitlistEnabled)
-                .editableControlSurface(cornerRadius: 12)
             Picker("Gruppo idoneo", selection: eligibleGroupModeBinding) {
                 Text("Tutti").tag("all")
                 Text("Membri attivi").tag("members")
@@ -23258,7 +23262,7 @@ struct MissionsSection: View {
                 } else {
                     ForEach(activeMissions) { mission in
                         MissionRow(mission: mission) {
-                            openEvents(for: mission)
+                            selectedMission = mission
                         }
                     }
                 }
@@ -23290,7 +23294,7 @@ struct MissionsSection: View {
                     if showCompletedMissions {
                         ForEach(completedMissions) { mission in
                             MissionRow(mission: mission) {
-                                openEvents(for: mission)
+                                selectedMission = mission
                             }
                         }
                     }
@@ -23298,7 +23302,10 @@ struct MissionsSection: View {
             }
         }
         .sheet(item: $selectedMission) { mission in
-            MissionDetailSheet(mission: mission)
+            MissionDetailSheet(mission: mission) {
+                openEvents(for: mission)
+                selectedMission = nil
+            }
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
@@ -23373,6 +23380,7 @@ struct MissionRow: View {
 
 struct MissionDetailSheet: View {
     let mission: MissionCardModel
+    let onDiscoverEvents: () -> Void
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -23432,6 +23440,15 @@ struct MissionDetailSheet: View {
                     .padding(14)
                     .background(Brand.card, in: RoundedRectangle(cornerRadius: 14))
                     .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.muted, lineWidth: 1))
+
+                    Button {
+                        dismiss()
+                        onDiscoverEvents()
+                    } label: {
+                        Label("Scopri gli eventi", systemImage: "magnifyingglass")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(PrimaryButtonStyle())
                 }
                 .padding(18)
             }
@@ -23532,35 +23549,29 @@ struct RewardsView: View {
             let rawTitle = reward.title?.nilIfBlank?.lowercased()
             let hasSpecificTitle = rawTitle != nil && rawTitle != "badge"
             return reward.kind == .badge &&
-            reward.isCurrent &&
             (unlockedBadges.isEmpty || hasSpecificTitle) &&
             !badgeNames.contains(reward.displayTitle.lowercased())
         }
     }
 
+    private var physicalRewards: [Reward] {
+        rewards.filter { $0.kind == .physical || $0.kind == .other }
+    }
+
     private var pointRewards: [Reward] {
-        rewards.filter { $0.kind == .points && $0.isCurrent }
+        rewards.filter { $0.kind == .points }
     }
 
-    private var activeCoupons: [Reward] {
-        rewards.filter { $0.kind == .coupon && $0.isCurrent }
-    }
-
-    private var activeOtherRewards: [Reward] {
-        rewards.filter { [.physical, .other].contains($0.kind) && $0.isCurrent }
-    }
-
-    private var history: [Reward] {
-        rewards.filter { $0.kind != .badge && $0.isHistory }
+    private var couponRewards: [Reward] {
+        rewards.filter { $0.kind == .coupon }
     }
 
     private var isEmpty: Bool {
         unlockedBadges.isEmpty &&
         fallbackBadgeRewards.isEmpty &&
+        physicalRewards.isEmpty &&
         pointRewards.isEmpty &&
-        activeCoupons.isEmpty &&
-        activeOtherRewards.isEmpty &&
-        history.isEmpty
+        couponRewards.isEmpty
     }
 
     var body: some View {
@@ -23588,22 +23599,8 @@ struct RewardsView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.top, 80)
                 } else {
-                    if !activeCoupons.isEmpty {
-                        RewardsSection(title: "Coupon attivi", icon: "ticket", color: Brand.primary) {
-                            ForEach(activeCoupons) { reward in
-                                Button {
-                                    selectedRewardDetail = RewardDetailItem(reward: reward)
-                                } label: {
-                                    RewardCard(reward: reward)
-                                }
-                                .buttonStyle(.plain)
-                                .rewardCardTapTarget()
-                            }
-                        }
-                    }
-
-                    if !unlockedBadges.isEmpty || !fallbackBadgeRewards.isEmpty || !pointRewards.isEmpty || !activeOtherRewards.isEmpty {
-                        RewardsSection(title: "Ricompense sbloccate", icon: "gift", color: Brand.secondary) {
+                    if !unlockedBadges.isEmpty || !fallbackBadgeRewards.isEmpty {
+                        RewardsSection(title: "Badge", icon: "trophy", color: Brand.accent) {
                             ForEach(unlockedBadges) { badge in
                                 Button {
                                     selectedRewardDetail = RewardDetailItem(badge: badge)
@@ -23623,18 +23620,12 @@ struct RewardsView: View {
                                 .buttonStyle(.plain)
                                 .rewardCardTapTarget()
                             }
+                        }
+                    }
 
-                            ForEach(pointRewards) { reward in
-                                Button {
-                                    selectedRewardDetail = RewardDetailItem(reward: reward)
-                                } label: {
-                                    RewardCard(reward: reward)
-                                }
-                                .buttonStyle(.plain)
-                                .rewardCardTapTarget()
-                            }
-
-                            ForEach(activeOtherRewards) { reward in
+                    if !physicalRewards.isEmpty {
+                        RewardsSection(title: "Ricompense fisiche", icon: "gift", color: Brand.warning) {
+                            ForEach(physicalRewards) { reward in
                                 Button {
                                     selectedRewardDetail = RewardDetailItem(reward: reward)
                                 } label: {
@@ -23646,9 +23637,23 @@ struct RewardsView: View {
                         }
                     }
 
-                    if !history.isEmpty {
-                        RewardsSection(title: "Storico ricompense", icon: "clock", color: Brand.mutedForeground) {
-                            ForEach(history) { reward in
+                    if !pointRewards.isEmpty {
+                        RewardsSection(title: "Punti", icon: "star", color: Brand.secondary) {
+                            ForEach(pointRewards) { reward in
+                                Button {
+                                    selectedRewardDetail = RewardDetailItem(reward: reward)
+                                } label: {
+                                    RewardCard(reward: reward)
+                                }
+                                .buttonStyle(.plain)
+                                .rewardCardTapTarget()
+                            }
+                        }
+                    }
+
+                    if !couponRewards.isEmpty {
+                        RewardsSection(title: "Coupon", icon: "ticket", color: Brand.primary) {
+                            ForEach(couponRewards) { reward in
                                 Button {
                                     selectedRewardDetail = RewardDetailItem(reward: reward)
                                 } label: {
@@ -23895,6 +23900,7 @@ struct RewardDetailItem: Identifiable {
     let sourceLabel: String?
     let sourceText: String?
     let dateText: String?
+    let helpLabel: String
     let helpText: String?
     let copyCode: String?
 
@@ -23916,6 +23922,7 @@ struct RewardDetailItem: Identifiable {
             self.valueText = reward.pointValueLabel
             self.sourceLabel = "Ottenuti grazie a"
             self.sourceText = reward.earnedDescription
+            self.helpLabel = "Nota"
             self.helpText = nil
             self.copyCode = nil
         case .badge:
@@ -23923,6 +23930,7 @@ struct RewardDetailItem: Identifiable {
             self.valueText = nil
             self.sourceLabel = "Sbloccato con"
             self.sourceText = reward.earnedDescription
+            self.helpLabel = "Nota"
             self.helpText = "Resta visibile nel profilo e contribuisce alla tua progressione nella community."
             self.copyCode = nil
         case .coupon:
@@ -23932,6 +23940,7 @@ struct RewardDetailItem: Identifiable {
             self.sourceLabel = "Ottenuto grazie a"
             self.sourceText = reward.earnedDescription
             let expiry = reward.expiryDate?.shortDateLabel.map { " Scade il \($0)." } ?? ""
+            self.helpLabel = "Nota"
             self.helpText = "Inserisci il codice in fase di pagamento.\(expiry)"
             self.copyCode = reward.effectiveStatus == "active" ? code : nil
         case .physical:
@@ -23939,13 +23948,16 @@ struct RewardDetailItem: Identifiable {
             self.valueText = reward.value?.nilIfBlank
             self.sourceLabel = "Ottenuto grazie a"
             self.sourceText = reward.earnedDescription
-            self.helpText = reward.effectiveStatus == "pending" ? "Potrai ritirarlo al prossimo evento." : nil
+            let claimInstructions = reward.sourceReward?.physicalConfig?.claimInstructions?.nilIfBlank
+            self.helpLabel = claimInstructions == nil ? "Nota" : "Istruzioni di riscatto"
+            self.helpText = claimInstructions ?? (reward.effectiveStatus == "pending" ? "Potrai ritirarlo al prossimo evento." : nil)
             self.copyCode = nil
         case .other:
             self.valueLabel = nil
             self.valueText = reward.value?.nilIfBlank
             self.sourceLabel = "Ottenuta grazie a"
             self.sourceText = reward.earnedDescription
+            self.helpLabel = "Nota"
             self.helpText = nil
             self.copyCode = nil
         }
@@ -23966,6 +23978,7 @@ struct RewardDetailItem: Identifiable {
         self.sourceLabel = "Ottenuto grazie a"
         self.sourceText = badge.displayDescription.nilIfBlank ?? "Obiettivo completato nella community."
         self.dateText = badge.earnedAt?.shortDateLabel ?? badge.completedAt?.shortDateLabel
+        self.helpLabel = "Nota"
         self.helpText = "Resta visibile nel profilo e racconta un traguardo raggiunto."
         self.copyCode = nil
     }
@@ -24019,7 +24032,7 @@ struct RewardDetailSheet: View {
                                 RewardDetailInfoRow(label: sourceLabel, value: sourceText)
                             }
                             if let helpText = detail.helpText {
-                                RewardDetailInfoRow(label: "Nota", value: helpText)
+                                RewardDetailInfoRow(label: detail.helpLabel, value: helpText)
                             }
                         }
                         .padding(12)
