@@ -16656,11 +16656,6 @@ struct OrganizerEventManageView: View {
         registrations.filter { $0.normalizedStatus == "cancelled" }
     }
 
-    private var availableSpots: Int {
-        guard let event else { return 0 }
-        return max((event.spotsTotal ?? 0) - activeRegistrations.count - (event.reservedSpots ?? 0), 0)
-    }
-
     private var attendedCount: Int {
         registrations.filter { $0.checkedIn == true || $0.normalizedStatus == "attended" }.count
     }
@@ -16772,8 +16767,6 @@ struct OrganizerEventManageView: View {
                 }
             }
 
-            manageMetricsGrid
-
             OrganizerParticipationOptionsBreakdown(event: event, registrations: registrations, priceOptions: priceOptions)
 
             OrganizerManagePrimaryActions(
@@ -16803,21 +16796,6 @@ struct OrganizerEventManageView: View {
             || event.paymentType == "deposit"
             || priceOptions.contains { $0.effectivePaymentType(fallback: event) == "deposit" }
             || event.priceOptions.contains { $0.effectivePaymentType(fallback: event) == "deposit" }
-    }
-
-    private var manageMetricsGrid: some View {
-        LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
-            OrganizerMetricCard(title: "\(activeRegistrations.count)", subtitle: "Partecipanti", icon: "person.2.fill")
-            OrganizerMetricCard(title: "\(attendedCount)", subtitle: "Presenti", icon: "checkmark.circle.fill")
-            OrganizerMetricCard(title: "\(waitlistedRegistrations.count)", subtitle: "Lista attesa", icon: "list.bullet")
-            Button {
-                showCapacity = true
-            } label: {
-                OrganizerMetricCard(title: "\(availableSpots)", subtitle: "Liberi", icon: "chair")
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Modifica capienza evento")
-        }
     }
 
     @ViewBuilder
@@ -17522,62 +17500,6 @@ struct OrganizerParticipantsSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            LazyVGrid(columns: quickFilterColumns, spacing: 8) {
-                OrganizerParticipantFilterCard(
-                    title: "\(activeRegistrations.count)",
-                    subtitle: "Partecipanti",
-                    icon: "person.2.fill",
-                    tint: Brand.primary,
-                    isSelected: selectedParticipantFilter == Self.allParticipantFilter
-                ) {
-                    selectedParticipantFilter = Self.allParticipantFilter
-                }
-
-                if shouldShowDepositFilter {
-                    OrganizerParticipantFilterCard(
-                        title: "\(depositPaidCount)",
-                        subtitle: "Acconti",
-                        icon: "creditcard",
-                        tint: Brand.warning,
-                        isSelected: selectedParticipantFilter == Self.depositParticipantFilter
-                    ) {
-                        selectedParticipantFilter = Self.depositParticipantFilter
-                    }
-                }
-
-                OrganizerParticipantFilterCard(
-                    title: "\(attendedCount)",
-                    subtitle: "Presenti",
-                    icon: "checkmark.circle.fill",
-                    tint: Brand.success,
-                    isSelected: selectedParticipantFilter == Self.attendedParticipantFilter
-                ) {
-                    selectedParticipantFilter = Self.attendedParticipantFilter
-                }
-
-                OrganizerParticipantFilterCard(
-                    title: "\(waitlistCount)",
-                    subtitle: "Lista d'attesa",
-                    icon: "list.bullet",
-                    tint: Brand.warning,
-                    isSelected: selectedParticipantFilter == Self.waitlistParticipantFilter
-                ) {
-                    selectedParticipantFilter = Self.waitlistParticipantFilter
-                }
-
-                if !filterOptions.isEmpty {
-                    OrganizerParticipantFilterCard(
-                        title: "\(filterOptions.count)",
-                        subtitle: "Opzioni",
-                        icon: "ticket",
-                        tint: Brand.secondary,
-                        isSelected: selectedParticipantFilter == Self.optionParticipantFilter
-                    ) {
-                        selectedParticipantFilter = Self.optionParticipantFilter
-                    }
-                }
-            }
-
             VStack(spacing: 10) {
                 HStack(spacing: 10) {
                     Label("Filtro", systemImage: "line.3.horizontal.decrease.circle")
@@ -17623,27 +17545,25 @@ struct OrganizerParticipantsSection: View {
 
                 if selectedParticipantFilter == Self.optionParticipantFilter, !filterOptions.isEmpty {
                     HStack(spacing: 10) {
-	                        Label("Formula", systemImage: "ticket")
-	                            .font(.subheadline.weight(.semibold))
-	                            .foregroundStyle(Brand.foreground)
-	                        Spacer()
-	                        Picker("Formula", selection: $selectedPriceOptionFilter) {
-	                            Text("Tutte").tag(Self.allPriceOptionsFilter)
-	                            ForEach(filterOptions) { option in
-	                                Text(option.displayName).tag(option.id)
-	                            }
-	                            Text("Senza formula").tag(Self.withoutPriceOptionFilter)
-	                        }
-	                        .pickerStyle(.menu)
-	                        .tint(Brand.primary)
-	                    }
-	                }
+                        Label("Formula", systemImage: "ticket")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Brand.foreground)
+                        Spacer()
+                        Picker("Formula", selection: $selectedPriceOptionFilter) {
+                            Text("Tutte").tag(Self.allPriceOptionsFilter)
+                            ForEach(filterOptions) { option in
+                                Text(option.displayName).tag(option.id)
+                            }
+                            Text("Senza formula").tag(Self.withoutPriceOptionFilter)
+                        }
+                        .pickerStyle(.menu)
+                        .tint(Brand.primary)
+                    }
+                }
             }
             .padding(12)
             .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
             .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
-
-            OrganizerMetricCard(title: "\(filteredRegistrations.count)", subtitle: selectedFilterLabel, icon: selectedFilterIcon)
 
             if activeRegistrations.isEmpty && selectedParticipantFilter == Self.allParticipantFilter {
                 EmptyState(icon: "person.2.slash", title: "Nessun partecipante", message: "Aggiungi un partecipante o attendi nuove iscrizioni.")
@@ -17691,29 +17611,6 @@ struct OrganizerParticipantsSection: View {
         }
     }
 
-    private var quickFilterColumns: [GridItem] {
-        [GridItem(.adaptive(minimum: 96), spacing: 8)]
-    }
-
-    private var depositPaidCount: Int {
-        activeRegistrations.filter(isDepositPaid).count
-    }
-
-    private var attendedCount: Int {
-        activeRegistrations.filter(isAttended).count
-    }
-
-    private var waitlistCount: Int {
-        registrations.filter { $0.normalizedStatus == "waitlist" }.count
-    }
-
-    private var shouldShowDepositFilter: Bool {
-        depositPaidCount > 0
-            || event.paymentType == "deposit"
-            || priceOptions.contains { $0.effectivePaymentType(fallback: event) == "deposit" }
-            || event.priceOptions.contains { $0.effectivePaymentType(fallback: event) == "deposit" }
-    }
-
     private var optionFilteredRegistrations: [OrganizerRegistration] {
         let visibleRegistrations = registrations.filter { $0.normalizedStatus != "cancelled" }
         switch selectedPriceOptionFilter {
@@ -17735,36 +17632,6 @@ struct OrganizerParticipantsSection: View {
             return source.filter { $0.meetingPointId?.nilIfBlank == nil }
         default:
             return source.filter { $0.meetingPointId == selectedMeetingPointFilter }
-        }
-    }
-
-    private var selectedFilterLabel: String {
-        switch selectedParticipantFilter {
-        case Self.optionParticipantFilter:
-            return "Filtro formula"
-        case Self.depositParticipantFilter:
-            return "Acconto pagato"
-        case Self.attendedParticipantFilter:
-            return "Presenti"
-        case Self.waitlistParticipantFilter:
-            return "Lista d'attesa"
-        default:
-            return "Partecipanti"
-        }
-    }
-
-    private var selectedFilterIcon: String {
-        switch selectedParticipantFilter {
-        case Self.optionParticipantFilter:
-            return "ticket"
-        case Self.depositParticipantFilter:
-            return "creditcard"
-        case Self.attendedParticipantFilter:
-            return "checkmark.circle.fill"
-        case Self.waitlistParticipantFilter:
-            return "list.bullet"
-        default:
-            return "person.2.fill"
         }
     }
 
@@ -17791,31 +17658,6 @@ struct OrganizerParticipantsSection: View {
         registration.normalizedStatus == "deposit_paid" || registration.paymentStatus == "deposit_paid"
     }
 
-}
-
-private struct OrganizerParticipantFilterCard: View {
-    let title: String
-    let subtitle: String
-    let icon: String
-    let tint: Color
-    let isSelected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            OrganizerStatTile(
-                style: .filter,
-                title: subtitle,
-                value: title,
-                subtitle: subtitle,
-                icon: icon,
-                tint: tint,
-                isSelected: isSelected
-            )
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("\(subtitle): \(title)")
-    }
 }
 
 struct OrganizerCheckInSection: View {
