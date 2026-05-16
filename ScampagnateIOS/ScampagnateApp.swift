@@ -26588,13 +26588,9 @@ struct ProfileEditSheet: View {
                     help: #"Inserisci la sigla della provincia (es. "RM", "MI"). Se sei nato/a all'estero, scrivi EE."#
                 )
             }
-            OrganizerAddressAutocompleteField(
+            ProfileSheetField(
                 "Indirizzo di residenza",
                 text: $input.residentialAddress,
-                labelFont: ProfileSheetFieldStyle.labelFont,
-                labelSpacing: ProfileSheetFieldStyle.labelSpacing,
-                borderWidth: ProfileSheetFieldStyle.inputBorderWidth,
-                showsLeadingIcon: false,
                 help: #"Inserisci via e numero civico (es. "Via Roma 12")."#
             )
             HStack(alignment: .top, spacing: 14) {
