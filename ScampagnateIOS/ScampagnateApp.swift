@@ -2,6 +2,7 @@ import SwiftUI
 import SafariServices
 import PhotosUI
 import UIKit
+import UniformTypeIdentifiers
 import UserNotifications
 import EventKit
 import EventKitUI
@@ -14,6 +15,11 @@ enum ScampagnateConfig {
     static let supabaseURL = URL(string: "https://istotjnoqtrtthnyreyv.supabase.co")!
     static let publishableKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlzdG90am5vcXRydHRobnlyZXl2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg2ODIxMzMsImV4cCI6MjA5NDI1ODEzM30.GcrdLFBW1oDW9-hQ960eqpOtfGb0k_XsQhT2juFuwWc"
     static let stripeOrigin = "https://scampagnate.com"
+}
+
+enum IssueMediaLimits {
+    static let maxFiles = 4
+    static let maxFileSize = 50 * 1024 * 1024
 }
 
 enum Brand {
@@ -318,10 +324,14 @@ final class AppStore: ObservableObject {
         }
     }
 
-    func submitIssue(title: String, description: String, priority: IssuePriority) async -> Bool {
+    func submitIssue(title: String, description: String, priority: IssuePriority, mediaItems: [PendingIssueMedia] = []) async -> Bool {
         do {
             let authSession = try await authenticatedSession()
-            try await api.submitIssue(title: title, description: description, priority: priority, profile: profile, session: authSession)
+            var attachments: [IssueMediaAttachment] = []
+            for mediaItem in mediaItems {
+                attachments.append(try await api.uploadIssueMedia(mediaItem, session: authSession))
+            }
+            try await api.submitIssue(title: title, description: description, priority: priority, mediaAttachments: attachments, profile: profile, session: authSession)
             return true
         } catch {
             report(error)
@@ -1066,6 +1076,16 @@ final class AppStore: ObservableObject {
         } catch {
             report(error, when: reportingErrors)
             return []
+        }
+    }
+
+    func signedIssueMediaURL(path: String, reportingErrors: Bool = false) async -> String? {
+        do {
+            let authSession = try await authenticatedSession()
+            return try await api.createIssueMediaSignedURL(path: path, session: authSession)
+        } catch {
+            report(error, when: reportingErrors)
+            return nil
         }
     }
 
@@ -2204,6 +2224,26 @@ struct SupabaseAPI {
         let _: EmptyResponse = try await request(path: "/rest/v1/issues?id=eq.\(id.urlEncoded)", method: "PATCH", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
     }
 
+    func createIssueMediaSignedURL(path: String, session: AuthSession) async throws -> String {
+        let encodedPath = path
+            .split(separator: "/")
+            .map { String($0).urlEncoded }
+            .joined(separator: "/")
+        let payload: [String: Int] = ["expiresIn": 60 * 60]
+        let response = try await request(
+            path: "/storage/v1/object/sign/issue-media/\(encodedPath)",
+            method: "POST",
+            body: payload,
+            auth: session,
+            decode: StorageSignedURLResponse.self
+        )
+        let signedPath = response.signedURL ?? response.signedUrl ?? ""
+        guard !signedPath.isEmpty else { throw AppError.message("URL allegato non disponibile") }
+        if signedPath.hasPrefix("http") { return signedPath }
+        let normalizedPath = signedPath.hasPrefix("/") ? signedPath : "/\(signedPath)"
+        return ScampagnateConfig.supabaseURL.appendingPath(normalizedPath).absoluteString
+    }
+
     func fetchDiscountCodes(session: AuthSession) async throws -> [AdminDiscountCode] {
         let path = "/rest/v1/discount_codes?select=*&order=created_at.desc"
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [AdminDiscountCode].self)
@@ -2697,6 +2737,25 @@ struct SupabaseAPI {
         return ScampagnateConfig.supabaseURL
             .appending(path: "/storage/v1/object/public/event-images/\(filePath)")
             .absoluteString
+    }
+
+    func uploadIssueMedia(_ media: PendingIssueMedia, session: AuthSession) async throws -> IssueMediaAttachment {
+        let fileName = media.filename.sanitizedStorageFileName.nilIfBlank ?? "attachment.\(media.fileExtension)"
+        let filePath = "\(session.user.id)/\(UUID().uuidString)-\(fileName)"
+        let encodedPath = filePath
+            .split(separator: "/")
+            .map { String($0).urlEncoded }
+            .joined(separator: "/")
+        let storageURL = ScampagnateConfig.supabaseURL.appending(path: "/storage/v1/object/issue-media/\(encodedPath)")
+        try await uploadStorageObject(url: storageURL, data: media.data, contentType: media.contentType, session: session, upsert: false)
+
+        return IssueMediaAttachment(
+            path: filePath,
+            type: media.mediaType.rawValue,
+            contentType: media.contentType,
+            name: media.filename,
+            size: media.data.count
+        )
     }
 
     func updateOrganizerRegistration(id: String, updates: OrganizerRegistrationUpdate, session: AuthSession) async throws {
@@ -3193,14 +3252,15 @@ struct SupabaseAPI {
         let _: EmptyResponse = try await request(path: path, method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
     }
 
-    func submitIssue(title: String, description: String, priority: IssuePriority, profile: Profile?, session: AuthSession) async throws {
+    func submitIssue(title: String, description: String, priority: IssuePriority, mediaAttachments: [IssueMediaAttachment], profile: Profile?, session: AuthSession) async throws {
         let reporterName = profile?.displayName.isEmpty == false ? profile?.displayName ?? "User" : "User"
         let payload: [String: JSONValue] = [
             "title": .string(title.trimmingCharacters(in: .whitespacesAndNewlines)),
             "description": .string(description.trimmingCharacters(in: .whitespacesAndNewlines)),
             "priority": .string(priority.rawValue),
             "reporter_id": .string(session.user.id),
-            "reporter_name": .string(reporterName)
+            "reporter_name": .string(reporterName),
+            "media_attachments": .array(mediaAttachments.map { $0.jsonValue })
         ]
         let data = try JSONEncoder().encode(payload)
         let _: [EmptyObject] = try await request(path: "/rest/v1/issues", method: "POST", bodyData: data, auth: session, decode: [EmptyObject].self, prefer: "return=representation")
@@ -3302,13 +3362,13 @@ struct SupabaseAPI {
         return data
     }
 
-    private func uploadStorageObject(url: URL, data: Data, contentType: String, session: AuthSession) async throws {
+    private func uploadStorageObject(url: URL, data: Data, contentType: String, session: AuthSession, upsert: Bool = true) async throws {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue(ScampagnateConfig.publishableKey, forHTTPHeaderField: "apikey")
         request.setValue("Bearer \(session.accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue(contentType, forHTTPHeaderField: "Content-Type")
-        request.setValue("true", forHTTPHeaderField: "x-upsert")
+        request.setValue(upsert ? "true" : "false", forHTTPHeaderField: "x-upsert")
         request.httpBody = data
 
         let (responseData, response) = try await URLSession.shared.data(for: request)
@@ -4486,10 +4546,63 @@ struct AdminIssue: Codable, Identifiable, Hashable {
     let priority: String?
     let status: String?
     let reporterName: String?
+    let mediaAttachments: [IssueMediaAttachment]?
     let resolutionNotes: String?
     let createdAt: String?
     let updatedAt: String?
     let resolvedAt: String?
+}
+
+enum IssueMediaType: String, Codable, Hashable {
+    case image
+    case video
+}
+
+struct PendingIssueMedia: Identifiable, Hashable {
+    let id = UUID()
+    let data: Data
+    let filename: String
+    let contentType: String
+    let mediaType: IssueMediaType
+    let fileExtension: String
+}
+
+struct IssueMediaAttachment: Codable, Identifiable, Hashable {
+    var id: String { path }
+    let path: String
+    let type: String
+    let contentType: String?
+    let name: String?
+    let size: Int?
+
+    var isVideo: Bool { type == IssueMediaType.video.rawValue }
+    var displayName: String { name?.nilIfBlank ?? (isVideo ? "Video" : "Immagine") }
+    var displaySize: String { Self.formatBytes(size ?? 0) }
+
+    var jsonValue: JSONValue {
+        .object([
+            "path": .string(path),
+            "type": .string(type),
+            "content_type": contentType.map { .string($0) } ?? .null,
+            "name": name.map { .string($0) } ?? .null,
+            "size": size.map { .number(Double($0)) } ?? .null
+        ])
+    }
+
+    private static func formatBytes(_ bytes: Int) -> String {
+        if bytes >= 1024 * 1024 {
+            return String(format: "%.1f MB", Double(bytes) / Double(1024 * 1024))
+        }
+        if bytes >= 1024 {
+            return "\(bytes / 1024) KB"
+        }
+        return "\(bytes) B"
+    }
+}
+
+struct StorageSignedURLResponse: Decodable {
+    let signedURL: String?
+    let signedUrl: String?
 }
 
 struct AdminDiscountCode: Codable, Identifiable, Hashable {
@@ -15918,6 +16031,11 @@ struct OrganizerIssuesPanel: View {
                         LabeledContent("Priorita", value: issue.priority ?? "medium")
                         LabeledContent("Segnalata da", value: issue.reporterName ?? "utente")
                     }
+                    if let attachments = issue.mediaAttachments, !attachments.isEmpty {
+                        Section("Allegati") {
+                            AdminIssueMediaStrip(attachments: attachments, compact: false)
+                        }
+                    }
                     Section("Risoluzione") {
                         TextEditor(text: $resolutionNotes)
                             .frame(minHeight: 120)
@@ -15957,6 +16075,9 @@ struct OrganizerIssuesPanel: View {
                     .font(.caption)
                     .foregroundStyle(Brand.mutedForeground)
                     .lineLimit(2)
+                if let attachments = issue.mediaAttachments, !attachments.isEmpty {
+                    AdminIssueMediaStrip(attachments: attachments, compact: true)
+                }
                 Text("Da \(issue.reporterName ?? "utente")")
                     .font(.caption2)
                     .foregroundStyle(Brand.mutedForeground)
@@ -15999,6 +16120,123 @@ struct OrganizerIssuesPanel: View {
         case "medium": Brand.warning
         default: Brand.mutedForeground
         }
+    }
+}
+
+private struct AdminIssueMediaStrip: View {
+    @EnvironmentObject private var store: AppStore
+    let attachments: [IssueMediaAttachment]
+    let compact: Bool
+    @State private var signedURLs: [String: String] = [:]
+
+    private var taskKey: String {
+        attachments.map(\.path).joined(separator: "|")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if compact {
+                HStack(spacing: 8) {
+                    ForEach(attachments.prefix(3)) { attachment in
+                        mediaPreview(for: attachment)
+                            .frame(width: 72, height: 54)
+                    }
+                    if attachments.count > 3 {
+                        Text("+\(attachments.count - 3)")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(Brand.mutedForeground)
+                    }
+                }
+            } else {
+                ForEach(attachments) { attachment in
+                    VStack(alignment: .leading, spacing: 6) {
+                        mediaPreview(for: attachment)
+                            .frame(height: attachment.isVideo ? 88 : 160)
+                        HStack(spacing: 6) {
+                            Image(systemName: attachment.isVideo ? "video.fill" : "photo.fill")
+                            Text(attachment.displayName)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(attachment.displaySize)
+                            if let url = signedURL(for: attachment) {
+                                Link(destination: url) {
+                                    Image(systemName: "arrow.up.right.square")
+                                }
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .task(id: taskKey) {
+            await loadSignedURLs()
+        }
+    }
+
+    @ViewBuilder
+    private func mediaPreview(for attachment: IssueMediaAttachment) -> some View {
+        if attachment.isVideo {
+            if let url = signedURL(for: attachment) {
+                Link(destination: url) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 12)
+                            .fill(.black.opacity(0.86))
+                        Image(systemName: "play.circle.fill")
+                            .font(.title2)
+                            .foregroundStyle(.white)
+                    }
+                }
+                .buttonStyle(.plain)
+            } else {
+                placeholder(systemImage: "video.fill")
+            }
+        } else if let url = signedURL(for: attachment) {
+            AsyncImage(url: url) { phase in
+                switch phase {
+                case .success(let image):
+                    image
+                        .resizable()
+                        .scaledToFill()
+                case .failure:
+                    placeholder(systemImage: "photo.fill")
+                default:
+                    ProgressView()
+                        .tint(Brand.primary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Brand.muted, lineWidth: 1))
+        } else {
+            placeholder(systemImage: "photo.fill")
+        }
+    }
+
+    private func placeholder(systemImage: String) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Brand.muted)
+            Image(systemName: systemImage)
+                .foregroundStyle(Brand.mutedForeground)
+        }
+    }
+
+    private func signedURL(for attachment: IssueMediaAttachment) -> URL? {
+        signedURLs[attachment.path].flatMap(URL.init(string:))
+    }
+
+    @MainActor
+    private func loadSignedURLs() async {
+        var urls: [String: String] = [:]
+        for attachment in attachments {
+            if let url = await store.signedIssueMediaURL(path: attachment.path) {
+                urls[attachment.path] = url
+            }
+        }
+        signedURLs = urls
     }
 }
 
@@ -26059,6 +26297,9 @@ struct ReportIssueSheet: View {
     @State private var title = ""
     @State private var description = ""
     @State private var priority: IssuePriority = .medium
+    @State private var selectedMediaItems: [PhotosPickerItem] = []
+    @State private var pendingMedia: [PendingIssueMedia] = []
+    @State private var loadingMedia = false
     @State private var submitting = false
     @State private var validationMessage: String?
     @State private var showSuccess = false
@@ -26066,7 +26307,12 @@ struct ReportIssueSheet: View {
     private var canSubmit: Bool {
         !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+        !loadingMedia &&
         !submitting
+    }
+
+    private var remainingMediaSlots: Int {
+        max(0, IssueMediaLimits.maxFiles - pendingMedia.count)
     }
 
     var body: some View {
@@ -26114,6 +26360,37 @@ struct ReportIssueSheet: View {
                         .pickerStyle(.segmented)
                     }
 
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Allegati")
+                            .font(.subheadline.weight(.semibold))
+                        if remainingMediaSlots > 0 {
+                            let pickerTitle = loadingMedia ? "Preparo allegati..." : "Aggiungi foto o video"
+                            PhotosPicker(
+                                selection: $selectedMediaItems,
+                                maxSelectionCount: remainingMediaSlots,
+                                matching: .any(of: [.images, .videos]),
+                                photoLibrary: .shared()
+                            ) {
+                                Label(pickerTitle, systemImage: "paperclip")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(SecondaryButtonStyle())
+                            .disabled(loadingMedia || submitting)
+                        }
+                        Text("Fino a \(IssueMediaLimits.maxFiles) file, immagini o video, max 50 MB ciascuno.")
+                            .font(.caption)
+                            .foregroundStyle(Brand.mutedForeground)
+                        if !pendingMedia.isEmpty {
+                            VStack(spacing: 8) {
+                                ForEach(pendingMedia) { media in
+                                    PendingIssueMediaRow(media: media) {
+                                        pendingMedia.removeAll { $0.id == media.id }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if let validationMessage {
                         Text(validationMessage)
                             .font(.caption)
@@ -26146,6 +26423,9 @@ struct ReportIssueSheet: View {
                     Button("Chiudi") { dismiss() }
                 }
             }
+            .onChange(of: selectedMediaItems) { _, items in
+                Task { await importSelectedMedia(items) }
+            }
             .alert("Grazie", isPresented: $showSuccess) {
                 Button("OK") { dismiss() }
             } message: {
@@ -26168,14 +26448,105 @@ struct ReportIssueSheet: View {
 
         validationMessage = nil
         submitting = true
-        let success = await store.submitIssue(title: cleanTitle, description: cleanDescription, priority: priority)
+        let success = await store.submitIssue(title: cleanTitle, description: cleanDescription, priority: priority, mediaItems: pendingMedia)
         submitting = false
         if success {
             title = ""
             description = ""
             priority = .medium
+            pendingMedia = []
             showSuccess = true
         }
+    }
+
+    @MainActor
+    private func importSelectedMedia(_ items: [PhotosPickerItem]) async {
+        guard !items.isEmpty else { return }
+        let itemsToLoad = Array(items.prefix(remainingMediaSlots))
+        selectedMediaItems = []
+        guard !itemsToLoad.isEmpty else {
+            validationMessage = "Hai già raggiunto il limite di \(IssueMediaLimits.maxFiles) allegati."
+            return
+        }
+
+        loadingMedia = true
+        validationMessage = nil
+        defer { loadingMedia = false }
+
+        var importedMedia: [PendingIssueMedia] = []
+        for (index, item) in itemsToLoad.enumerated() {
+            do {
+                guard let data = try await item.loadTransferable(type: Data.self) else { continue }
+                let contentType = item.issueMediaContentType
+                let mediaType: IssueMediaType = contentType.conforms(to: .movie) ? .video : .image
+                var uploadData = data
+                var uploadContentType = contentType.preferredMIMEType ?? (mediaType == .video ? "video/mp4" : "image/jpeg")
+                var fileExtension = contentType.preferredFilenameExtension ?? (mediaType == .video ? "mp4" : "jpg")
+
+                if mediaType == .image, let image = UIImage(data: data), let jpegData = image.jpegData(compressionQuality: 0.88) {
+                    uploadData = jpegData
+                    uploadContentType = "image/jpeg"
+                    fileExtension = "jpg"
+                }
+
+                guard uploadData.count <= IssueMediaLimits.maxFileSize else {
+                    validationMessage = "Un allegato supera il limite di 50 MB."
+                    continue
+                }
+
+                let filename = "segnalazione-\(Int(Date().timeIntervalSince1970))-\(index + 1).\(fileExtension)"
+                importedMedia.append(
+                    PendingIssueMedia(
+                        data: uploadData,
+                        filename: filename,
+                        contentType: uploadContentType,
+                        mediaType: mediaType,
+                        fileExtension: fileExtension
+                    )
+                )
+            } catch {
+                validationMessage = "Non riesco a leggere uno degli allegati selezionati."
+            }
+        }
+
+        pendingMedia.append(contentsOf: importedMedia)
+    }
+}
+
+private struct PendingIssueMediaRow: View {
+    let media: PendingIssueMedia
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: media.mediaType == .video ? "video.fill" : "photo.fill")
+                .foregroundStyle(Brand.secondary)
+                .frame(width: 28, height: 28)
+                .background(Brand.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(media.filename)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                Text(IssueMediaAttachment(path: "", type: media.mediaType.rawValue, contentType: media.contentType, name: media.filename, size: media.data.count).displaySize)
+                    .font(.caption2)
+                    .foregroundStyle(Brand.mutedForeground)
+            }
+            Spacer()
+            Button(action: onRemove) {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.bold))
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(10)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Brand.muted, lineWidth: 1))
+    }
+}
+
+private extension PhotosPickerItem {
+    var issueMediaContentType: UTType {
+        supportedContentTypes.first { $0.conforms(to: .movie) || $0.conforms(to: .image) } ?? .jpeg
     }
 }
 
@@ -31360,6 +31731,17 @@ private extension String {
         folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "it_IT"))
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
+    }
+
+    var sanitizedStorageFileName: String {
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+        let sanitized = unicodeScalars.map { scalar in
+            allowed.contains(scalar) ? String(scalar) : "-"
+        }
+        .joined()
+        .replacingOccurrences(of: #"-+"#, with: "-", options: .regularExpression)
+        .trimmingCharacters(in: CharacterSet(charactersIn: "-."))
+        return String(sanitized.prefix(90))
     }
 
     var recommendationLabel: String {
