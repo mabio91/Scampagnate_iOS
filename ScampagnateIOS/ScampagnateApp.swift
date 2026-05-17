@@ -5366,7 +5366,9 @@ private extension Registration {
         guard normalizedStatus == "deposit_paid" || paymentStatus == "deposit_paid" else { return false }
         let option = priceOption(in: event)
         let mode = option?.effectiveBalancePaymentMode(fallback: event) ?? event.balancePaymentMode ?? "online"
-        let balance = balanceDueAmount ?? option?.effectiveBalanceAmount(fallback: event) ?? max(0, (event.price ?? 0) - (event.deposit ?? 0))
+        let configuredBalance = option?.effectiveBalanceAmount(fallback: event) ?? max(0, (event.price ?? 0) - (event.deposit ?? 0))
+        let storedBalance = balanceDueAmount ?? 0
+        let balance = max(storedBalance, configuredBalance)
         return mode == "online" && balance > 0
     }
 
