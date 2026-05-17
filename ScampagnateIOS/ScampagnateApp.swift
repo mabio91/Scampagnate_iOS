@@ -2435,6 +2435,13 @@ struct SupabaseAPI {
     func fetchEventParticipants(eventId: String, session: AuthSession?) async throws -> [EventParticipant] {
         let publicPeople = (try? await fetchPublicEventPeople(eventId: eventId, session: session)) ?? []
 
+        guard session != nil else {
+            if !publicPeople.isEmpty {
+                return publicPeople
+            }
+            return try await fetchPublicEventAvatars(eventId: eventId, session: session)
+        }
+
         do {
             let select = "id,event_id,user_id,status,payment_status,sport_level"
             let path = "/rest/v1/event_registrations?select=\(select.urlEncoded)&event_id=eq.\(eventId.urlEncoded)&status=in.(registered,deposit_paid,paid,attended,no_show)&payment_status=neq.pending"
@@ -2442,18 +2449,28 @@ struct SupabaseAPI {
             let userIds = registrations.compactMap { $0.userId?.nilIfBlank }
             let profiles = try await fetchPublicProfiles(userIds: userIds, session: session)
             let organizerRows = publicPeople.filter(\.isOrganizer)
+            let publicParticipantRows = publicPeople.filter(\.isParticipant)
+            let publicParticipantsByRegistrationId = Dictionary(grouping: publicParticipantRows, by: \.id)
+                .compactMapValues(\.first)
+            let publicParticipantsByUserId = publicParticipantRows.reduce(into: [String: EventParticipant]()) { result, participant in
+                guard let userId = participant.userId else { return }
+                result[userId] = result[userId] ?? participant
+            }
             let participantRows = registrations.map { registration in
                 if let manual = registration.manualParticipant {
                     return EventParticipant(id: registration.id, userId: registration.userId, firstName: manual, lastNameInitial: nil, avatarUrl: nil)
                 }
                 let profile = registration.userId.flatMap { profiles[$0] }
+                let publicParticipant = publicParticipantsByRegistrationId[registration.id]
+                    ?? registration.userId.flatMap { publicParticipantsByUserId[$0] }
                 return EventParticipant(
                     id: registration.id,
                     userId: registration.userId,
-                    firstName: profile?.firstName ?? "?",
-                    lastNameInitial: profile?.lastNameInitial,
-                    avatarUrl: profile?.avatarUrl,
-                    totalPoints: profile?.totalPoints
+                    firstName: profile?.firstName ?? publicParticipant?.firstName ?? "?",
+                    lastNameInitial: profile?.lastNameInitial ?? publicParticipant?.lastNameInitial,
+                    avatarUrl: profile?.avatarUrl ?? publicParticipant?.avatarUrl,
+                    age: publicParticipant?.age,
+                    totalPoints: profile?.totalPoints ?? publicParticipant?.totalPoints
                 )
             }
             return organizerRows + participantRows
@@ -11206,11 +11223,12 @@ struct ParticipantAvatarStack: View {
     var showsPrivatePreview = false
 
     var body: some View {
-        if showsPrivatePreview, count > 0 {
+        if showsPrivatePreview, count > 0, !participants.isEmpty {
             HStack(spacing: 8) {
                 HStack(spacing: -10) {
-                    ForEach(0..<privatePreviewSlotCount, id: \.self) { index in
-                        ParticipantPrivacyAvatar(participant: privatePreviewParticipant(at: index), size: 38)
+                    ForEach(participants.prefix(3)) { participant in
+                        ParticipantAvatar(participant: participant, size: 38)
+                            .blur(radius: 6)
                             .overlay(Circle().stroke(Brand.background, lineWidth: 2))
                     }
                 }
@@ -11240,15 +11258,6 @@ struct ParticipantAvatarStack: View {
             }
         }
     }
-
-    private var privatePreviewSlotCount: Int {
-        min(max(count, participants.count), 3)
-    }
-
-    private func privatePreviewParticipant(at index: Int) -> EventParticipant? {
-        guard index < participants.count else { return nil }
-        return participants[index]
-    }
 }
 
 struct ParticipantAvatar: View {
@@ -11277,36 +11286,6 @@ struct ParticipantAvatar: View {
         }
         .frame(width: size, height: size)
         .clipShape(Circle())
-    }
-}
-
-struct ParticipantPrivacyAvatar: View {
-    let participant: EventParticipant?
-    let size: CGFloat
-
-    var body: some View {
-        avatar
-            .frame(width: size, height: size)
-            .clipShape(Circle())
-            .blur(radius: 6)
-            .accessibilityHidden(true)
-    }
-
-    @ViewBuilder
-    private var avatar: some View {
-        if let avatarUrl = participant?.avatarUrl?.nilIfBlank {
-            RemoteImage(urlString: avatarUrl)
-        } else {
-            ZStack {
-                Brand.muted
-                Circle()
-                    .fill(Brand.primary.opacity(0.12))
-                    .blur(radius: 8)
-                Text(participant?.initial ?? "?")
-                    .font(.system(size: size * 0.42, weight: .bold, design: .rounded))
-                    .foregroundStyle(Brand.primary)
-            }
-        }
     }
 }
 
