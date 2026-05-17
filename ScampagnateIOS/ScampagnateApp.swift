@@ -9570,6 +9570,10 @@ struct EventDetailView: View {
         attendeeParticipants.isEmpty ? (event?.attendeeSpotsTaken ?? 0) : attendeeParticipants.count
     }
 
+    var canViewParticipantDetails: Bool {
+        store.isAuthenticated && store.profile != nil && !store.needsOnboarding
+    }
+
     private func accessCheck(for event: Event) -> EventAccessCheck {
         EventAccessCheck.evaluate(event: event, profile: store.profile, badges: store.badges, registrations: store.myEvents)
     }
@@ -9888,7 +9892,7 @@ struct EventDetailView: View {
                     } label: {
                         VStack(alignment: .trailing, spacing: 7) {
                             SectionTitle("Chi c'è? (\(activeParticipantCount))")
-                            ParticipantAvatarStack(participants: attendeeParticipants, count: activeParticipantCount)
+                            ParticipantAvatarStack(participants: attendeeParticipants, count: activeParticipantCount, showsPrivatePreview: !canViewParticipantDetails)
                         }
                     }
                     .buttonStyle(.plain)
@@ -11199,26 +11203,51 @@ struct OpenMeteoDaily: Decodable {
 struct ParticipantAvatarStack: View {
     let participants: [EventParticipant]
     let count: Int
+    var showsPrivatePreview = false
 
     var body: some View {
-        HStack(spacing: -10) {
-            ForEach(participants.prefix(3)) { participant in
-                ParticipantAvatar(participant: participant, size: 38)
-                    .overlay(Circle().stroke(Brand.background, lineWidth: 2))
-            }
-            if count > 3 {
-                Text("+\(count - 3)")
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(Brand.mutedForeground)
-                    .frame(width: 38, height: 38)
-                    .background(Brand.muted, in: Circle())
-                    .overlay(Circle().stroke(Brand.background, lineWidth: 2))
-            } else if participants.isEmpty {
-                Text(count > 0 ? "\(count) iscritti" : "Nessun iscritto")
+        if showsPrivatePreview, count > 0 {
+            HStack(spacing: 8) {
+                HStack(spacing: -10) {
+                    ForEach(0..<privatePreviewSlotCount, id: \.self) { index in
+                        ParticipantPrivacyAvatar(participant: privatePreviewParticipant(at: index), size: 38)
+                            .overlay(Circle().stroke(Brand.background, lineWidth: 2))
+                    }
+                }
+
+                Text(count == 1 ? "1 iscritto" : "\(count) iscritti")
                     .font(.caption)
                     .foregroundStyle(Brand.mutedForeground)
             }
+        } else {
+            HStack(spacing: -10) {
+                ForEach(participants.prefix(3)) { participant in
+                    ParticipantAvatar(participant: participant, size: 38)
+                        .overlay(Circle().stroke(Brand.background, lineWidth: 2))
+                }
+                if count > 3 {
+                    Text("+\(count - 3)")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.mutedForeground)
+                        .frame(width: 38, height: 38)
+                        .background(Brand.muted, in: Circle())
+                        .overlay(Circle().stroke(Brand.background, lineWidth: 2))
+                } else if participants.isEmpty {
+                    Text(count > 0 ? "\(count) iscritti" : "Nessun iscritto")
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                }
+            }
         }
+    }
+
+    private var privatePreviewSlotCount: Int {
+        min(max(count, participants.count), 3)
+    }
+
+    private func privatePreviewParticipant(at index: Int) -> EventParticipant? {
+        guard index < participants.count else { return nil }
+        return participants[index]
     }
 }
 
@@ -11248,6 +11277,36 @@ struct ParticipantAvatar: View {
         }
         .frame(width: size, height: size)
         .clipShape(Circle())
+    }
+}
+
+struct ParticipantPrivacyAvatar: View {
+    let participant: EventParticipant?
+    let size: CGFloat
+
+    var body: some View {
+        avatar
+            .frame(width: size, height: size)
+            .clipShape(Circle())
+            .blur(radius: 6)
+            .accessibilityHidden(true)
+    }
+
+    @ViewBuilder
+    private var avatar: some View {
+        if let avatarUrl = participant?.avatarUrl?.nilIfBlank {
+            RemoteImage(urlString: avatarUrl)
+        } else {
+            ZStack {
+                Brand.muted
+                Circle()
+                    .fill(Brand.primary.opacity(0.12))
+                    .blur(radius: 8)
+                Text(participant?.initial ?? "?")
+                    .font(.system(size: size * 0.42, weight: .bold, design: .rounded))
+                    .foregroundStyle(Brand.primary)
+            }
+        }
     }
 }
 
