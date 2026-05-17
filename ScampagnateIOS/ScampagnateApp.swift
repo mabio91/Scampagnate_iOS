@@ -25542,24 +25542,60 @@ struct ProfilePrivacySection: View {
     @State private var consentsLoaded = false
     @State private var loadingConsents = false
     @State private var savingConsentTypes: Set<ConsentPreferenceType> = []
+    @State private var preferencesExpanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 8) {
                 ProfileGroupLabel("Le tue preferenze")
-                ProfilePushNotificationRow()
-                ProfileConsentRow(
-                    title: "Non perderti le prossime scampagnate 🌿",
-                    subtitle: "Ti avvisiamo su nuovi eventi, posti che si liberano e chicche della community",
-                    isOn: consentBinding(for: .marketing),
-                    isBusy: isConsentBusy(.marketing)
-                )
-                ProfileConsentRow(
-                    title: "Fai parte delle nostre storie 📸",
-                    subtitle: "Possiamo condividere foto e momenti delle esperienze sui nostri canali",
-                    isOn: consentBinding(for: .media),
-                    isBusy: isConsentBusy(.media)
-                )
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        preferencesExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 16) {
+                        Image(systemName: "bell.badge")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(Brand.secondary)
+                            .frame(width: 30)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Notifiche e consensi")
+                                .font(.subheadline.weight(.bold))
+                                .foregroundStyle(Brand.foreground)
+                            Text("Gestisci aggiornamenti e foto condivise")
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedForeground)
+                        }
+                        Spacer(minLength: 10)
+                        Image(systemName: preferencesExpanded ? "chevron.up" : "chevron.down")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(Brand.mutedForeground)
+                    }
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
+                }
+                .accessibilityValue(preferencesExpanded ? "Aperto" : "Chiuso")
+
+                if preferencesExpanded {
+                    VStack(alignment: .leading, spacing: 16) {
+                        ProfilePushNotificationRow()
+                        ProfileConsentRow(
+                            title: "Non perderti le prossime scampagnate 🌿",
+                            subtitle: "Ti avvisiamo su nuovi eventi, posti che si liberano e chicche della community",
+                            isOn: consentBinding(for: .marketing),
+                            isBusy: isConsentBusy(.marketing)
+                        )
+                        ProfileConsentRow(
+                            title: "Fai parte delle nostre storie 📸",
+                            subtitle: "Possiamo condividere foto e momenti delle esperienze sui nostri canali",
+                            isOn: consentBinding(for: .media),
+                            isBusy: isConsentBusy(.media)
+                        )
+                    }
+                    .padding(.leading, 46)
+                    .padding(.top, 4)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
             }
 
             VStack(alignment: .leading, spacing: 14) {
