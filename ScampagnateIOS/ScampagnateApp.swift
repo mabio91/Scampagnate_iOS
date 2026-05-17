@@ -401,6 +401,7 @@ final class AppStore: ObservableObject {
     }
 
     func fetchConsentPreferences() async -> ConsentPreferences? {
+        guard session != nil else { return nil }
         do {
             let authSession = try await authenticatedSession()
             return try await api.fetchConsentPreferences(userId: authSession.user.id, session: authSession)
@@ -411,6 +412,7 @@ final class AppStore: ObservableObject {
     }
 
     func updateConsentPreference(_ type: ConsentPreferenceType, granted: Bool) async -> Bool {
+        guard session != nil else { return false }
         do {
             let authSession = try await authenticatedSession()
             try await api.saveConsent(userId: authSession.user.id, type: type, granted: granted, session: authSession)
@@ -26586,6 +26588,10 @@ struct ProfilePrivacySection: View {
     }
 
     private func loadConsentPreferences() async {
+        guard store.isAuthenticated else {
+            resetConsentPreferences()
+            return
+        }
         guard !loadingConsents else { return }
         loadingConsents = true
         defer { loadingConsents = false }
@@ -26626,6 +26632,13 @@ struct ProfilePrivacySection: View {
         case .media:
             mediaConsent = value
         }
+    }
+
+    private func resetConsentPreferences() {
+        marketingConsent = false
+        mediaConsent = false
+        consentsLoaded = false
+        savingConsentTypes.removeAll()
     }
 
     private func isConsentBusy(_ type: ConsentPreferenceType) -> Bool {
