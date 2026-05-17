@@ -2628,9 +2628,14 @@ struct SupabaseAPI {
 
     func updateProfile(input: OnboardingInput, session: AuthSession) async throws {
         let grade = input.experienceGrade
+        let normalizedInstagramHandle = input.normalizedInstagramHandle
+        guard OnboardingInput.isValidInstagramHandle(normalizedInstagramHandle) else {
+            throw AppError.message("Inserisci solo username, @username o link instagram.com/username.")
+        }
         let payload: [String: JSONValue] = [
             "phone": .string(input.phone),
             "birth_date": input.birthDate.isEmpty ? .null : .string(input.birthDate),
+            "instagram_handle": normalizedInstagramHandle.map { .string($0) } ?? .null,
             "trekking_experience": .string(input.trekkingExperience),
             "activity_frequency": .string(input.activityFrequency),
             "experience_grade": .number(Double(grade)),
@@ -2663,10 +2668,15 @@ struct SupabaseAPI {
     }
 
     func updateProfile(input: ProfileEditInput, session: AuthSession) async throws {
+        let normalizedInstagramHandle = input.normalizedInstagramHandle
+        guard OnboardingInput.isValidInstagramHandle(normalizedInstagramHandle) else {
+            throw AppError.message("Inserisci solo username, @username o link instagram.com/username.")
+        }
         let payload: [String: JSONValue] = [
             "first_name": .string(input.firstName),
             "last_name": .string(input.lastName),
             "phone": .string(input.phone),
+            "instagram_handle": normalizedInstagramHandle.map { .string($0) } ?? .null,
             "bio": input.bio.isEmpty ? .null : .string(input.bio),
             "birth_date": input.birthDate.isEmpty ? .null : .string(input.birthDate),
             "birth_place": input.birthPlace.isEmpty ? .null : .string(input.birthPlace),
@@ -3595,6 +3605,7 @@ struct Profile: Codable, Identifiable {
     var firstName: String?
     var lastName: String?
     var phone: String
+    var instagramHandle: String?
     var avatarUrl: String?
     var bio: String?
     var totalPoints: Int?
@@ -6527,12 +6538,17 @@ struct UserConsentRow: Decodable {
 struct OnboardingInput {
     var phone = ""
     var birthDate = ""
+    var instagramHandle = ""
     var trekkingExperience = ""
     var selfLevel = ""
     var activityFrequency = ""
     var hasCar = ""
     var interests: [String] = []
     var motivation = ""
+
+    var normalizedInstagramHandle: String? {
+        Self.normalizedInstagramHandle(instagramHandle)
+    }
 
     var experienceGrade: Int {
         let map: [String: [String: Int]] = [
@@ -6542,12 +6558,31 @@ struct OnboardingInput {
         ]
         return map[trekkingExperience]?[activityFrequency] ?? 1
     }
+
+    static func normalizedInstagramHandle(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var normalized = trimmed
+            .replacingOccurrences(of: #"^https?://(www\.)?instagram\.com/"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"^instagram\.com/"#, with: "", options: .regularExpression)
+        normalized = normalized.components(separatedBy: CharacterSet(charactersIn: "/?#")).first ?? ""
+        normalized = normalized.replacingOccurrences(of: #"^@+"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    static func isValidInstagramHandle(_ handle: String?) -> Bool {
+        guard let handle else { return true }
+        return handle.range(of: #"^[a-z0-9._]{1,30}$"#, options: .regularExpression) != nil
+    }
 }
 
 struct ProfileEditInput {
     var firstName = ""
     var lastName = ""
     var phone = ""
+    var instagramHandle = ""
     var birthDate = ""
     var birthPlace = ""
     var provinceOfBirth = ""
@@ -6555,6 +6590,10 @@ struct ProfileEditInput {
     var cityOfResidence = ""
     var provinceOfResidence = ""
     var bio = ""
+
+    var normalizedInstagramHandle: String? {
+        OnboardingInput.normalizedInstagramHandle(instagramHandle)
+    }
 
     mutating func normalizeProvinceFields() {
         provinceOfBirth = Self.normalizedProvince(provinceOfBirth)
@@ -27065,6 +27104,7 @@ struct ProfileEditSheet: View {
                 ProfileSheetField("Cognome", text: $input.lastName)
             }
             ProfileSheetField("Telefono", text: $input.phone, keyboard: .phonePad)
+            ProfileSheetField("Instagram", placeholder: "@nomeutente", text: $input.instagramHandle, keyboard: .default)
             ProfileSheetTextArea("Bio", placeholder: "Parlaci di te...", text: $input.bio)
         }
     }
@@ -27173,6 +27213,7 @@ struct ProfileEditSheet: View {
         input.firstName != (profile.firstName ?? "") ||
         input.lastName != (profile.lastName ?? "") ||
         input.phone != profile.phone ||
+        input.instagramHandle != (profile.instagramHandle ?? "") ||
         input.birthDate != (profile.birthDate ?? "") ||
         input.birthPlace != (profile.birthPlace ?? "") ||
         input.provinceOfBirth != (profile.provinceOfBirth ?? "") ||
@@ -27187,6 +27228,7 @@ struct ProfileEditSheet: View {
             firstName: profile.firstName ?? "",
             lastName: profile.lastName ?? "",
             phone: profile.phone,
+            instagramHandle: profile.instagramHandle ?? "",
             birthDate: profile.birthDate ?? "",
             birthPlace: profile.birthPlace ?? "",
             provinceOfBirth: profile.provinceOfBirth ?? "",
@@ -27219,6 +27261,11 @@ struct ProfileEditSheet: View {
         let hasResidenceData = !input.residentialAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !input.cityOfResidence.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !input.provinceOfResidence.isEmpty
         if hasResidenceData, input.provinceOfResidence.count != 2 {
             store.errorMessage = "Inserisci la provincia di residenza con due lettere maiuscole."
+            return false
+        }
+
+        if !OnboardingInput.isValidInstagramHandle(input.normalizedInstagramHandle) {
+            store.errorMessage = "Inserisci solo username, @username o link instagram.com/username."
             return false
         }
 
@@ -27907,12 +27954,14 @@ struct ProfileSheetLabel: View {
 
 struct ProfileSheetField: View {
     let title: String
+    let placeholder: String
     @Binding var text: String
     let keyboard: UIKeyboardType
     let help: String?
 
-    init(_ title: String, text: Binding<String>, keyboard: UIKeyboardType = .default, help: String? = nil) {
+    init(_ title: String, placeholder: String? = nil, text: Binding<String>, keyboard: UIKeyboardType = .default, help: String? = nil) {
         self.title = title
+        self.placeholder = placeholder ?? title
         self._text = text
         self.keyboard = keyboard
         self.help = help
@@ -27926,7 +27975,7 @@ struct ProfileSheetField: View {
                     InfoTooltipButton(text: help)
                 }
             }
-            TextField("", text: $text, prompt: Text(title).foregroundStyle(Brand.inputMutedForeground))
+            TextField("", text: $text, prompt: Text(placeholder).foregroundStyle(Brand.inputMutedForeground))
                 .keyboardType(keyboard)
                 .font(.body)
                 .foregroundStyle(Brand.inputForeground)
@@ -28340,6 +28389,12 @@ struct OnboardingView: View {
                     }
                 }
 
+                OnboardingTextField(
+                    title: "Profilo Instagram",
+                    placeholder: "@nomeutente",
+                    text: $input.instagramHandle
+                )
+
                 OnboardingBirthDateField(
                     title: "Data di nascita",
                     required: true,
@@ -28493,7 +28548,7 @@ struct OnboardingView: View {
 
     private var canContinue: Bool {
         switch step {
-        case 1: return Self.isValidPhone(input.phone) && !input.birthDate.isEmpty
+        case 1: return Self.isValidPhone(input.phone) && !input.birthDate.isEmpty && OnboardingInput.isValidInstagramHandle(input.normalizedInstagramHandle)
         case 2: return !input.trekkingExperience.isEmpty && !input.selfLevel.isEmpty && !input.activityFrequency.isEmpty
         default: return !input.hasCar.isEmpty && (2...4).contains(input.interests.count) && !input.motivation.isEmpty
         }
@@ -28612,6 +28667,7 @@ struct OnboardingView: View {
         guard !didPrefill, let profile = store.profile else { return }
         input.phone = profile.phone
         input.birthDate = profile.birthDate ?? ""
+        input.instagramHandle = profile.instagramHandle ?? ""
         input.trekkingExperience = profile.trekkingExperience ?? ""
         input.selfLevel = profile.selfLevel ?? ""
         input.activityFrequency = profile.activityFrequency ?? ""
