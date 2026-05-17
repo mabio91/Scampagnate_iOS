@@ -7084,7 +7084,10 @@ struct RootView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             guard phase == .active, store.isAuthenticated else { return }
-            Task { await store.refreshUserData(reportingErrors: false) }
+            Task {
+                await pushNotifications.refreshAuthorizationStatus()
+                await store.refreshUserData(reportingErrors: false)
+            }
         }
         .task {
             if store.needsOnboarding {
@@ -9488,6 +9491,7 @@ struct EventAccessMessageCard: View {
 struct EventDetailView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var store: AppStore
+    @EnvironmentObject private var pushNotifications: PushNotificationService
     @Binding var showAuth: Bool
     let eventId: String
     let openParticipantsOnAppear: Bool
@@ -10153,8 +10157,13 @@ struct EventDetailView: View {
         guard !togglingOpeningReminder else { return }
         let wasActive = isOpeningReminderActive
         togglingOpeningReminder = true
+        defer { togglingOpeningReminder = false }
+
+        if !wasActive {
+            guard await preparePushNotificationsForOpeningReminder() else { return }
+        }
+
         let success = await store.toggleEventOpeningReminder(eventId: event.id)
-        togglingOpeningReminder = false
         guard success else { return }
 
         feedback = AppFeedback(
@@ -10164,6 +10173,64 @@ struct EventDetailView: View {
                 : "Ti avviseremo appena apriremo le iscrizioni.",
             icon: wasActive ? "bell.slash.fill" : "bell.badge.fill",
             tone: .success
+        )
+    }
+
+    private func preparePushNotificationsForOpeningReminder() async -> Bool {
+        guard let session = store.session else { return false }
+
+        await pushNotifications.refreshAuthorizationStatus()
+
+        switch pushNotifications.authorizationStatus {
+        case .notDetermined:
+            await pushNotifications.requestPermissionAndRegister(session: session)
+            await pushNotifications.refreshAuthorizationStatus()
+        case .denied:
+            openNotificationSettingsForReminder()
+            return false
+        case .authorized, .provisional, .ephemeral:
+            if pushNotifications.isPushActive {
+                await pushNotifications.syncIfPossible(session: session)
+                return true
+            }
+            await pushNotifications.requestPermissionAndRegister(session: session)
+            await pushNotifications.refreshAuthorizationStatus()
+        @unknown default:
+            feedback = AppFeedback(
+                title: "Notifiche non disponibili",
+                message: "Controlla le impostazioni di notifica del dispositivo e riprova.",
+                icon: "bell.slash.fill",
+                tone: .warning
+            )
+            return false
+        }
+
+        if pushNotifications.authorizationStatus == .denied {
+            openNotificationSettingsForReminder()
+            return false
+        }
+
+        guard pushNotifications.isPushActive else {
+            feedback = AppFeedback(
+                title: "Notifiche non attive",
+                message: "Per ricevere l'avviso quando apriamo le iscrizioni, abilita le notifiche dell'app.",
+                icon: "bell.slash.fill",
+                tone: .warning
+            )
+            return false
+        }
+
+        await pushNotifications.syncIfPossible(session: session)
+        return true
+    }
+
+    private func openNotificationSettingsForReminder() {
+        pushNotifications.openAppSettings()
+        feedback = AppFeedback(
+            title: "Notifiche bloccate",
+            message: "Abilita le notifiche dalle Impostazioni di iOS, poi torna qui per attivare l'avviso.",
+            icon: "bell.slash.fill",
+            tone: .warning
         )
     }
 
