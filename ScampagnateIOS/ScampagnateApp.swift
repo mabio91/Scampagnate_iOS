@@ -111,6 +111,7 @@ final class AppStore: ObservableObject {
     @Published var categories: [EventCategory] = []
     @Published var myEvents: [Registration] = []
     @Published var savedEvents: [SavedEvent] = []
+    @Published var eventOpeningReminders: [EventOpeningReminder] = []
     @Published var eventParticipants: [String: [EventParticipant]] = [:]
     @Published var organizerProfiles: [String: PublicProfile] = [:]
     @Published var organizerPublicProfiles: [String: OrganizerPublicProfile] = [:]
@@ -191,6 +192,7 @@ final class AppStore: ObservableObject {
             async let categoriesTask = api.fetchCategories(session: authSession)
             async let registrationsTask = api.fetchMyEvents(session: authSession)
             async let savedTask = api.fetchSavedEvents(session: authSession)
+            async let openingRemindersTask = api.fetchEventOpeningReminders(session: authSession)
             async let notificationsTask = api.fetchNotifications(session: authSession)
             async let productsTask = api.fetchProducts()
             async let rewardsTask = api.fetchRewards(session: authSession)
@@ -207,6 +209,7 @@ final class AppStore: ObservableObject {
             do { categories = try await categoriesTask } catch { remember(error, in: &firstError) }
             do { myEvents = try await registrationsTask } catch { remember(error, in: &firstError) }
             do { savedEvents = try await savedTask } catch { remember(error, in: &firstError) }
+            do { eventOpeningReminders = try await openingRemindersTask } catch { remember(error, in: &firstError) }
             do { notifications = try await notificationsTask } catch { remember(error, in: &firstError) }
             do { products = try await productsTask } catch { remember(error, in: &firstError) }
             do { rewards = try await rewardsTask } catch { remember(error, in: &firstError) }
@@ -237,11 +240,13 @@ final class AppStore: ObservableObject {
                 async let eventsTask = api.fetchEvents(session: authSession)
                 async let registrationsTask = api.fetchMyEvents(session: authSession)
                 async let savedTask = api.fetchSavedEvents(session: authSession)
+                async let openingRemindersTask = api.fetchEventOpeningReminders(session: authSession)
 
                 var firstError: Error?
                 do { events = try await eventsTask } catch { remember(error, in: &firstError) }
                 do { myEvents = try await registrationsTask } catch { remember(error, in: &firstError) }
                 do { savedEvents = try await savedTask } catch { remember(error, in: &firstError) }
+                do { eventOpeningReminders = try await openingRemindersTask } catch { remember(error, in: &firstError) }
 
                 report(firstError, when: reportingErrors)
             } catch {
@@ -757,6 +762,20 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func toggleEventOpeningReminder(eventId: String) async -> Bool {
+        guard session != nil else { return false }
+        let isActive = eventOpeningReminders.contains { $0.eventId == eventId && $0.isActive }
+        do {
+            let authSession = try await authenticatedSession()
+            try await api.toggleEventOpeningReminder(eventId: eventId, isActive: isActive, session: authSession)
+            eventOpeningReminders = try await api.fetchEventOpeningReminders(session: authSession)
+            return true
+        } catch {
+            report(error)
+            return false
+        }
+    }
+
     func markNotificationRead(_ id: String) async {
         guard session != nil else { return }
         do {
@@ -832,6 +851,7 @@ final class AppStore: ObservableObject {
         organizerEvents = []
         myEvents = []
         savedEvents = []
+        eventOpeningReminders = []
         notifications = []
         rewards = []
         missions = []
@@ -855,6 +875,7 @@ final class AppStore: ObservableObject {
             async let eventsTask = api.fetchEvents(session: authSession)
             async let registrationsTask = api.fetchMyEvents(session: authSession)
             async let savedTask = api.fetchSavedEvents(session: authSession)
+            async let openingRemindersTask = api.fetchEventOpeningReminders(session: authSession)
             async let rewardsTask = api.fetchRewards(session: authSession)
             async let missionsTask = api.fetchMissionCards(session: authSession)
             async let badgesTask = api.fetchUserBadges(session: authSession)
@@ -865,6 +886,7 @@ final class AppStore: ObservableObject {
             events = try await eventsTask
             myEvents = try await registrationsTask
             savedEvents = try await savedTask
+            eventOpeningReminders = try await openingRemindersTask
             rewards = try await rewardsTask
             missions = try await missionsTask
             badges = try await badgesTask
@@ -1579,7 +1601,7 @@ enum NotificationDestination: Equatable, Sendable {
 
         guard let normalizedType else { return nil }
         switch normalizedType {
-        case "registration", "registration_confirmed", "event_registration", "waitlist", "waitlist_promotion", "payment", "payment_confirmed", "deposit", "balance", "balance_due", "event", "event_update", "event_reminder", "event_reminder_24h", "event_reminder_3h":
+        case "registration", "registration_confirmed", "event_registration", "waitlist", "waitlist_promotion", "payment", "payment_confirmed", "deposit", "balance", "balance_due", "event", "event_update", "event_opening", "event_reminder", "event_reminder_24h", "event_reminder_3h":
             self = .events
         case "membership", "membership_payment", "membership_activated", "subscription":
             self = .profile(.membership)
@@ -2494,6 +2516,12 @@ struct SupabaseAPI {
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [SavedEvent].self)
     }
 
+    func fetchEventOpeningReminders(session: AuthSession) async throws -> [EventOpeningReminder] {
+        let select = "id,event_id,created_at,cancelled_at,notified_at"
+        let path = "/rest/v1/event_opening_reminders?select=\(select.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)&cancelled_at=is.null&notified_at=is.null&order=created_at.desc"
+        return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [EventOpeningReminder].self)
+    }
+
     func fetchNotifications(session: AuthSession) async throws -> [UserNotification] {
         let path = "/rest/v1/notifications?select=*&user_id=eq.\(session.user.id)&order=created_at.desc&limit=50"
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [UserNotification].self)
@@ -3232,6 +3260,24 @@ struct SupabaseAPI {
         }
     }
 
+    func toggleEventOpeningReminder(eventId: String, isActive: Bool, session: AuthSession) async throws {
+        if isActive {
+            let payload: [String: JSONValue] = [
+                "cancelled_at": .string(ISO8601DateFormatter().string(from: Date()))
+            ]
+            let data = try JSONEncoder().encode(payload)
+            let path = "/rest/v1/event_opening_reminders?event_id=eq.\(eventId.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)&cancelled_at=is.null&notified_at=is.null"
+            let _: EmptyResponse = try await request(path: path, method: "PATCH", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
+        } else {
+            let payload: [String: JSONValue] = [
+                "event_id": .string(eventId),
+                "user_id": .string(session.user.id)
+            ]
+            let data = try JSONEncoder().encode(payload)
+            let _: EmptyResponse = try await request(path: "/rest/v1/event_opening_reminders", method: "POST", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
+        }
+    }
+
     func markNotificationRead(id: String, session: AuthSession) async throws {
         let payload = ["read": true]
         let _: EmptyResponse = try await request(path: "/rest/v1/notifications?id=eq.\(id)", method: "PATCH", body: payload, auth: session, decode: EmptyResponse.self)
@@ -3777,6 +3823,11 @@ struct Event: Codable, Identifiable, Hashable {
     var requiresOnlinePayment: Bool { paymentType == "paid" || paymentType == "deposit" }
     var acceptsRegistrations: Bool {
         guard ["available", "published", "open"].contains(normalizedStatus) else { return false }
+        guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return true }
+        return eventDate >= Calendar.current.startOfDay(for: Date())
+    }
+    var canNotifyWhenRegistrationsOpen: Bool {
+        guard ["draft", "unpublished", "upcoming"].contains(normalizedStatus) else { return false }
         guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return true }
         return eventDate >= Calendar.current.startOfDay(for: Date())
     }
@@ -5711,6 +5762,18 @@ struct SavedEvent: Codable, Identifiable {
     let eventId: String?
     let events: Event?
     var event: Event? { events }
+}
+
+struct EventOpeningReminder: Codable, Identifiable {
+    let id: String
+    let eventId: String
+    let createdAt: String?
+    let cancelledAt: String?
+    let notifiedAt: String?
+
+    var isActive: Bool {
+        cancelledAt == nil && notifiedAt == nil
+    }
 }
 
 struct UserNotification: Codable, Identifiable {
@@ -9437,6 +9500,7 @@ struct EventDetailView: View {
     @State private var selectedGalleryIndex = 0
     @State private var descriptionExpanded = false
     @State private var savingEvent = false
+    @State private var togglingOpeningReminder = false
     @State private var showShare = false
     @State private var showCalendar = false
     @State private var showAccessWarning = false
@@ -9471,6 +9535,10 @@ struct EventDetailView: View {
 
     var isSaved: Bool {
         store.savedEvents.contains { $0.event?.id == eventId || $0.eventId == eventId }
+    }
+
+    var isOpeningReminderActive: Bool {
+        store.eventOpeningReminders.contains { $0.eventId == eventId && $0.isActive }
     }
 
     var participants: [EventParticipant] {
@@ -9903,6 +9971,10 @@ struct EventDetailView: View {
 
     private func bottomBar(_ event: Event) -> some View {
         let check = accessCheck(for: event)
+        let availabilityLabel = event.canNotifyWhenRegistrationsOpen
+            ? (isOpeningReminderActive ? "Ti avviseremo all'apertura" : "Iscrizioni non ancora aperte")
+            : event.availabilityLabel
+
         return VStack(spacing: 0) {
             if store.isAuthenticated, check.isBlocking {
                 Text(check.restrictionMessage ?? check.failedReasons.first ?? "Non soddisfi i requisiti per partecipare a questo evento.")
@@ -9921,7 +9993,7 @@ struct EventDetailView: View {
                     Text(event.displayPrice(profile: store.profile, badges: store.badges, registrations: store.myEvents))
                         .font(.title2.weight(.bold))
                         .foregroundStyle(Brand.foreground)
-                    Text(event.availabilityLabel)
+                    Text(availabilityLabel)
                         .font(.caption)
                         .foregroundStyle(Brand.mutedForeground)
                     if let registration, registration.normalizedStatus == "deposit_paid" || registration.paymentStatus == "deposit_paid" {
@@ -9953,6 +10025,18 @@ struct EventDetailView: View {
                             .frame(height: 50)
                             .background(statusStyle.background, in: RoundedRectangle(cornerRadius: 18))
                     }
+                } else if event.canNotifyWhenRegistrationsOpen {
+                    Button {
+                        Task { await toggleOpeningReminder(event) }
+                    } label: {
+                        Label(
+                            togglingOpeningReminder ? "Attendere..." : (isOpeningReminderActive ? "Avviso attivo" : "Avvisami"),
+                            systemImage: isOpeningReminderActive ? "bell.fill" : "bell"
+                        )
+                        .lineLimit(1)
+                    }
+                    .buttonStyle(OpeningReminderButtonStyle(isActive: isOpeningReminderActive, width: 170))
+                    .disabled(togglingOpeningReminder)
                 } else if !event.acceptsRegistrations {
                     Text(event.statusStyle.label)
                         .font(.headline.weight(.bold))
@@ -10059,6 +10143,28 @@ struct EventDetailView: View {
         savingEvent = true
         await store.toggleSave(eventId: event.id)
         savingEvent = false
+    }
+
+    private func toggleOpeningReminder(_ event: Event) async {
+        guard store.isAuthenticated else {
+            showAuth = true
+            return
+        }
+        guard !togglingOpeningReminder else { return }
+        let wasActive = isOpeningReminderActive
+        togglingOpeningReminder = true
+        let success = await store.toggleEventOpeningReminder(eventId: event.id)
+        togglingOpeningReminder = false
+        guard success else { return }
+
+        feedback = AppFeedback(
+            title: wasActive ? "Avviso disattivato" : "Avviso attivo",
+            message: wasActive
+                ? "Non riceverai la notifica quando apriremo le iscrizioni."
+                : "Ti avviseremo appena apriremo le iscrizioni.",
+            icon: wasActive ? "bell.slash.fill" : "bell.badge.fill",
+            tone: .success
+        )
     }
 
     private func shareItems(for event: Event) -> [Any] {
@@ -31517,6 +31623,38 @@ struct SecondaryButtonStyle: ButtonStyle {
     }
 }
 
+struct OpeningReminderButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+    let isActive: Bool
+    var width: CGFloat?
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(.headline, design: .rounded, weight: .bold))
+            .foregroundStyle(foreground)
+            .frame(maxWidth: width == nil ? .infinity : nil)
+            .frame(width: width)
+            .frame(height: 50)
+            .background(background, in: RoundedRectangle(cornerRadius: 18))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18)
+                    .stroke(isActive && isEnabled ? Brand.primary.opacity(0.38) : .clear, lineWidth: 1)
+            )
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .opacity(configuration.isPressed ? 0.9 : 1)
+    }
+
+    private var foreground: Color {
+        guard isEnabled else { return Brand.mutedForeground }
+        return isActive ? Brand.primary : .white
+    }
+
+    private var background: Color {
+        guard isEnabled else { return Brand.mutedForeground.opacity(0.18) }
+        return isActive ? Brand.primary.opacity(0.13) : Brand.primary
+    }
+}
+
 struct DestructiveButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -31844,6 +31982,7 @@ private func notificationIcon(_ type: String?) -> String {
     case "waitlist", "waitlist_promotion": "person.2"
     case "payment", "payment_confirmed", "deposit", "balance_due": "creditcard"
     case "event_update": "exclamationmark.circle"
+    case "event_opening": "bell.badge"
     case "event_reminder", "event_reminder_24h", "event_reminder_3h": "clock"
     case "issue_resolved": "checkmark.circle"
     case "membership", "membership_payment", "membership_activated": "checkmark.seal"
@@ -31868,7 +32007,7 @@ private func notificationTintColor(_ type: String?, read: Bool) -> Color {
         return Brand.warning
     case "event_reminder_3h":
         return Brand.destructive
-    case "event_update", "admin_broadcast", "ios_broadcast":
+    case "event_update", "event_opening", "admin_broadcast", "ios_broadcast":
         return Brand.primary
     case "shop", "merch", "merch_product", "product", "reward", "rewards", "points", "coupon", "coupon_unlocked", "mission_reward", "prize":
         return Brand.secondary
