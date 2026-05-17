@@ -4574,8 +4574,8 @@ struct OrganizerRegistration: Codable, Identifiable, Hashable {
         if normalizedStatus == "deposit_paid" || payment == "deposit_paid" {
             let balanceMode = priceOption?.effectiveBalancePaymentMode(fallback: event) ?? event.balancePaymentMode ?? "online"
             return balanceMode == "on_site"
-                ? "Acconto pagato - saldo sul posto"
-                : "Acconto pagato - saldo da completare"
+                ? "Iscritto - Acconto pagato"
+                : "Iscritto - Da saldare"
         }
         return payment
     }
@@ -5392,9 +5392,9 @@ private extension Registration {
         if waitlistSpotAvailable(in: event) { return "Posto disponibile" }
         if normalizedStatus == "deposit_paid" || paymentStatus == "deposit_paid" {
             let mode = priceOption(in: event)?.effectiveBalancePaymentMode(fallback: event) ?? event.balancePaymentMode ?? "online"
-            if mode == "on_site" { return "Acconto pagato - saldo sul posto" }
-            if hasOnlineBalanceDue(in: event) { return "Acconto pagato - saldo da completare" }
-            return "Acconto pagato"
+            if mode == "on_site" { return "Iscritto - Acconto pagato" }
+            if hasOnlineBalanceDue(in: event) { return "Iscritto - Da saldare" }
+            return "Iscritto"
         }
         return statusLabel
     }
@@ -5403,7 +5403,13 @@ private extension Registration {
         if waitlistSpotAvailable(in: event) {
             return (Brand.success.opacity(0.12), Brand.success)
         }
-        if normalizedStatus == "deposit_paid" || paymentStatus == "deposit_paid" || hasOnlineBalanceDue(in: event) {
+        if normalizedStatus == "deposit_paid" || paymentStatus == "deposit_paid" {
+            let mode = priceOption(in: event)?.effectiveBalancePaymentMode(fallback: event) ?? event.balancePaymentMode ?? "online"
+            if mode == "on_site" || hasOnlineBalanceDue(in: event) {
+                return (Brand.warning.opacity(0.16), Brand.warning)
+            }
+        }
+        if hasOnlineBalanceDue(in: event) {
             return (Brand.warning.opacity(0.16), Brand.warning)
         }
         return statusStyle
