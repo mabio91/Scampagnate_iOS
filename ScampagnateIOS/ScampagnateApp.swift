@@ -31634,6 +31634,7 @@ struct LinkRow: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: icon)
+                .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(Brand.secondary)
                 .frame(width: 32)
             VStack(alignment: .leading, spacing: 2) {
