@@ -11229,7 +11229,6 @@ struct ParticipantAvatarStack: View {
                     ForEach(participants.prefix(3)) { participant in
                         ParticipantAvatar(participant: participant, size: 38)
                             .blur(radius: 6)
-                            .overlay(Circle().stroke(Brand.background, lineWidth: 2))
                     }
                 }
 
