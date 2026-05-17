@@ -26562,7 +26562,7 @@ struct ProfilePrivacySection: View {
                     }
                     .padding(.leading, 46)
                     .padding(.top, 4)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .transition(.opacity)
                 }
             }
 
