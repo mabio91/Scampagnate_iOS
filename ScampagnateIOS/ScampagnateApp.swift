@@ -3848,7 +3848,7 @@ struct Event: Codable, Identifiable, Hashable {
     var isFull: Bool { isSoldOut }
     var requiresOnlinePayment: Bool { paymentType == "paid" || paymentType == "deposit" }
     var acceptsRegistrations: Bool {
-        guard ["available", "published", "open"].contains(normalizedStatus) else { return false }
+        guard ["available", "published", "open", "full"].contains(normalizedStatus) else { return false }
         guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return true }
         return eventDate >= Calendar.current.startOfDay(for: Date())
     }
