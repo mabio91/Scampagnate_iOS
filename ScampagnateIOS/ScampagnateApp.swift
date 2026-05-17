@@ -1968,7 +1968,7 @@ struct SupabaseAPI {
     private static let priceOptionSelect = "id,name,price,sort_order,original_price,eligible_group,is_promotional,promo_start,promo_end,payment_type,deposit_amount,balance_amount,balance_payment_mode,has_dedicated_spots,dedicated_spots,spots_taken,waitlist_enabled"
     private static let eventSelect = "id,title,date,time,location,location_label,category_id,status,price,deposit,payment_type,balance_payment_mode,image_url,difficulty,distance,elevation,duration,spots_total,spots_taken,reserved_spots,featured,event_badges,organizer_id,organizer_name,description,cancellation_policy,equipment_list,additional_fields,visibility,gallery_images,access_rules,event_categories(id,name,icon),event_meeting_points(id,name,location,time,notes),event_price_options(\(priceOptionSelect))"
     private static let registrationSelect = "*,events(\(eventSelect)),meeting_point:event_meeting_points(id,name,location,time)"
-    private static let organizerRegistrationSelect = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,sport_level,amount_paid,refund_amount,last_balance_reminder_sent_at,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,avatar_url,total_points,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade,interests,birth_date),price_option:event_price_options(\(priceOptionSelect))"
+    private static let organizerRegistrationSelect = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,sport_level,amount_paid,refund_amount,last_balance_reminder_sent_at,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,instagram_handle,avatar_url,total_points,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade,interests,birth_date),price_option:event_price_options(\(priceOptionSelect))"
     private static let nonManualRegistrationFilter = "&or=(sport_level.is.null,sport_level.not.like.manual:%25)"
 
     private let decoder: JSONDecoder = {
@@ -4687,6 +4687,7 @@ struct OrganizerParticipantProfile: Codable, Hashable {
     let firstName: String?
     let lastName: String?
     let phone: String?
+    let instagramHandle: String?
     let avatarUrl: String?
     let totalPoints: Int?
     let membershipId: Int?
@@ -4703,6 +4704,20 @@ struct OrganizerParticipantProfile: Codable, Hashable {
             .compactMap { $0?.nilIfBlank }
             .joined(separator: " ")
             .nilIfBlank ?? "Partecipante"
+    }
+
+    var normalizedInstagramHandle: String? {
+        instagramHandle?
+            .trimmingCharacters(in: CharacterSet(charactersIn: "@").union(.whitespacesAndNewlines))
+            .nilIfBlank
+    }
+
+    var instagramDisplay: String? {
+        normalizedInstagramHandle.map { "@\($0)" }
+    }
+
+    var instagramURL: URL? {
+        normalizedInstagramHandle.flatMap { URL(string: "https://www.instagram.com/\($0)") }
     }
 }
 
@@ -11062,6 +11077,7 @@ struct ParticipantsSheet: View {
     @Binding var showAuth: Bool
     @State private var organizerRegistrations: [OrganizerRegistration] = []
     @State private var registrationHistoryByUserId: [String: [ParticipantRegistrationHistoryRow]] = [:]
+    @State private var selectedParticipantProfile: OrganizerRegistration?
 
     private var participants: [EventParticipant] {
         store.eventParticipants[eventId] ?? []
@@ -11136,7 +11152,12 @@ struct ParticipantsSheet: View {
                                             registration: organizerRegistration(for: participant),
                                             event: event,
                                             levels: store.communityLevels,
-                                            history: history(for: participant)
+                                            history: history(for: participant),
+                                            onOpenProfile: {
+                                                if let registration = organizerRegistration(for: participant), !registration.isManual {
+                                                    selectedParticipantProfile = registration
+                                                }
+                                            }
                                         )
                                     } else {
                                         ParticipantPersonRow(participant: participant, levels: store.communityLevels, mode: .details)
@@ -11170,6 +11191,16 @@ struct ParticipantsSheet: View {
         .task(id: loadKey) {
             await store.loadParticipants(eventId: eventId)
             await loadOrganizerDetailsIfNeeded()
+        }
+        .sheet(item: $selectedParticipantProfile) { registration in
+            if let event {
+                OrganizerParticipantProfileSheet(
+                    registration: registration,
+                    event: event,
+                    levels: store.communityLevels,
+                    history: history(for: registration)
+                )
+            }
         }
     }
 
@@ -11239,6 +11270,11 @@ struct ParticipantsSheet: View {
 
     private func history(for participant: EventParticipant) -> [ParticipantRegistrationHistoryRow] {
         guard let userId = participant.userId?.nilIfBlank else { return [] }
+        return registrationHistoryByUserId[userId] ?? []
+    }
+
+    private func history(for registration: OrganizerRegistration) -> [ParticipantRegistrationHistoryRow] {
+        guard let userId = registration.userId?.nilIfBlank else { return [] }
         return registrationHistoryByUserId[userId] ?? []
     }
 }
@@ -11330,9 +11366,14 @@ struct OrganizerPublicParticipantDetailRow: View {
     let event: Event
     let levels: [CommunityLevelDefinition]
     let history: [ParticipantRegistrationHistoryRow]
+    let onOpenProfile: () -> Void
 
     private var displayProfile: OrganizerParticipantProfile? {
         registration?.isManual == true ? nil : registration?.profiles
+    }
+
+    private var canOpenProfile: Bool {
+        registration != nil && registration?.isManual != true
     }
 
     private var displayName: String {
@@ -11432,6 +11473,9 @@ struct OrganizerPublicParticipantDetailRow: View {
                     }
                     ParticipantDetailChip(icon: reliabilityLabel == "Da migliorare" ? "exclamationmark.triangle.fill" : "checkmark.circle.fill", text: "Affidabilità \(reliabilityLabel)", color: reliabilityColor)
                     ParticipantDetailChip(icon: "checkmark.seal.fill", text: "\(completedEvents) eventi completati", color: Brand.mutedForeground)
+                    if let instagram = displayProfile?.instagramDisplay {
+                        ParticipantDetailChip(icon: "camera.fill", text: instagram, color: Brand.primary)
+                    }
                     if let age = participant.age ?? displayProfile?.birthDate.flatMap({ calculateAge(from: $0) }) {
                         ParticipantDetailChip(icon: "calendar", text: "\(age) anni", color: Brand.mutedForeground)
                     }
@@ -11439,8 +11483,18 @@ struct OrganizerPublicParticipantDetailRow: View {
             }
 
             Spacer(minLength: 0)
+            if canOpenProfile {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(Brand.mutedForeground)
+            }
         }
         .contentShape(Rectangle())
+        .onTapGesture {
+            if canOpenProfile {
+                onOpenProfile()
+            }
+        }
     }
 
     private func rank(_ row: ParticipantRegistrationHistoryRow) -> Int {
@@ -11473,6 +11527,230 @@ struct ParticipantDetailChip: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
         .background(color.opacity(0.10), in: Capsule())
+    }
+}
+
+struct OrganizerParticipantProfileSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let registration: OrganizerRegistration
+    let event: Event
+    let levels: [CommunityLevelDefinition]
+    let history: [ParticipantRegistrationHistoryRow]
+
+    private var profile: OrganizerParticipantProfile? {
+        registration.isManual ? nil : registration.profiles
+    }
+
+    private var displayName: String {
+        registration.displayName.nilIfBlank ?? profile?.displayName ?? "Partecipante"
+    }
+
+    private var age: Int? {
+        profile?.birthDate.flatMap { calculateAge(from: $0) }
+    }
+
+    private var points: Int {
+        profile?.totalPoints ?? 0
+    }
+
+    private var level: CommunityLevelDefinition? {
+        CommunityLevelDefinition.currentLevel(points: points, levels: levels)
+    }
+
+    private var fitScore: EventFitScoreResult? {
+        guard let profile else { return nil }
+        let result = EventFitScoreResult(organizerProfile: profile, event: event)
+        return result.hidden || result.profileIncomplete ? nil : result
+    }
+
+    private var completedEvents: Int {
+        history.filter(\.isCompleted).count
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    header
+                    contactSection
+                    profileSection
+                    eventSection
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 18)
+                .padding(.bottom, 34)
+            }
+            .background(Brand.background)
+            .navigationTitle("Profilo partecipante")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Chiudi") {
+                        dismiss()
+                    }
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Brand.primary)
+                }
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .center, spacing: 16) {
+            OrganizerProfileAvatar(profile: profile, name: displayName, size: 76)
+            VStack(alignment: .leading, spacing: 8) {
+                Text(age.map { "\(displayName), \($0)" } ?? displayName)
+                    .font(.system(.title3, design: .rounded, weight: .bold))
+                    .foregroundStyle(Brand.foreground)
+                    .fixedSize(horizontal: false, vertical: true)
+                FlowLayout(spacing: 6, rowSpacing: 6) {
+                    BadgeLabel(text: registration.statusLabel, color: registration.statusColor.opacity(0.14), foreground: registration.statusColor)
+                    if let level {
+                        BadgeLabel(text: level.name, color: (Color(hex: level.color) ?? Brand.primary).opacity(0.12), foreground: Color(hex: level.color) ?? Brand.primary)
+                    }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(16)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 20))
+        .overlay(RoundedRectangle(cornerRadius: 20).stroke(Brand.muted, lineWidth: 1))
+    }
+
+    @ViewBuilder
+    private var contactSection: some View {
+        if profile?.phone?.nilIfBlank != nil || profile?.instagramDisplay != nil {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle("Contatti")
+                if let phone = profile?.phone?.nilIfBlank {
+                    OrganizerParticipantProfileActionRow(icon: "phone", title: "Telefono", value: phone, tint: Brand.primary) {
+                        if let url = URL(string: "tel://\(phone.filter { $0.isNumber || $0 == "+" })") {
+                            UIApplication.shared.open(url)
+                        }
+                    }
+                }
+                if let instagram = profile?.instagramDisplay, let url = profile?.instagramURL {
+                    OrganizerParticipantProfileActionRow(icon: "camera", title: "Instagram", value: instagram, tint: Brand.primary) {
+                        UIApplication.shared.open(url)
+                    }
+                }
+            }
+        }
+    }
+
+    private var profileSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionTitle("Profilo")
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                OrganizerParticipantProfileInfoTile(icon: "star.fill", title: "Punti", value: "\(points)")
+                if let membershipId = profile?.membershipId {
+                    OrganizerParticipantProfileInfoTile(icon: "creditcard", title: "Tessera", value: "\(membershipId)")
+                }
+                if let selfLevel = profile?.selfLevel?.nilIfBlank {
+                    OrganizerParticipantProfileInfoTile(icon: "figure.hiking", title: "Livello", value: selfLevel)
+                }
+                if let trekking = profile?.trekkingExperience?.nilIfBlank {
+                    OrganizerParticipantProfileInfoTile(icon: "mountain.2.fill", title: "Trekking", value: "\(trekking.webTrekkingValue) trek")
+                }
+                if let frequency = profile?.activityFrequency?.nilIfBlank {
+                    OrganizerParticipantProfileInfoTile(icon: "face.smiling", title: "Frequenza", value: frequency)
+                }
+                if let grade = profile?.experienceGrade {
+                    OrganizerParticipantProfileInfoTile(icon: "chart.bar.fill", title: "Grade", value: "\(grade)")
+                }
+                if let fitScore {
+                    OrganizerParticipantProfileInfoTile(icon: "checkmark.circle.fill", title: "Compatibilita", value: "\(fitScore.score)%")
+                }
+                if !history.isEmpty {
+                    OrganizerParticipantProfileInfoTile(icon: "checkmark.seal.fill", title: "Completati", value: "\(completedEvents)")
+                }
+            }
+            if let interests = profile?.interests?.filter({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }), !interests.isEmpty {
+                FlowLayout(spacing: 6, rowSpacing: 6) {
+                    ForEach(interests, id: \.self) { interest in
+                        ParticipantDetailChip(icon: "tag.fill", text: interest, color: Brand.mutedForeground)
+                    }
+                }
+                .padding(.top, 2)
+            }
+        }
+    }
+
+    private var eventSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionTitle("Iscrizione")
+            OrganizerParticipantProfileInfoTile(icon: "ticket", title: "Formula", value: registration.priceOption?.displayName ?? "Partecipazione")
+            if let payment = registration.paymentStatus?.nilIfBlank {
+                OrganizerParticipantProfileInfoTile(icon: "creditcard", title: "Pagamento", value: payment.webPaymentStatusLabel)
+            }
+            OrganizerParticipantProfileInfoTile(icon: "checkmark.circle", title: "Check-in", value: registration.checkedIn == true ? "Si" : "No")
+        }
+    }
+}
+
+private struct OrganizerParticipantProfileActionRow: View {
+    let icon: String
+    let title: String
+    let value: String
+    let tint: Color
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 11) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 38, height: 38)
+                    .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Brand.mutedForeground)
+                    Text(value)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                }
+                Spacer()
+                Image(systemName: "arrow.up.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(tint)
+            }
+            .padding(12)
+            .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct OrganizerParticipantProfileInfoTile: View {
+    let icon: String
+    let title: String
+    let value: String
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Brand.primary)
+                .frame(width: 30, height: 30)
+                .background(Brand.primary.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Brand.mutedForeground)
+                Text(value)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(Brand.foreground)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.muted, lineWidth: 1))
     }
 }
 
@@ -17207,6 +17485,7 @@ struct OrganizerEventManageView: View {
     @State private var showOwnerPicker = false
     @State private var sharePayload: SharePayload?
     @State private var exportingCSV = false
+    @State private var selectedParticipantProfile: OrganizerRegistration?
 
     private var activeRegistrations: [OrganizerRegistration] {
         registrations.filter(\.isActive)
@@ -17290,6 +17569,16 @@ struct OrganizerEventManageView: View {
                 OrganizerOwnerPickerSheet(event: event) {
                     await load()
                 }
+            }
+        }
+        .sheet(item: $selectedParticipantProfile) { registration in
+            if let event {
+                OrganizerParticipantProfileSheet(
+                    registration: registration,
+                    event: event,
+                    levels: store.communityLevels,
+                    history: []
+                )
             }
         }
         .sheet(item: $sharePayload) { item in
@@ -17380,6 +17669,7 @@ struct OrganizerEventManageView: View {
                 onPayment: updatePayment,
                 onMeetingPoint: updateMeetingPoint,
                 onPriceOption: updatePriceOption,
+                onOpenProfile: { selectedParticipantProfile = $0 },
                 onExport: exportCSV,
                 isExporting: exportingCSV
             )
@@ -17621,9 +17911,9 @@ private enum OrganizerParticipantCSVExporter {
     }
 
     private static func makeCSV(registrations: [OrganizerRegistration], meetingPoints: [MeetingPoint]) -> String {
-        let header = "Nome,Cognome,Telefono,Livello,Formula,Stato,Pagamento,Importo pagato,Rimborso,Ritrovo,Check-in,Registrato"
+        let header = "Nome,Cognome,Telefono,Instagram,Livello,Formula,Stato,Pagamento,Importo pagato,Rimborso,Ritrovo,Check-in,Registrato"
         let meetingPointNames = Dictionary(uniqueKeysWithValues: meetingPoints.map { ($0.id, $0.name ?? "") })
-        let rows = registrations.map { registration in
+        let rows = registrations.filter(\.isActive).map { registration in
             let meetingPoint = registration.meetingPointId.flatMap { meetingPointNames[$0] } ?? ""
             let firstName = registration.isManual ? (registration.manualName ?? registration.displayName) : (registration.profiles?.firstName ?? "")
             let lastName = registration.isManual ? "(manual)" : (registration.profiles?.lastName ?? "")
@@ -17631,6 +17921,7 @@ private enum OrganizerParticipantCSVExporter {
                 (firstName.nilIfBlank ?? "-").csvEscaped,
                 (lastName.nilIfBlank ?? "-").csvEscaped,
                 (registration.isManual ? "-" : (registration.profiles?.phone ?? "-")).csvEscaped,
+                (registration.isManual ? "-" : (registration.profiles?.instagramDisplay ?? "-")).csvEscaped,
                 (registration.isManual ? "-" : (registration.sportLevel ?? "-")).csvEscaped,
                 (registration.priceOption?.displayName ?? "-").csvEscaped,
                 registration.statusLabel.csvEscaped,
@@ -18014,6 +18305,7 @@ struct OrganizerParticipantsSection: View {
     let onPayment: (OrganizerRegistration, String) -> Void
     let onMeetingPoint: (OrganizerRegistration, String?) -> Void
     let onPriceOption: (OrganizerRegistration, String?) -> Void
+    let onOpenProfile: (OrganizerRegistration) -> Void
     let onExport: () -> Void
     let isExporting: Bool
 
@@ -18150,7 +18442,8 @@ struct OrganizerParticipantsSection: View {
                             onStatus: { onStatus(registration, $0) },
                             onPayment: { onPayment(registration, $0) },
                             onMeetingPoint: { onMeetingPoint(registration, $0) },
-                            onPriceOption: { onPriceOption(registration, $0) }
+                            onPriceOption: { onPriceOption(registration, $0) },
+                            onOpenProfile: { onOpenProfile(registration) }
                         )
                     }
                 }
@@ -19195,6 +19488,11 @@ struct OrganizerParticipantRow: View {
     let onPayment: (String) -> Void
     let onMeetingPoint: (String?) -> Void
     let onPriceOption: (String?) -> Void
+    let onOpenProfile: () -> Void
+
+    private var canOpenProfile: Bool {
+        !registration.isManual && registration.userId?.nilIfBlank != nil
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -19209,6 +19507,17 @@ struct OrganizerParticipantRow: View {
                     VStack(alignment: .leading, spacing: 3) {
                         if let phone = registration.profiles?.phone?.nilIfBlank {
                             Label(phone, systemImage: "phone")
+                        }
+                        if registration.isActive,
+                           let instagram = registration.profiles?.instagramDisplay,
+                           let url = registration.profiles?.instagramURL {
+                            Button {
+                                UIApplication.shared.open(url)
+                            } label: {
+                                Label(instagram, systemImage: "camera")
+                            }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(Brand.primary)
                         }
                         if let meetingPoint {
                             Label(meetingPoint.name ?? "Ritrovo", systemImage: "mappin.and.ellipse")
@@ -19225,6 +19534,14 @@ struct OrganizerParticipantRow: View {
                 VStack(alignment: .trailing, spacing: 8) {
                     BadgeLabel(text: registration.statusLabel, color: registration.statusColor.opacity(0.14), foreground: registration.statusColor)
                     Menu {
+                        if canOpenProfile {
+                            Button {
+                                onOpenProfile()
+                            } label: {
+                                Label("Apri profilo", systemImage: "person.crop.circle")
+                            }
+                            Divider()
+                        }
                         Button {
                             onToggleCheckIn()
                         } label: {
@@ -19275,6 +19592,13 @@ struct OrganizerParticipantRow: View {
         .padding(12)
         .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+        .contentShape(Rectangle())
+        .onTapGesture {
+            if canOpenProfile {
+                onOpenProfile()
+            }
+        }
+        .accessibilityHint(Text(canOpenProfile ? "Tocca per aprire il profilo partecipante" : ""))
     }
 
     private var participantChips: [OrganizerParticipantChipModel] {
@@ -19425,6 +19749,7 @@ private struct FlowLayoutItem {
 struct OrganizerProfileAvatar: View {
     let profile: OrganizerParticipantProfile?
     let name: String
+    var size: CGFloat = 44
 
     var body: some View {
         ZStack {
@@ -19441,7 +19766,7 @@ struct OrganizerProfileAvatar: View {
                     .foregroundStyle(Brand.primary)
             }
         }
-        .frame(width: 44, height: 44)
+        .frame(width: size, height: size)
         .clipShape(Circle())
     }
 }
