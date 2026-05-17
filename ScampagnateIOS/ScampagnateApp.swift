@@ -1435,6 +1435,17 @@ struct EventNavigationTarget: Identifiable, Hashable, Sendable {
     }
 }
 
+struct MissionNavigationTarget: Identifiable, Hashable, Sendable {
+    let id = UUID()
+    let missionId: String?
+    let completedAtHint: String?
+
+    init(missionId: String? = nil, completedAtHint: String? = nil) {
+        self.missionId = missionId
+        self.completedAtHint = completedAtHint
+    }
+}
+
 struct OrganizerNavigationTarget: Identifiable, Hashable, Sendable {
     let id: String
 }
@@ -1530,23 +1541,28 @@ struct HomeDiscoveryRequest: Identifiable, Equatable, Sendable {
 enum NotificationDestination: Equatable, Sendable {
     case event(String)
     case events
+    case mission(id: String?, completedAt: String?)
     case profile(ProfileScrollTarget)
     case shop
 
-    init?(type: String?, eventId: String?) {
+    init?(type: String?, eventId: String?, missionId: String? = nil, completedAt: String? = nil, title: String? = nil, message: String? = nil) {
+        let normalizedType = type?.notificationTypeKey
+        if Self.isMissionNotification(type: normalizedType, title: title, message: message) {
+            self = .mission(id: missionId?.nilIfBlank, completedAt: completedAt?.nilIfBlank)
+            return
+        }
+
         if let eventId = eventId?.nilIfBlank {
             self = .event(eventId)
             return
         }
 
-        guard let normalizedType = type?.notificationTypeKey else { return nil }
+        guard let normalizedType else { return nil }
         switch normalizedType {
         case "registration", "registration_confirmed", "event_registration", "waitlist", "waitlist_promotion", "payment", "payment_confirmed", "deposit", "balance", "balance_due", "event", "event_update", "event_reminder", "event_reminder_24h", "event_reminder_3h":
             self = .events
         case "membership", "membership_payment", "membership_activated", "subscription":
             self = .profile(.membership)
-        case "mission", "mission_completed", "challenge", "challenge_completed":
-            self = .profile(.missions)
         case "badge", "badge_unlocked", "user_badge":
             self = .profile(.badges)
         case "reward", "rewards", "points", "coupon", "coupon_unlocked", "mission_reward", "prize":
@@ -1563,8 +1579,12 @@ enum NotificationDestination: Equatable, Sendable {
     static func from(userInfo: [AnyHashable: Any]) -> NotificationDestination? {
         let payloads = nestedPayloads(userInfo)
         let eventId = payloads.lazy.compactMap { stringValue(in: $0, keys: ["event_id", "eventId", "event"]) }.first
+        let missionId = payloads.lazy.compactMap { stringValue(in: $0, keys: ["mission_id", "missionId", "mission"]) }.first
+        let completedAt = payloads.lazy.compactMap { stringValue(in: $0, keys: ["completed_at", "completedAt", "created_at", "createdAt"]) }.first
         let type = payloads.lazy.compactMap { stringValue(in: $0, keys: ["type", "notification_type", "notificationType", "category"]) }.first
-        if let destination = NotificationDestination(type: type, eventId: eventId) {
+        let title = payloads.lazy.compactMap { stringValue(in: $0, keys: ["title", "alert_title", "alertTitle"]) }.first
+        let message = payloads.lazy.compactMap { stringValue(in: $0, keys: ["message", "body", "alert", "subtitle"]) }.first
+        if let destination = NotificationDestination(type: type, eventId: eventId, missionId: missionId, completedAt: completedAt, title: title, message: message) {
             return destination
         }
 
@@ -1580,6 +1600,8 @@ enum NotificationDestination: Equatable, Sendable {
             return "Apri evento"
         case .events:
             return "Vai ai miei eventi"
+        case .mission:
+            return "Apri missione"
         case .profile(let target):
             switch target {
             case .membership:
@@ -1614,6 +1636,9 @@ enum NotificationDestination: Equatable, Sendable {
             return .profile(.rewards)
         }
         if normalizedRoute.contains("mission") {
+            if let missionId = missionId(fromRoute: route) {
+                return .mission(id: missionId, completedAt: nil)
+            }
             return .profile(.missions)
         }
         if normalizedRoute.contains("membership") || normalizedRoute.contains("tessera") {
@@ -1636,11 +1661,18 @@ enum NotificationDestination: Equatable, Sendable {
 
     private static func nestedPayloads(_ userInfo: [AnyHashable: Any]) -> [[AnyHashable: Any]] {
         var payloads = [userInfo]
-        if let data = userInfo[AnyHashable("data")] as? [AnyHashable: Any] {
-            payloads.append(data)
-        } else if let data = userInfo[AnyHashable("data")] as? [String: Any] {
-            payloads.append(Dictionary(uniqueKeysWithValues: data.map { (AnyHashable($0.key), $0.value) }))
+
+        var index = 0
+        while index < payloads.count {
+            let payload = payloads[index]
+            for key in ["data", "custom", "additionalData", "aps", "alert"] {
+                if let nested = dictionaryValue(payload[AnyHashable(key)]) {
+                    payloads.append(nested)
+                }
+            }
+            index += 1
         }
+
         return payloads
     }
 
@@ -1654,6 +1686,64 @@ enum NotificationDestination: Equatable, Sendable {
                 return clean
             }
         }
+        return nil
+    }
+
+    private static func dictionaryValue(_ value: Any?) -> [AnyHashable: Any]? {
+        if let dictionary = value as? [AnyHashable: Any] {
+            return dictionary
+        }
+        if let dictionary = value as? [String: Any] {
+            return Dictionary(uniqueKeysWithValues: dictionary.map { (AnyHashable($0.key), $0.value) })
+        }
+        return nil
+    }
+
+    private static func isMissionNotification(type: String?, title: String?, message: String?) -> Bool {
+        if let type, ["mission", "mission_completed", "challenge", "challenge_completed"].contains(type) {
+            return true
+        }
+
+        return [title, message]
+            .compactMap { $0?.nilIfBlank }
+            .map(normalizedCopy)
+            .contains { value in
+                value.contains("missione completat") || value.contains("mission completed")
+            }
+    }
+
+    private static func normalizedCopy(_ value: String) -> String {
+        value
+            .folding(options: .diacriticInsensitive, locale: .current)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+    }
+
+    private static func missionId(fromRoute route: String) -> String? {
+        guard let url = URL(string: route) else { return nil }
+
+        let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        if let missionId = queryItems
+            .first(where: { ["mission_id", "missionId", "id"].contains($0.name) })?
+            .value?
+            .nilIfBlank {
+            return missionId
+        }
+
+        let components = ([url.host].compactMap { $0 } + url.pathComponents)
+            .filter { $0 != "/" }
+        for (index, component) in components.enumerated() {
+            let normalized = component.lowercased()
+            guard ["mission", "missions", "missione", "missioni"].contains(normalized),
+                  components.indices.contains(index + 1) else { continue }
+            let candidate = components[index + 1]
+            if let missionId = candidate.nilIfBlank,
+               !["mission", "missions", "missione", "missioni"].contains(missionId.lowercased()) {
+                return missionId
+            }
+        }
+
         return nil
     }
 }
@@ -5491,13 +5581,14 @@ struct UserNotification: Codable, Identifiable {
     let title: String
     let message: String
     let eventId: String?
+    let missionId: String?
     var read: Bool
     let createdAt: String?
 }
 
 private extension UserNotification {
     var destination: NotificationDestination? {
-        NotificationDestination(type: type, eventId: eventId)
+        NotificationDestination(type: type, eventId: eventId, missionId: missionId, completedAt: createdAt, title: title, message: message)
     }
 
     var displayTitle: String {
@@ -6629,6 +6720,7 @@ struct RootView: View {
     @State private var routedOrganizerDashboardRoute: OrganizerDashboardRoute?
     @State private var routedOrganizerProfile: OrganizerNavigationTarget?
     @State private var routedContentPage: ContentPageRoute?
+    @State private var routedMission: MissionNavigationTarget?
     @State private var profileScrollTarget: ProfileScrollTarget?
     @State private var routedRewards = false
     @State private var profileTabAvatarImage: UIImage?
@@ -6664,7 +6756,7 @@ struct RootView: View {
                     }
                     .tag(AppTab.shop)
 
-                ProfileView(showAuth: $showAuth, scrollTarget: $profileScrollTarget, openRewards: $routedRewards)
+                ProfileView(showAuth: $showAuth, scrollTarget: $profileScrollTarget, openRewards: $routedRewards, routedMission: $routedMission)
                     .tabItem {
                         profileTabItem
                     }
@@ -6844,6 +6936,13 @@ struct RootView: View {
             }
         case .events:
             selectedTab = .events
+        case .mission(let missionId, let completedAt):
+            selectedTab = .profile
+            Task { await store.refreshUserData(reportingErrors: false) }
+            routeAfterSheetDismissal {
+                profileScrollTarget = .missions
+                routedMission = MissionNavigationTarget(missionId: missionId, completedAtHint: completedAt)
+            }
         case .profile(let target):
             selectedTab = .profile
             routeAfterSheetDismissal {
@@ -22561,6 +22660,7 @@ struct ProfileView: View {
     @Binding var showAuth: Bool
     @Binding var scrollTarget: ProfileScrollTarget?
     @Binding var openRewards: Bool
+    @Binding var routedMission: MissionNavigationTarget?
     @State private var showEdit = false
     @State private var showPointsInfo = false
     @State private var showRoutedRewards = false
@@ -22630,7 +22730,7 @@ struct ProfileView: View {
                                         MembershipCard(profile: profile)
                                             .id(ProfileScrollTarget.membership)
                                         ProfileProgressionSection(profile: profile, levels: store.communityLevels)
-                                        MissionsSection(missions: store.missions)
+                                        MissionsSection(missions: store.missions, routedMission: $routedMission)
                                             .id(ProfileScrollTarget.missions)
                                         RewardsShortcutRow(rewards: store.rewards, badges: store.badges)
                                             .id(ProfileScrollTarget.rewards)
@@ -23276,6 +23376,7 @@ struct ProfileProgressionSection: View {
 struct MissionsSection: View {
     @EnvironmentObject private var store: AppStore
     let missions: [MissionCardModel]
+    @Binding var routedMission: MissionNavigationTarget?
     @State private var selectedMission: MissionCardModel?
     @State private var showCompletedMissions = false
 
@@ -23285,6 +23386,12 @@ struct MissionsSection: View {
 
     private var completedMissions: [MissionCardModel] {
         missions.filter(\.isCompleted)
+    }
+
+    private var recentlyCompletedMissions: [MissionCardModel] {
+        completedMissions.sorted { lhs, rhs in
+            (lhs.completedAt ?? "") > (rhs.completedAt ?? "")
+        }
     }
 
     var body: some View {
@@ -23351,10 +23458,49 @@ struct MissionsSection: View {
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
         }
+        .onAppear {
+            openRoutedMissionIfNeeded()
+        }
+        .onChange(of: routedMission?.id) { _, _ in
+            openRoutedMissionIfNeeded()
+        }
+        .onChange(of: missions.map(\.id)) { _, _ in
+            openRoutedMissionIfNeeded()
+        }
     }
 
     private func openEvents(for mission: MissionCardModel) {
         store.homeDiscoveryRequest = HomeDiscoveryRequest(mission: mission)
+    }
+
+    private func openRoutedMissionIfNeeded() {
+        guard let target = routedMission, !missions.isEmpty else { return }
+
+        let mission: MissionCardModel?
+        if let missionId = target.missionId?.nilIfBlank {
+            mission = missions.first { $0.missionId == missionId || $0.id == missionId }
+        } else {
+            mission = routedCompletedMission(near: target.completedAtHint)
+        }
+
+        guard let mission else { return }
+        if mission.isCompleted {
+            showCompletedMissions = true
+        }
+        selectedMission = mission
+        routedMission = nil
+    }
+
+    private func routedCompletedMission(near completedAtHint: String?) -> MissionCardModel? {
+        guard let hintDate = completedAtHint?.isoDate else {
+            return recentlyCompletedMissions.first
+        }
+
+        return completedMissions.min { lhs, rhs in
+            let lhsDistance = abs((lhs.completedAt?.isoDate ?? .distantPast).timeIntervalSince(hintDate))
+            let rhsDistance = abs((rhs.completedAt?.isoDate ?? .distantPast).timeIntervalSince(hintDate))
+            return lhsDistance < rhsDistance
+        } ?? recentlyCompletedMissions.first
     }
 }
 
