@@ -5385,7 +5385,7 @@ private extension Registration {
             return requiresOnlinePayment(in: event) ? "Completa prenotazione" : "Conferma il posto"
         }
         if hasOnlineBalanceDue(in: event) { return "Completa il saldo" }
-        return "Completa pagamento"
+        return "Completa il pagamento"
     }
 
     func displayStatusLabel(in event: Event) -> String {
@@ -7279,7 +7279,10 @@ struct AppFeedback: Identifiable, Equatable {
         case .spotTaken(let message):
             self.init(title: "Posto non confermato", message: message, icon: "person.2.slash", tone: .warning)
         case .error(let message):
-            self.init(title: "Pagamento da verificare", message: message.isEmpty ? "Riprova tra qualche istante." : message, icon: "exclamationmark.triangle.fill", tone: .error)
+            let defaultMessage = "Riprova tra qualche istante."
+            let normalizedMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayMessage = normalizedMessage.isEmpty || normalizedMessage == "Pagamento non ancora confermato" ? defaultMessage : normalizedMessage
+            self.init(title: "Pagamento da verificare", message: displayMessage, icon: "exclamationmark.triangle.fill", tone: .error)
         }
     }
 
@@ -7352,7 +7355,7 @@ struct PaymentAuthenticationView: View {
     var body: some View {
         ZStack(alignment: .bottom) {
             SafariCheckoutView(url: checkout.url) {
-                finish(AppFeedback(title: "Pagamento chiuso", message: "Checkout interrotto. Nessun pagamento è stato confermato.", icon: "xmark.circle.fill", tone: .warning))
+                finish(AppFeedback(title: "Pagamento annullato", message: "Non è stato addebitato nulla. Puoi riprendere quando vuoi.", icon: "xmark.circle.fill", tone: .warning))
             }
             .ignoresSafeArea()
 
