@@ -65,7 +65,7 @@ struct ScampagnateApp: App {
                     await store.bootstrap()
                 }
                 .onChange(of: scenePhase) { _, phase in
-                    guard phase == .active else { return }
+                    guard phase == .active, !store.isAuthenticated else { return }
                     Task { await store.refreshEventData(reportingErrors: false) }
                 }
         }
@@ -247,12 +247,14 @@ final class AppStore: ObservableObject {
             do {
                 let authSession = try await authenticatedSession()
                 async let eventsTask = api.fetchEvents(session: authSession)
+                async let categoriesTask = api.fetchCategories(session: authSession)
                 async let registrationsTask = api.fetchMyEvents(session: authSession)
                 async let savedTask = api.fetchSavedEvents(session: authSession)
                 async let openingRemindersTask = api.fetchEventOpeningReminders(session: authSession)
 
                 var firstError: Error?
                 do { events = try await eventsTask } catch { remember(error, in: &firstError) }
+                do { categories = try await categoriesTask } catch { remember(error, in: &firstError) }
                 do { myEvents = try await registrationsTask } catch { remember(error, in: &firstError) }
                 do { savedEvents = try await savedTask } catch { remember(error, in: &firstError) }
                 do { eventOpeningReminders = try await openingRemindersTask } catch { remember(error, in: &firstError) }
@@ -262,21 +264,48 @@ final class AppStore: ObservableObject {
                 report(error, when: reportingErrors)
             }
         } else {
+            async let eventsTask = api.fetchEvents(session: nil)
+            async let categoriesTask = api.fetchCategories(session: nil)
+            var firstError: Error?
             do {
-                events = try await api.fetchEvents(session: nil)
-            } catch {
-                report(error, when: reportingErrors)
-            }
+                events = try await eventsTask
+            } catch { remember(error, in: &firstError) }
+            do {
+                categories = try await categoriesTask
+            } catch { remember(error, in: &firstError) }
+            report(firstError, when: reportingErrors)
         }
     }
 
-    func refreshEventDetail(eventId: String) async {
-        guard session != nil else {
-            await loadPublicData(reportingErrors: false)
+    func refreshEventDetail(eventId: String, reportingErrors: Bool = true) async {
+        if session != nil {
+            do {
+                let authSession = try await authenticatedSession()
+                async let eventTask = api.fetchEvent(eventId: eventId, session: authSession)
+                async let registrationsTask = api.fetchMyEvents(session: authSession)
+                async let savedTask = api.fetchSavedEvents(session: authSession)
+                async let openingRemindersTask = api.fetchEventOpeningReminders(session: authSession)
+
+                var firstError: Error?
+                do { mergeEventSnapshot(try await eventTask) } catch { remember(error, in: &firstError) }
+                do { myEvents = try await registrationsTask } catch { remember(error, in: &firstError) }
+                do { savedEvents = try await savedTask } catch { remember(error, in: &firstError) }
+                do { eventOpeningReminders = try await openingRemindersTask } catch { remember(error, in: &firstError) }
+
+                report(firstError, when: reportingErrors)
+                await refreshParticipants(eventId: eventId, session: authSession)
+            } catch {
+                report(error, when: reportingErrors)
+            }
+        } else {
+            do {
+                mergeEventSnapshot(try await api.fetchEvent(eventId: eventId, session: nil))
+            } catch {
+                await refreshEventData(reportingErrors: false)
+                report(error, when: reportingErrors)
+            }
             await loadParticipants(eventId: eventId)
-            return
         }
-        await refreshEventState(participantEventId: eventId)
     }
 
     func refreshEventClosingSentences(reportingErrors: Bool = false) async {
@@ -8681,8 +8710,7 @@ struct HomeView: View {
                 }
             }
             .refreshable {
-                await store.loadPublicData()
-                if store.isAuthenticated { await store.refreshUserData() }
+                await store.refreshEventData()
             }
         }
     }
@@ -9718,6 +9746,9 @@ struct EventDetailView: View {
                             .frame(width: proxy.size.width, alignment: .leading)
                             .padding(.bottom, 20)
                         }
+                        .refreshable {
+                            await store.refreshEventDetail(eventId: eventId)
+                        }
                         .ignoresSafeArea(edges: .top)
                         .modifier(EventDetailScrollTracker(scrollOffset: $scrollOffset))
 
@@ -9847,7 +9878,7 @@ struct EventDetailView: View {
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .tabBar)
         .task(id: eventId) {
-            await store.refreshEventDetail(eventId: eventId)
+            await store.refreshEventDetail(eventId: eventId, reportingErrors: false)
             openInitialParticipantsIfNeeded()
         }
         .task(id: event?.organizerId ?? "") {
@@ -14729,7 +14760,7 @@ struct MyEventsView: View {
             .navigationDestination(item: $presentedRoutedEvent) { target in
                 EventDetailView(eventId: target.eventId, showAuth: $showAuth, openParticipantsOnAppear: target.opensParticipants)
             }
-            .refreshable { await store.refreshUserData() }
+            .refreshable { await store.refreshEventData() }
             .onAppear {
                 openRoutedEventIfNeeded()
             }
