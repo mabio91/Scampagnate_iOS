@@ -2001,7 +2001,7 @@ struct SupabaseAPI {
     private static let priceOptionSelect = "id,name,price,sort_order,original_price,eligible_group,is_promotional,promo_start,promo_end,payment_type,deposit_amount,balance_amount,balance_payment_mode,has_dedicated_spots,dedicated_spots,spots_taken,waitlist_enabled"
     private static let eventSelect = "id,title,date,time,location,location_label,category_id,status,price,deposit,payment_type,balance_payment_mode,image_url,difficulty,distance,elevation,duration,spots_total,spots_taken,reserved_spots,featured,event_badges,organizer_id,organizer_name,description,cancellation_policy,equipment_list,additional_fields,visibility,gallery_images,access_rules,event_categories(id,name,icon),event_meeting_points(id,name,location,time,notes),event_price_options(\(priceOptionSelect))"
     private static let registrationSelect = "*,events(\(eventSelect)),meeting_point:event_meeting_points(id,name,location,time)"
-    private static let organizerRegistrationSelect = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,sport_level,amount_paid,refund_amount,last_balance_reminder_sent_at,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,instagram_handle,avatar_url,total_points,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade,interests,birth_date),price_option:event_price_options(\(priceOptionSelect))"
+    private static let organizerRegistrationSelect = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,sport_level,amount_paid,refund_amount,last_balance_reminder_sent_at,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,instagram_handle,avatar_url,total_points,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade,interests,birth_date,health_safety_status,health_safety_notes,emergency_medication_has,emergency_medication_notes,health_safety_help_notes),price_option:event_price_options(\(priceOptionSelect))"
     private static let nonManualRegistrationFilter = "&or=(sport_level.is.null,sport_level.not.like.manual:%25)"
 
     private let decoder: JSONDecoder = {
@@ -2688,7 +2688,7 @@ struct SupabaseAPI {
         guard OnboardingInput.isValidInstagramHandle(normalizedInstagramHandle) else {
             throw AppError.message("Inserisci solo username, @username o link instagram.com/username.")
         }
-        let payload: [String: JSONValue] = [
+        var payload: [String: JSONValue] = [
             "phone": .string(input.phone),
             "birth_date": input.birthDate.isEmpty ? .null : .string(input.birthDate),
             "instagram_handle": normalizedInstagramHandle.map { .string($0) } ?? .null,
@@ -2696,11 +2696,11 @@ struct SupabaseAPI {
             "activity_frequency": .string(input.activityFrequency),
             "experience_grade": .number(Double(grade)),
             "self_level": .string(input.selfLevel),
-            "has_car": .string(input.hasCar),
             "interests": .array(input.interests.map { .string($0) }),
             "event_motivation": .string(input.motivation),
             "onboarding_completed": .bool(true)
         ]
+        payload.merge(input.healthSafetyPayload()) { _, new in new }
         try await patchProfile(payload, session: session)
     }
 
@@ -2711,16 +2711,17 @@ struct SupabaseAPI {
 
     private func profilePreferencesPayload(input: OnboardingInput) -> [String: JSONValue] {
         let grade = input.experienceGrade
-        return [
+        var payload: [String: JSONValue] = [
             "trekking_experience": .string(input.trekkingExperience),
             "activity_frequency": .string(input.activityFrequency),
             "experience_grade": .number(Double(grade)),
             "self_level": .string(input.selfLevel),
-            "has_car": .string(input.hasCar),
             "interests": .array(input.interests.map { .string($0) }),
             "event_motivation": .string(input.motivation),
             "onboarding_completed": .bool(true)
         ]
+        payload.merge(input.healthSafetyPayload()) { _, new in new }
+        return payload
     }
 
     func updateProfile(input: ProfileEditInput, session: AuthSession) async throws {
@@ -2728,7 +2729,7 @@ struct SupabaseAPI {
         guard OnboardingInput.isValidInstagramHandle(normalizedInstagramHandle) else {
             throw AppError.message("Inserisci solo username, @username o link instagram.com/username.")
         }
-        let payload: [String: JSONValue] = [
+        var payload: [String: JSONValue] = [
             "first_name": .string(input.firstName),
             "last_name": .string(input.lastName),
             "phone": .string(input.phone),
@@ -2741,6 +2742,9 @@ struct SupabaseAPI {
             "city_of_residence": input.cityOfResidence.isEmpty ? .null : .string(input.cityOfResidence),
             "province_of_residence": input.provinceOfResidence.isEmpty ? .null : .string(input.provinceOfResidence.uppercased())
         ]
+        if !input.healthSafetyStatus.isEmpty {
+            payload.merge(input.healthSafetyPayload()) { _, new in new }
+        }
         try await patchProfile(payload, session: session)
     }
 
@@ -3697,6 +3701,12 @@ struct Profile: Codable, Identifiable {
     var interests: [String]?
     var onboardingCompleted: Bool?
     var eventMotivation: String?
+    var healthSafetyStatus: String?
+    var healthSafetyNotes: String?
+    var emergencyMedicationHas: Bool?
+    var emergencyMedicationNotes: String?
+    var healthSafetyHelpNotes: String?
+    var healthSafetyUpdatedAt: String?
     var birthDate: String?
     var birthPlace: String?
     var provinceOfBirth: String?
@@ -4777,6 +4787,11 @@ struct OrganizerParticipantProfile: Codable, Hashable {
     let experienceGrade: Int?
     let interests: [String]?
     let birthDate: String?
+    let healthSafetyStatus: String?
+    let healthSafetyNotes: String?
+    let emergencyMedicationHas: Bool?
+    let emergencyMedicationNotes: String?
+    let healthSafetyHelpNotes: String?
 
     var displayName: String {
         [firstName, lastName]
@@ -4797,6 +4812,14 @@ struct OrganizerParticipantProfile: Codable, Hashable {
 
     var instagramURL: URL? {
         normalizedInstagramHandle.flatMap { URL(string: "https://www.instagram.com/\($0)") }
+    }
+
+    var healthSafetyLabel: String {
+        switch healthSafetyStatus {
+        case "none": return "Nessuna da segnalare"
+        case "has_info": return "Informazioni da leggere"
+        default: return "Non compilato"
+        }
     }
 }
 
@@ -6649,6 +6672,11 @@ struct OnboardingInput {
     var selfLevel = ""
     var activityFrequency = ""
     var hasCar = ""
+    var healthSafetyStatus = ""
+    var healthSafetyNotes = ""
+    var emergencyMedicationAnswer = ""
+    var emergencyMedicationNotes = ""
+    var healthSafetyHelpNotes = ""
     var interests: [String] = []
     var motivation = ""
 
@@ -6663,6 +6691,44 @@ struct OnboardingInput {
             "5_plus": ["low": 3, "medium": 4, "high": 5]
         ]
         return map[trekkingExperience]?[activityFrequency] ?? 1
+    }
+
+    var healthSafetyIsValid: Bool {
+        switch healthSafetyStatus {
+        case "none":
+            return true
+        case "has_info":
+            guard !healthSafetyNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+            guard emergencyMedicationAnswer == "yes" || emergencyMedicationAnswer == "no" else { return false }
+            if emergencyMedicationAnswer == "yes" {
+                return !emergencyMedicationNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            return true
+        default:
+            return false
+        }
+    }
+
+    func healthSafetyPayload(now: String = ISO8601DateFormatter().string(from: Date())) -> [String: JSONValue] {
+        if healthSafetyStatus == "none" {
+            return [
+                "health_safety_status": .string("none"),
+                "health_safety_notes": .null,
+                "emergency_medication_has": .null,
+                "emergency_medication_notes": .null,
+                "health_safety_help_notes": .null,
+                "health_safety_updated_at": .string(now)
+            ]
+        }
+
+        return [
+            "health_safety_status": .string("has_info"),
+            "health_safety_notes": .string(healthSafetyNotes.trimmingCharacters(in: .whitespacesAndNewlines)),
+            "emergency_medication_has": .bool(emergencyMedicationAnswer == "yes"),
+            "emergency_medication_notes": emergencyMedicationAnswer == "yes" ? .string(emergencyMedicationNotes.trimmingCharacters(in: .whitespacesAndNewlines)) : .null,
+            "health_safety_help_notes": healthSafetyHelpNotes.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank.map { .string($0) } ?? .null,
+            "health_safety_updated_at": .string(now)
+        ]
     }
 
     static func normalizedInstagramHandle(_ value: String) -> String? {
@@ -6696,6 +6762,11 @@ struct ProfileEditInput {
     var cityOfResidence = ""
     var provinceOfResidence = ""
     var bio = ""
+    var healthSafetyStatus = ""
+    var healthSafetyNotes = ""
+    var emergencyMedicationAnswer = ""
+    var emergencyMedicationNotes = ""
+    var healthSafetyHelpNotes = ""
 
     var normalizedInstagramHandle: String? {
         OnboardingInput.normalizedInstagramHandle(instagramHandle)
@@ -6704,6 +6775,26 @@ struct ProfileEditInput {
     mutating func normalizeProvinceFields() {
         provinceOfBirth = Self.normalizedProvince(provinceOfBirth)
         provinceOfResidence = Self.normalizedProvince(provinceOfResidence)
+    }
+
+    var healthSafetyIsValid: Bool {
+        OnboardingInput(
+            healthSafetyStatus: healthSafetyStatus,
+            healthSafetyNotes: healthSafetyNotes,
+            emergencyMedicationAnswer: emergencyMedicationAnswer,
+            emergencyMedicationNotes: emergencyMedicationNotes,
+            healthSafetyHelpNotes: healthSafetyHelpNotes
+        ).healthSafetyIsValid
+    }
+
+    func healthSafetyPayload(now: String = ISO8601DateFormatter().string(from: Date())) -> [String: JSONValue] {
+        OnboardingInput(
+            healthSafetyStatus: healthSafetyStatus,
+            healthSafetyNotes: healthSafetyNotes,
+            emergencyMedicationAnswer: emergencyMedicationAnswer,
+            emergencyMedicationNotes: emergencyMedicationNotes,
+            healthSafetyHelpNotes: healthSafetyHelpNotes
+        ).healthSafetyPayload(now: now)
     }
 
     static func normalizedProvince(_ value: String) -> String {
@@ -11794,6 +11885,7 @@ struct OrganizerParticipantProfileSheet: View {
                 VStack(alignment: .leading, spacing: 18) {
                     header
                     contactSection
+                    healthSafetySection
                     profileSection
                     eventSection
                 }
@@ -11855,6 +11947,48 @@ struct OrganizerParticipantProfileSheet: View {
                         UIApplication.shared.open(url)
                     }
                 }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var healthSafetySection: some View {
+        if let profile {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle("Salute e sicurezza")
+                VStack(alignment: .leading, spacing: 9) {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: profile.healthSafetyStatus == "has_info" ? "exclamationmark.triangle.fill" : "checkmark.shield.fill")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(profile.healthSafetyStatus == "has_info" ? Brand.warning : Brand.success)
+                            .frame(width: 28, height: 28)
+                            .background((profile.healthSafetyStatus == "has_info" ? Brand.warning : Brand.success).opacity(0.12), in: Circle())
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(profile.healthSafetyLabel)
+                                .font(.subheadline.weight(.bold))
+                                .foregroundStyle(Brand.foreground)
+                            Text("Non influenza compatibilità, suggerimenti o blocchi.")
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedForeground)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+
+                    if profile.healthSafetyStatus == "has_info" {
+                        if let notes = profile.healthSafetyNotes?.nilIfBlank {
+                            OrganizerParticipantHealthText(title: "Informazioni utili", value: notes)
+                        }
+                        if profile.emergencyMedicationHas == true, let medications = profile.emergencyMedicationNotes?.nilIfBlank {
+                            OrganizerParticipantHealthText(title: "Farmaci/dispositivi", value: medications)
+                        }
+                        if let helpNotes = profile.healthSafetyHelpNotes?.nilIfBlank {
+                            OrganizerParticipantHealthText(title: "Indicazioni", value: helpNotes)
+                        }
+                    }
+                }
+                .padding(14)
+                .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
             }
         }
     }
@@ -11942,6 +12076,25 @@ private struct OrganizerParticipantProfileActionRow: View {
             .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
         }
         .buttonStyle(.plain)
+    }
+}
+
+private struct OrganizerParticipantHealthText: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption2.weight(.bold))
+                .textCase(.uppercase)
+                .foregroundStyle(Brand.mutedForeground)
+            Text(value)
+                .font(.caption)
+                .foregroundStyle(Brand.foreground)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.top, 4)
     }
 }
 
@@ -19840,6 +19993,11 @@ struct OrganizerParticipantRow: View {
         if let grade = registration.profiles?.experienceGrade {
             chips.append(.init(text: "Grade: \(grade)", icon: "chart.bar.fill", tint: Brand.secondary, fill: Brand.secondary.opacity(0.12)))
         }
+        if registration.profiles?.healthSafetyStatus == "has_info" {
+            chips.append(.init(text: "Salute: da leggere", icon: "cross.case.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
+        } else if registration.profiles?.healthSafetyStatus == "none" {
+            chips.append(.init(text: "Salute: ok", icon: "checkmark.shield.fill", tint: Brand.success, fill: Brand.success.opacity(0.12)))
+        }
         if let sportLevel = registration.sportLevel?.nilIfBlank, !sportLevel.hasPrefix("manual:") {
             chips.append(.init(text: "Level: \(sportLevel)", icon: "figure.hiking", tint: Brand.primary, fill: Brand.primary.opacity(0.10)))
         }
@@ -23550,6 +23708,11 @@ struct ProfileView: View {
                                         ProfileCompletenessCard(profile: profile) {
                                             showEdit = true
                                         }
+                                        if profile.healthSafetyStatus != "none" && profile.healthSafetyStatus != "has_info" {
+                                            HealthSafetyProfileCallout {
+                                                showEdit = true
+                                            }
+                                        }
                                         MembershipCard(profile: profile)
                                             .id(ProfileScrollTarget.membership)
                                         ProfileProgressionSection(profile: profile, levels: store.communityLevels)
@@ -23698,8 +23861,7 @@ struct ProfileCompletenessCard: View {
             CompletionField(label: "Livello esperienza", completed: !(profile.selfLevel ?? "").isEmpty, group: "Preferenze"),
             CompletionField(label: "Esperienza trekking", completed: !(profile.trekkingExperience ?? "").isEmpty, group: "Preferenze"),
             CompletionField(label: "Frequenza attività", completed: !(profile.activityFrequency ?? "").isEmpty, group: "Preferenze"),
-            CompletionField(label: "Interessi", completed: !(profile.interests ?? []).isEmpty, group: "Preferenze"),
-            CompletionField(label: "Automunito", completed: !(profile.hasCar ?? "").isEmpty, group: "Preferenze")
+            CompletionField(label: "Interessi", completed: !(profile.interests ?? []).isEmpty, group: "Preferenze")
         ]
     }
 
@@ -23784,6 +23946,41 @@ struct ProfileCompletenessCard: View {
             .background(Brand.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 16))
             .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.primary.opacity(0.18), lineWidth: 1))
         }
+    }
+}
+
+struct HealthSafetyProfileCallout: View {
+    let action: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "cross.case.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Brand.secondary)
+                    .frame(width: 34, height: 34)
+                    .background(Brand.secondary.opacity(0.12), in: Circle())
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Completa salute e sicurezza")
+                        .font(.system(.subheadline, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                    Text("Una nuova sezione aiuta staff e organizzatori a sapere cosa serve in caso di necessità. Non cambia fit score, suggerimenti o accesso agli eventi.")
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Button(action: action) {
+                Label("Completa ora", systemImage: "chevron.right")
+                    .labelStyle(.titleAndIcon)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(SecondaryButtonStyle())
+        }
+        .padding(14)
+        .background(Brand.secondary.opacity(0.055), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.secondary.opacity(0.18), lineWidth: 1))
     }
 }
 
@@ -27523,6 +27720,7 @@ struct ProfileEditSheet: View {
                         sheetHeader
                         profileFields
                         membershipFields
+                        healthSafetyFields
 
                         if hasChanges {
                             Button {
@@ -27717,11 +27915,32 @@ struct ProfileEditSheet: View {
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Brand.muted, lineWidth: 1))
     }
 
+    private var healthSafetyFields: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            ProfileSheetLabel("Salute e sicurezza")
+            Text("Questi dati sono utili allo staff durante le attività. Puoi modificarli o cancellarli quando vuoi.")
+                .font(.caption)
+                .foregroundStyle(Brand.mutedForeground)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HealthSafetyEditor(
+                status: $input.healthSafetyStatus,
+                notes: $input.healthSafetyNotes,
+                emergencyMedicationAnswer: $input.emergencyMedicationAnswer,
+                emergencyMedicationNotes: $input.emergencyMedicationNotes,
+                helpNotes: $input.healthSafetyHelpNotes
+            )
+        }
+        .padding(16)
+        .background(Brand.background, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Brand.muted, lineWidth: 1))
+    }
+
     private var preferencesSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             ProfileSheetLabel("Preferenze")
             Button { showPreferenceEdit = true } label: {
-                ProfileSettingsRow(icon: "gearshape", iconColor: Brand.secondary, title: "Modifica preferenze", subtitle: "Livello, interessi, auto, frequenza", showChevron: true)
+                ProfileSettingsRow(icon: "gearshape", iconColor: Brand.secondary, title: "Modifica preferenze", subtitle: "Livello, interessi, frequenza", showChevron: true)
             }
             .buttonStyle(.plain)
         }
@@ -27777,7 +27996,12 @@ struct ProfileEditSheet: View {
         input.residentialAddress != (profile.residentialAddress ?? "") ||
         input.cityOfResidence != (profile.cityOfResidence ?? "") ||
         input.provinceOfResidence != (profile.provinceOfResidence ?? "") ||
-        input.bio != (profile.bio ?? "")
+        input.bio != (profile.bio ?? "") ||
+        input.healthSafetyStatus != (profile.healthSafetyStatus ?? "") ||
+        input.healthSafetyNotes != (profile.healthSafetyNotes ?? "") ||
+        input.emergencyMedicationAnswer != (profile.emergencyMedicationHas.map { $0 ? "yes" : "no" } ?? "") ||
+        input.emergencyMedicationNotes != (profile.emergencyMedicationNotes ?? "") ||
+        input.healthSafetyHelpNotes != (profile.healthSafetyHelpNotes ?? "")
     }
 
     private func resetInput() {
@@ -27792,7 +28016,12 @@ struct ProfileEditSheet: View {
             residentialAddress: profile.residentialAddress ?? "",
             cityOfResidence: profile.cityOfResidence ?? "",
             provinceOfResidence: profile.provinceOfResidence ?? "",
-            bio: profile.bio ?? ""
+            bio: profile.bio ?? "",
+            healthSafetyStatus: normalizedHealthSafetyStatus(profile.healthSafetyStatus),
+            healthSafetyNotes: profile.healthSafetyNotes ?? "",
+            emergencyMedicationAnswer: profile.emergencyMedicationHas.map { $0 ? "yes" : "no" } ?? "",
+            emergencyMedicationNotes: profile.emergencyMedicationNotes ?? "",
+            healthSafetyHelpNotes: profile.healthSafetyHelpNotes ?? ""
         )
         input.normalizeProvinceFields()
     }
@@ -27826,7 +28055,17 @@ struct ProfileEditSheet: View {
             return false
         }
 
+        if !input.healthSafetyStatus.isEmpty, !input.healthSafetyIsValid {
+            store.errorMessage = "Completa i campi obbligatori della sezione salute e sicurezza."
+            return false
+        }
+
         return true
+    }
+
+    private func normalizedHealthSafetyStatus(_ value: String?) -> String {
+        guard value == "none" || value == "has_info" else { return "" }
+        return value ?? ""
     }
 
     private func submitEmailChange() async {
@@ -28903,8 +29142,10 @@ struct OnboardingView: View {
             stepOneView
         case 2:
             stepTwoView
-        default:
+        case 3:
             stepThreeView
+        default:
+            stepFourView
         }
     }
 
@@ -29014,21 +29255,41 @@ struct OnboardingView: View {
 
     private var stepThreeView: some View {
         VStack(alignment: .leading, spacing: 24) {
-            Text("Le tue preferenze")
-                .font(.system(size: 24, weight: .bold, design: .rounded))
-                .foregroundStyle(Brand.foreground)
-                .padding(.bottom, 2)
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Salute e sicurezza")
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .foregroundStyle(Brand.foreground)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Solo ciò che può essere utile allo staff in caso di necessità durante un'attività.")
+                    .font(.system(size: 16, weight: .regular, design: .rounded))
+                    .foregroundStyle(Brand.mutedForeground)
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
-            OnboardingSelectionGroup(
-                title: "Sei automunito?",
-                required: true,
-                options: [
-                    .init(value: "yes", emoji: "🚗", title: "Sì"),
-                    .init(value: "prefer_not_to_drive", emoji: "🤷", title: "Preferisco non guidare"),
-                    .init(value: "no", emoji: "🚫", title: "No")
-                ],
-                selection: $input.hasCar
+            HealthSafetyEditor(
+                status: $input.healthSafetyStatus,
+                notes: $input.healthSafetyNotes,
+                emergencyMedicationAnswer: $input.emergencyMedicationAnswer,
+                emergencyMedicationNotes: $input.emergencyMedicationNotes,
+                helpNotes: $input.healthSafetyHelpNotes
             )
+        }
+    }
+
+    private var stepFourView: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Le tue preferenze")
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .foregroundStyle(Brand.foreground)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Useremo queste risposte per suggerirti eventi più affini, senza cambiare la logica del fit score.")
+                    .font(.system(size: 16, weight: .regular, design: .rounded))
+                    .foregroundStyle(Brand.mutedForeground)
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             OnboardingInterestGrid(selected: $input.interests)
 
@@ -29073,7 +29334,7 @@ struct OnboardingView: View {
                         Text(primaryButtonTitle)
                             .lineLimit(1)
                             .minimumScaleFactor(0.76)
-                        if step < 3 {
+                        if step < 4 {
                             Image(systemName: "arrow.right")
                         }
                     }
@@ -29099,6 +29360,7 @@ struct OnboardingView: View {
         switch step {
         case 1: "Profilo base"
         case 2: "Esperienza"
+        case 3: "Salute e sicurezza"
         default: "Preferenze"
         }
     }
@@ -29107,7 +29369,8 @@ struct OnboardingView: View {
         switch step {
         case 1: return Self.isValidPhone(input.phone) && !input.birthDate.isEmpty && OnboardingInput.isValidInstagramHandle(input.normalizedInstagramHandle)
         case 2: return !input.trekkingExperience.isEmpty && !input.selfLevel.isEmpty && !input.activityFrequency.isEmpty
-        default: return !input.hasCar.isEmpty && (2...4).contains(input.interests.count) && !input.motivation.isEmpty
+        case 3: return input.healthSafetyIsValid
+        default: return (2...4).contains(input.interests.count) && !input.motivation.isEmpty
         }
     }
 
@@ -29116,7 +29379,7 @@ struct OnboardingView: View {
     }
 
     private var totalSteps: Int {
-        isEditingPreferences ? 2 : 3
+        isEditingPreferences ? 3 : 4
     }
 
     private var displayStep: Int {
@@ -29132,14 +29395,14 @@ struct OnboardingView: View {
     }
 
     private var primaryButtonTitle: String {
-        guard step == 3 else { return "Continua" }
+        guard step == 4 else { return "Continua" }
         if saving { return "Salvataggio..." }
         return isEditingPreferences ? "Salva preferenze" : "Scopri gli eventi per te"
     }
 
     private var finalValidationMessage: String {
-        if input.hasCar.isEmpty {
-            return "Seleziona se sei automunito."
+        if !input.healthSafetyIsValid {
+            return "Completa la sezione salute e sicurezza."
         }
         if !(2...4).contains(input.interests.count) {
             return "Seleziona da 2 a 4 interessi."
@@ -29162,7 +29425,7 @@ struct OnboardingView: View {
     }
 
     private func handlePrimaryAction() {
-        if step < 3 {
+        if step < 4 {
             direction = 1
             withAnimation(.easeInOut(duration: 0.28)) {
                 step += 1
@@ -29229,6 +29492,11 @@ struct OnboardingView: View {
         input.selfLevel = profile.selfLevel ?? ""
         input.activityFrequency = profile.activityFrequency ?? ""
         input.hasCar = normalizedHasCar(profile.hasCar ?? "")
+        input.healthSafetyStatus = normalizedHealthSafetyStatus(profile.healthSafetyStatus)
+        input.healthSafetyNotes = profile.healthSafetyNotes ?? ""
+        input.emergencyMedicationAnswer = profile.emergencyMedicationHas.map { $0 ? "yes" : "no" } ?? ""
+        input.emergencyMedicationNotes = profile.emergencyMedicationNotes ?? ""
+        input.healthSafetyHelpNotes = profile.healthSafetyHelpNotes ?? ""
         input.interests = normalizedInterests(profile.interests ?? [])
         input.motivation = profile.eventMotivation ?? ""
         didPrefill = true
@@ -29240,6 +29508,11 @@ struct OnboardingView: View {
         case "no_car": return "no"
         default: return value
         }
+    }
+
+    private func normalizedHealthSafetyStatus(_ value: String?) -> String {
+        guard value == "none" || value == "has_info" else { return "" }
+        return value ?? ""
     }
 
     private func normalizedInterests(_ values: [String]) -> [String] {
@@ -29572,6 +29845,132 @@ struct OnboardingInfoBox: View {
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Brand.card.opacity(0.62), in: RoundedRectangle(cornerRadius: 14))
+    }
+}
+
+struct OnboardingTextArea: View {
+    let title: String
+    var required = false
+    let placeholder: String
+    @Binding var text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            OnboardingFieldLabel(title: title, required: required)
+            ZStack(alignment: .topLeading) {
+                if text.isEmpty {
+                    Text(placeholder)
+                        .font(.body)
+                        .foregroundStyle(Brand.inputMutedForeground)
+                        .padding(.horizontal, 15)
+                        .padding(.vertical, 14)
+                }
+                TextEditor(text: $text)
+                    .font(.body)
+                    .foregroundStyle(Brand.inputForeground)
+                    .tint(Brand.primary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .scrollContentBackground(.hidden)
+                    .background(Color.clear)
+            }
+            .frame(minHeight: 112)
+            .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.inputBorder, lineWidth: 1))
+        }
+    }
+}
+
+struct HealthSafetyEditor: View {
+    @Binding var status: String
+    @Binding var notes: String
+    @Binding var emergencyMedicationAnswer: String
+    @Binding var emergencyMedicationNotes: String
+    @Binding var helpNotes: String
+
+    private var statusBinding: Binding<String> {
+        Binding(
+            get: { status },
+            set: { newValue in
+                status = newValue
+                if newValue == "none" {
+                    notes = ""
+                    emergencyMedicationAnswer = ""
+                    emergencyMedicationNotes = ""
+                    helpNotes = ""
+                }
+            }
+        )
+    }
+
+    private var medicationBinding: Binding<String> {
+        Binding(
+            get: { emergencyMedicationAnswer },
+            set: { newValue in
+                emergencyMedicationAnswer = newValue
+                if newValue == "no" {
+                    emergencyMedicationNotes = ""
+                }
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            OnboardingInfoBox(
+                title: "Visibilità limitata",
+                text: "Queste informazioni sono visibili solo allo staff autorizzato e agli organizzatori degli eventi a cui partecipi. Non vengono usate per fit score, suggerimenti o blocchi."
+            )
+
+            OnboardingSelectionGroup(
+                title: "Hai condizioni di salute, allergie o esigenze particolari che dovremmo conoscere?",
+                required: true,
+                options: [
+                    .init(value: "none", emoji: "✅", title: "No, nessuna da segnalare", subtitle: "Non ci sono informazioni utili da condividere con lo staff."),
+                    .init(value: "has_info", emoji: "⚕️", title: "Sì, ho qualcosa da segnalare", subtitle: "Condividi solo ciò che può essere utile in caso di necessità.")
+                ],
+                selection: statusBinding
+            )
+
+            if status == "has_info" {
+                OnboardingTextArea(
+                    title: "Dicci solo ciò che può essere utile sapere in caso di necessità.",
+                    required: true,
+                    placeholder: "Es. asma, allergie importanti, problemi cardiaci, farmaci salvavita, epipen, altre informazioni utili.",
+                    text: $notes
+                )
+
+                OnboardingSelectionGroup(
+                    title: "Hai con te farmaci o dispositivi da usare in caso di emergenza?",
+                    required: true,
+                    options: [
+                        .init(value: "no", emoji: "✅", title: "No"),
+                        .init(value: "yes", emoji: "💊", title: "Sì")
+                    ],
+                    selection: medicationBinding
+                )
+
+                if emergencyMedicationAnswer == "yes" {
+                    OnboardingTextArea(
+                        title: "Quali?",
+                        required: true,
+                        placeholder: "Es. epipen, inalatore, farmaci specifici, altro.",
+                        text: $emergencyMedicationNotes
+                    )
+                }
+
+                OnboardingTextArea(
+                    title: "In caso di necessità, cosa può essere utile fare o evitare?",
+                    placeholder: "Es. chiamare subito un contatto, evitare certi cibi o sforzi, sapere dove tengo il dispositivo.",
+                    text: $helpNotes
+                )
+
+                OnboardingInfoBox(
+                    title: "Sempre modificabile",
+                    text: "Inserisci solo informazioni utili alla gestione dell'attività. Puoi modificarle o cancellarle in qualsiasi momento dal profilo."
+                )
+            }
+        }
     }
 }
 
