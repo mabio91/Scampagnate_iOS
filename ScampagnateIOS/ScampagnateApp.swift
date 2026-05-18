@@ -5003,6 +5003,23 @@ struct OrganizerPriceOptionDraft: Identifiable, Equatable {
 
     init() {}
 
+    static func defaultFormula(
+        named name: String = "Formula 1",
+        paymentType: String = "free",
+        price: Double = 0,
+        deposit: Double = 0,
+        balancePaymentMode: String = "online"
+    ) -> OrganizerPriceOptionDraft {
+        var option = OrganizerPriceOptionDraft()
+        option.name = name
+        option.paymentType = paymentType
+        option.price = paymentType == "free" ? 0 : price
+        option.depositAmount = paymentType == "deposit" ? deposit : 0
+        option.balanceAmount = paymentType == "deposit" ? max(0, option.price - deposit) : 0
+        option.balancePaymentMode = balancePaymentMode
+        return option
+    }
+
     init(legacyEvent event: Event) {
         name = "Partecipazione"
         price = event.paymentType == "free" ? 0 : (event.price ?? 0)
@@ -5183,7 +5200,7 @@ struct OrganizerEventDraft: Equatable {
     var exclusivityLabel = ""
     var restrictionMessage = ""
     var meetingPoints: [OrganizerMeetingPointDraft] = []
-    var priceOptions: [OrganizerPriceOptionDraft] = []
+    var priceOptions: [OrganizerPriceOptionDraft] = [OrganizerPriceOptionDraft.defaultFormula()]
     var equipmentItems: [OrganizerEquipmentItemDraft] = []
     var additionalFields: [OrganizerAdditionalFieldDraft] = []
     var accessRules: [OrganizerAccessRuleDraft] = []
@@ -5254,13 +5271,21 @@ struct OrganizerEventDraft: Equatable {
         exclusivityLabel = event.accessRules?.string(at: "exclusivity_label") ?? ""
         restrictionMessage = event.accessRules?.string(at: "restriction_message") ?? ""
         self.meetingPoints = meetingPoints.map(OrganizerMeetingPointDraft.init(point:))
-        self.priceOptions = priceOptions.map { option in
+        let mappedPriceOptions = priceOptions.map { option in
             var draft = OrganizerPriceOptionDraft(option: option)
             if duplicate {
                 draft.serverId = nil
             }
             return draft
         }
+        self.priceOptions = mappedPriceOptions.isEmpty
+            ? [OrganizerPriceOptionDraft.defaultFormula(
+                paymentType: paymentType,
+                price: paymentType == "free" ? 0 : price,
+                deposit: paymentType == "deposit" ? deposit : 0,
+                balancePaymentMode: balancePaymentMode
+            )]
+            : mappedPriceOptions
         equipmentItems = event.equipmentItems.map(OrganizerEquipmentItemDraft.init(item:))
         additionalFields = (event.additionalFields?.array(at: "fields") ?? event.additionalFields?.array(at: "custom_fields") ?? event.additionalFields?.arrayValue)?
             .map(OrganizerAdditionalFieldDraft.init(json:)) ?? []
@@ -8052,14 +8077,14 @@ struct AuthView: View {
                                 isOn: $consents.age
                             )
                             ConsentToggle(
-                                title: "Tienimi aggiornato sulle prossime scampagnate 🌿",
-                                subtitle: "Riceverai info su nuovi eventi, posti che si liberano e novità della community (email / WhatsApp)",
+                                title: "Comunicazioni e novità",
+                                subtitle: "Ti terremo aggiornato su nuove iniziative, promozioni, eventi speciali e contenuti della community",
                                 required: false,
                                 isOn: $consents.marketing
                             )
                             ConsentToggle(
-                                title: "Ok a comparire nei momenti Scampagnate 📸",
-                                subtitle: "Possiamo condividere foto e video delle esperienze sui nostri canali (Instagram, sito, ecc.)",
+                                title: "Fai parte dei nostri racconti",
+                                subtitle: "Possiamo condividere foto e momenti delle esperienze sui canali Scampagnate.",
                                 required: false,
                                 isOn: $consents.media
                             )
@@ -20842,17 +20867,13 @@ struct OrganizerEventEditorView: View {
                             OrganizerGalleryEditor(urls: $draft.galleryImageURLs)
                         }
 
-                        OrganizerEditorSection(title: "Capienza e pagamento") {
+                        OrganizerEditorSection(title: "Capienza") {
                             OrganizerIntegerStepperField("Posti totali", value: $draft.spotsTotal, range: 1...300)
                             OrganizerIntegerStepperField("Posti riservati", value: $draft.reservedSpots, range: 0...max(draft.spotsTotal, 1))
-                            OrganizerBasePaymentEditor(
-                                paymentType: $draft.paymentType,
-                                price: $draft.price,
-                                deposit: $draft.deposit,
-                                balancePaymentMode: $draft.balancePaymentMode,
-                                hasPriceOptions: draft.priceOptions.contains { $0.name.nilIfBlank != nil }
-                            )
-                            if draft.paymentType == "free" {
+                        }
+
+                        OrganizerEditorSection(title: "Pagamento") {
+                            if !draft.priceOptions.contains(where: { $0.paymentType != "free" }) {
                                 VStack(alignment: .leading, spacing: 5) {
                                     Text("Regole eventi gratuiti")
                                         .font(.subheadline.weight(.bold))
@@ -20865,7 +20886,7 @@ struct OrganizerEventEditorView: View {
                                 .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 14))
                                 .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.muted, lineWidth: 1))
                             } else {
-                                Picker("Policy cancellazione", selection: $draft.cancellationPolicy) {
+                                Picker("Termini di cancellazione", selection: $draft.cancellationPolicy) {
                                     ForEach(OrganizerEventDraft.cancellationPolicies, id: \.id) { policy in
                                         Text(policy.label).tag(policy.id)
                                     }
@@ -20877,22 +20898,22 @@ struct OrganizerEventEditorView: View {
                                         .foregroundStyle(Brand.mutedForeground)
                                 }
                             }
-                        }
-
-                        OrganizerEditorSection(title: "Modalità di partecipazione") {
                             ForEach($draft.priceOptions) { optionBinding in
-                                OrganizerPriceOptionEditor(option: optionBinding, specialBadges: allBadges) {
+                                OrganizerPriceOptionEditor(option: optionBinding, specialBadges: allBadges, canDelete: draft.priceOptions.count > 1) {
                                     let optionId = optionBinding.wrappedValue.id
                                     draft.priceOptions.removeAll { $0.id == optionId }
                                 }
                             }
                             Button("Aggiungi formula") {
-                                var option = OrganizerPriceOptionDraft()
-                                option.paymentType = draft.paymentType
-                                option.price = draft.paymentType == "free" ? 0 : draft.price
-                                option.depositAmount = draft.paymentType == "deposit" ? draft.deposit : 0
-                                option.balanceAmount = draft.paymentType == "deposit" ? max(0, draft.price - draft.deposit) : 0
-                                option.balancePaymentMode = draft.balancePaymentMode
+                                let previous = draft.priceOptions.last
+                                let paymentType = previous?.paymentType ?? "free"
+                                let option = OrganizerPriceOptionDraft.defaultFormula(
+                                    named: "Formula \(draft.priceOptions.count + 1)",
+                                    paymentType: paymentType,
+                                    price: previous?.price ?? 0,
+                                    deposit: previous?.depositAmount ?? 0,
+                                    balancePaymentMode: previous?.balancePaymentMode ?? "online"
+                                )
                                 draft.priceOptions.append(option)
                             }
                             .buttonStyle(SecondaryButtonStyle())
@@ -22761,16 +22782,19 @@ struct OrganizerBasePaymentEditor: View {
 struct OrganizerPriceOptionEditor: View {
     @Binding var option: OrganizerPriceOptionDraft
     let specialBadges: [BadgeDefinition]
+    let canDelete: Bool
     let onDelete: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Formula")
+                Text(option.name.nilIfBlank ?? "Formula")
                     .font(.subheadline.weight(.bold))
                 Spacer()
-                Button(role: .destructive, action: onDelete) {
-                    Image(systemName: "trash")
+                if canDelete {
+                    Button(role: .destructive, action: onDelete) {
+                        Image(systemName: "trash")
+                    }
                 }
             }
             Field("Nome formula", text: $option.name)
@@ -22836,7 +22860,7 @@ struct OrganizerPriceOptionEditor: View {
                 Field("Numero eventi maggiore di", text: thresholdBinding(prefix: "events_gt"), keyboard: .numberPad)
             }
             OrganizerOptionalEuroField("Prezzo originale", value: $option.originalPrice)
-            Toggle("Promozionale", isOn: $option.isPromotional)
+            Toggle("Promo a tempo limitato", isOn: $option.isPromotional)
                 .editableControlSurface(cornerRadius: 12)
             if option.isPromotional {
                 OrganizerOptionalDatePickerField("Promo dal", dateString: $option.promoStart)
@@ -26738,14 +26762,14 @@ struct ProfilePrivacySection: View {
                     VStack(alignment: .leading, spacing: 16) {
                         ProfilePushNotificationRow()
                         ProfileConsentRow(
-                            title: "Non perderti le prossime scampagnate 🌿",
-                            subtitle: "Ti avvisiamo su nuovi eventi, posti che si liberano e chicche della community",
+                            title: "Comunicazioni e novità",
+                            subtitle: "Ti terremo aggiornato su nuove iniziative, promozioni, eventi speciali e contenuti della community",
                             isOn: consentBinding(for: .marketing),
                             isBusy: isConsentBusy(.marketing)
                         )
                         ProfileConsentRow(
-                            title: "Fai parte delle nostre storie 📸",
-                            subtitle: "Possiamo condividere foto e momenti delle esperienze sui nostri canali",
+                            title: "Fai parte dei nostri racconti",
+                            subtitle: "Possiamo condividere foto e momenti delle esperienze sui canali Scampagnate.",
                             isOn: consentBinding(for: .media),
                             isBusy: isConsentBusy(.media)
                         )
@@ -28857,7 +28881,7 @@ struct ProfilePushNotificationRow: View {
                     Image(systemName: iconName)
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(iconColor)
-                    Text("Notifiche iOS")
+                    Text("Notifiche app")
                         .font(.subheadline.weight(.bold))
                         .foregroundStyle(Brand.foreground)
                 }
@@ -28872,7 +28896,7 @@ struct ProfilePushNotificationRow: View {
                     .tint(Brand.primary)
                     .padding(.top, 3)
             } else {
-                Toggle("Notifiche iOS", isOn: notificationToggleBinding)
+                Toggle("Notifiche app", isOn: notificationToggleBinding)
                     .labelsHidden()
                     .tint(Brand.primary)
                     .padding(.top, 3)
@@ -28901,7 +28925,7 @@ struct ProfilePushNotificationRow: View {
     private var subtitle: String {
         pushNotifications.canOpenSettings
             ? "Gestisci l'autorizzazione dalle Impostazioni di iOS"
-            : "Avvisi su eventi, posti che si liberano e aggiornamenti utili"
+            : "Ricevi avvisi su iscrizioni, posti che si liberano e aggiornamenti importanti."
     }
 
     private var notificationToggleBinding: Binding<Bool> {
