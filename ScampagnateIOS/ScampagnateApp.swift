@@ -388,6 +388,18 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func updateHealthSafety(_ input: OnboardingInput) async -> Bool {
+        do {
+            let authSession = try await authenticatedSession()
+            try await api.updateHealthSafety(input: input, session: authSession)
+            await refreshUserData()
+            return true
+        } catch {
+            report(error)
+            return false
+        }
+    }
+
     func updateProfile(_ input: ProfileEditInput) async -> Bool {
         do {
             let authSession = try await authenticatedSession()
@@ -2707,6 +2719,10 @@ struct SupabaseAPI {
     func updatePreferences(input: OnboardingInput, session: AuthSession) async throws {
         let payload = profilePreferencesPayload(input: input)
         try await patchProfile(payload, session: session)
+    }
+
+    func updateHealthSafety(input: OnboardingInput, session: AuthSession) async throws {
+        try await patchProfile(input.healthSafetyPayload(), session: session)
     }
 
     private func profilePreferencesPayload(input: OnboardingInput) -> [String: JSONValue] {
@@ -23615,6 +23631,7 @@ struct ProfileView: View {
     @Binding var openRewards: Bool
     @Binding var routedMission: MissionNavigationTarget?
     @State private var showEdit = false
+    @State private var showHealthSafetyEdit = false
     @State private var showPointsInfo = false
     @State private var showRoutedRewards = false
 
@@ -23682,7 +23699,7 @@ struct ProfileView: View {
                                         }
                                         if profile.healthSafetyStatus != "none" && profile.healthSafetyStatus != "has_info" {
                                             HealthSafetyProfileCallout {
-                                                showEdit = true
+                                                showHealthSafetyEdit = true
                                             }
                                         }
                                         MembershipCard(profile: profile)
@@ -23718,6 +23735,9 @@ struct ProfileView: View {
                             ProfileEditSheet(profile: profile)
                                 .presentationDetents([.fraction(0.86), .large])
                                 .presentationDragIndicator(.hidden)
+                        }
+                        .fullScreenCover(isPresented: $showHealthSafetyEdit) {
+                            OnboardingView(mode: .healthSafetyEdit)
                         }
                     }
                 }
@@ -28971,11 +28991,13 @@ struct OnboardingView: View {
     enum Mode {
         case onboarding
         case preferencesEdit
+        case healthSafetyEdit
 
         var initialStep: Int {
             switch self {
             case .onboarding: 1
             case .preferencesEdit: 2
+            case .healthSafetyEdit: 3
             }
         }
     }
@@ -29054,7 +29076,7 @@ struct OnboardingView: View {
                             avatarCropDraft = nil
                         }
                     }
-                    .alert("Completa le preferenze", isPresented: Binding(get: { validationMessage != nil }, set: { if !$0 { validationMessage = nil } })) {
+                    .alert(validationAlertTitle, isPresented: Binding(get: { validationMessage != nil }, set: { if !$0 { validationMessage = nil } })) {
                         Button("OK") { validationMessage = nil }
                     } message: {
                         Text(validationMessage ?? "")
@@ -29264,7 +29286,7 @@ struct OnboardingView: View {
                         Text(primaryButtonTitle)
                             .lineLimit(1)
                             .minimumScaleFactor(0.76)
-                        if step < 4 {
+                        if shouldAdvanceToNextStep {
                             Image(systemName: "arrow.right")
                         }
                     }
@@ -29308,23 +29330,36 @@ struct OnboardingView: View {
         mode == .preferencesEdit
     }
 
+    private var isEditingHealthSafety: Bool {
+        mode == .healthSafetyEdit
+    }
+
+    private var isEditingProfileDetails: Bool {
+        mode != .onboarding
+    }
+
     private var totalSteps: Int {
-        isEditingPreferences ? 3 : 4
+        if isEditingHealthSafety { return 1 }
+        return isEditingPreferences ? 3 : 4
     }
 
     private var displayStep: Int {
-        isEditingPreferences ? step - 1 : step
+        if isEditingHealthSafety { return 1 }
+        return isEditingPreferences ? step - 1 : step
     }
 
     private var canGoBack: Bool {
-        step > mode.initialStep || isEditingPreferences
+        step > mode.initialStep || isEditingProfileDetails
     }
 
     private var backButtonTitle: String {
-        isEditingPreferences && step == mode.initialStep ? "Annulla" : "Indietro"
+        isEditingProfileDetails && step == mode.initialStep ? "Annulla" : "Indietro"
     }
 
     private var primaryButtonTitle: String {
+        if isEditingHealthSafety {
+            return saving ? "Salvataggio..." : "Salva salute e sicurezza"
+        }
         guard step == 4 else { return "Continua" }
         if saving { return "Salvataggio..." }
         return isEditingPreferences ? "Salva preferenze" : "Scopri gli eventi per te"
@@ -29343,8 +29378,16 @@ struct OnboardingView: View {
         return "Completa tutti i campi richiesti."
     }
 
+    private var validationAlertTitle: String {
+        isEditingHealthSafety ? "Completa salute e sicurezza" : "Completa le preferenze"
+    }
+
+    private var shouldAdvanceToNextStep: Bool {
+        !isEditingHealthSafety && step < 4
+    }
+
     private func goBack() {
-        if isEditingPreferences && step == mode.initialStep {
+        if isEditingProfileDetails && step == mode.initialStep {
             dismiss()
             return
         }
@@ -29355,7 +29398,7 @@ struct OnboardingView: View {
     }
 
     private func handlePrimaryAction() {
-        if step < 4 {
+        if shouldAdvanceToNextStep {
             direction = 1
             withAnimation(.easeInOut(duration: 0.28)) {
                 step += 1
@@ -29371,11 +29414,17 @@ struct OnboardingView: View {
         Task {
             guard !saving else { return }
             saving = true
-            let didSave = isEditingPreferences
-                ? await store.updatePreferences(input)
-                : await store.updateOnboarding(input)
+            let didSave: Bool
+            switch mode {
+            case .onboarding:
+                didSave = await store.updateOnboarding(input)
+            case .preferencesEdit:
+                didSave = await store.updatePreferences(input)
+            case .healthSafetyEdit:
+                didSave = await store.updateHealthSafety(input)
+            }
             if didSave {
-                if isEditingPreferences {
+                if isEditingProfileDetails {
                     dismiss()
                 } else {
                     withAnimation(.easeInOut(duration: 0.24)) {
