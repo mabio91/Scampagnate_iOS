@@ -2729,7 +2729,7 @@ struct SupabaseAPI {
         guard OnboardingInput.isValidInstagramHandle(normalizedInstagramHandle) else {
             throw AppError.message("Inserisci solo username, @username o link instagram.com/username.")
         }
-        var payload: [String: JSONValue] = [
+        let payload: [String: JSONValue] = [
             "first_name": .string(input.firstName),
             "last_name": .string(input.lastName),
             "phone": .string(input.phone),
@@ -2742,9 +2742,6 @@ struct SupabaseAPI {
             "city_of_residence": input.cityOfResidence.isEmpty ? .null : .string(input.cityOfResidence),
             "province_of_residence": input.provinceOfResidence.isEmpty ? .null : .string(input.provinceOfResidence.uppercased())
         ]
-        if !input.healthSafetyStatus.isEmpty {
-            payload.merge(input.healthSafetyPayload()) { _, new in new }
-        }
         try await patchProfile(payload, session: session)
     }
 
@@ -6762,11 +6759,6 @@ struct ProfileEditInput {
     var cityOfResidence = ""
     var provinceOfResidence = ""
     var bio = ""
-    var healthSafetyStatus = ""
-    var healthSafetyNotes = ""
-    var emergencyMedicationAnswer = ""
-    var emergencyMedicationNotes = ""
-    var healthSafetyHelpNotes = ""
 
     var normalizedInstagramHandle: String? {
         OnboardingInput.normalizedInstagramHandle(instagramHandle)
@@ -6775,26 +6767,6 @@ struct ProfileEditInput {
     mutating func normalizeProvinceFields() {
         provinceOfBirth = Self.normalizedProvince(provinceOfBirth)
         provinceOfResidence = Self.normalizedProvince(provinceOfResidence)
-    }
-
-    var healthSafetyIsValid: Bool {
-        OnboardingInput(
-            healthSafetyStatus: healthSafetyStatus,
-            healthSafetyNotes: healthSafetyNotes,
-            emergencyMedicationAnswer: emergencyMedicationAnswer,
-            emergencyMedicationNotes: emergencyMedicationNotes,
-            healthSafetyHelpNotes: healthSafetyHelpNotes
-        ).healthSafetyIsValid
-    }
-
-    func healthSafetyPayload(now: String = ISO8601DateFormatter().string(from: Date())) -> [String: JSONValue] {
-        OnboardingInput(
-            healthSafetyStatus: healthSafetyStatus,
-            healthSafetyNotes: healthSafetyNotes,
-            emergencyMedicationAnswer: emergencyMedicationAnswer,
-            emergencyMedicationNotes: emergencyMedicationNotes,
-            healthSafetyHelpNotes: healthSafetyHelpNotes
-        ).healthSafetyPayload(now: now)
     }
 
     static func normalizedProvince(_ value: String) -> String {
@@ -27720,7 +27692,6 @@ struct ProfileEditSheet: View {
                         sheetHeader
                         profileFields
                         membershipFields
-                        healthSafetyFields
 
                         if hasChanges {
                             Button {
@@ -27915,32 +27886,11 @@ struct ProfileEditSheet: View {
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Brand.muted, lineWidth: 1))
     }
 
-    private var healthSafetyFields: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            ProfileSheetLabel("Salute e sicurezza")
-            Text("Questi dati sono utili allo staff durante le attività. Puoi modificarli o cancellarli quando vuoi.")
-                .font(.caption)
-                .foregroundStyle(Brand.mutedForeground)
-                .fixedSize(horizontal: false, vertical: true)
-
-            HealthSafetyEditor(
-                status: $input.healthSafetyStatus,
-                notes: $input.healthSafetyNotes,
-                emergencyMedicationAnswer: $input.emergencyMedicationAnswer,
-                emergencyMedicationNotes: $input.emergencyMedicationNotes,
-                helpNotes: $input.healthSafetyHelpNotes
-            )
-        }
-        .padding(16)
-        .background(Brand.background, in: RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Brand.muted, lineWidth: 1))
-    }
-
     private var preferencesSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             ProfileSheetLabel("Preferenze")
             Button { showPreferenceEdit = true } label: {
-                ProfileSettingsRow(icon: "gearshape", iconColor: Brand.secondary, title: "Modifica preferenze", subtitle: "Livello, interessi, frequenza", showChevron: true)
+                ProfileSettingsRow(icon: "gearshape", iconColor: Brand.secondary, title: "Modifica preferenze", subtitle: "Esperienza, salute, interessi", showChevron: true)
             }
             .buttonStyle(.plain)
         }
@@ -27996,12 +27946,7 @@ struct ProfileEditSheet: View {
         input.residentialAddress != (profile.residentialAddress ?? "") ||
         input.cityOfResidence != (profile.cityOfResidence ?? "") ||
         input.provinceOfResidence != (profile.provinceOfResidence ?? "") ||
-        input.bio != (profile.bio ?? "") ||
-        input.healthSafetyStatus != (profile.healthSafetyStatus ?? "") ||
-        input.healthSafetyNotes != (profile.healthSafetyNotes ?? "") ||
-        input.emergencyMedicationAnswer != (profile.emergencyMedicationHas.map { $0 ? "yes" : "no" } ?? "") ||
-        input.emergencyMedicationNotes != (profile.emergencyMedicationNotes ?? "") ||
-        input.healthSafetyHelpNotes != (profile.healthSafetyHelpNotes ?? "")
+        input.bio != (profile.bio ?? "")
     }
 
     private func resetInput() {
@@ -28016,12 +27961,7 @@ struct ProfileEditSheet: View {
             residentialAddress: profile.residentialAddress ?? "",
             cityOfResidence: profile.cityOfResidence ?? "",
             provinceOfResidence: profile.provinceOfResidence ?? "",
-            bio: profile.bio ?? "",
-            healthSafetyStatus: normalizedHealthSafetyStatus(profile.healthSafetyStatus),
-            healthSafetyNotes: profile.healthSafetyNotes ?? "",
-            emergencyMedicationAnswer: profile.emergencyMedicationHas.map { $0 ? "yes" : "no" } ?? "",
-            emergencyMedicationNotes: profile.emergencyMedicationNotes ?? "",
-            healthSafetyHelpNotes: profile.healthSafetyHelpNotes ?? ""
+            bio: profile.bio ?? ""
         )
         input.normalizeProvinceFields()
     }
@@ -28055,17 +27995,7 @@ struct ProfileEditSheet: View {
             return false
         }
 
-        if !input.healthSafetyStatus.isEmpty, !input.healthSafetyIsValid {
-            store.errorMessage = "Completa i campi obbligatori della sezione salute e sicurezza."
-            return false
-        }
-
         return true
-    }
-
-    private func normalizedHealthSafetyStatus(_ value: String?) -> String {
-        guard value == "none" || value == "has_info" else { return "" }
-        return value ?? ""
     }
 
     private func submitEmailChange() async {
@@ -29967,7 +29897,7 @@ struct HealthSafetyEditor: View {
 
                 OnboardingInfoBox(
                     title: "Sempre modificabile",
-                    text: "Inserisci solo informazioni utili alla gestione dell'attività. Puoi modificarle o cancellarle in qualsiasi momento dal profilo."
+                    text: "Inserisci solo informazioni utili alla gestione dell'attività. Puoi modificarle o cancellarle in qualsiasi momento dalle preferenze del profilo."
                 )
             }
         }
