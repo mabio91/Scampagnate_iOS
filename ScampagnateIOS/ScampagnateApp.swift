@@ -8087,7 +8087,7 @@ struct AuthView: View {
                             )
                             ConsentToggle(
                                 title: "Fai parte dei nostri racconti",
-                                subtitle: "Possiamo condividere foto e momenti delle esperienze sui canali Scampagnate.",
+                                subtitle: "Possiamo condividere foto e momenti delle esperienze sui canali Scampagnate",
                                 required: false,
                                 isOn: $consents.media
                             )
@@ -26772,7 +26772,7 @@ struct ProfilePrivacySection: View {
                         )
                         ProfileConsentRow(
                             title: "Fai parte dei nostri racconti",
-                            subtitle: "Possiamo condividere foto e momenti delle esperienze sui canali Scampagnate.",
+                            subtitle: "Possiamo condividere foto e momenti delle esperienze sui canali Scampagnate",
                             isOn: consentBinding(for: .media),
                             isBusy: isConsentBusy(.media)
                         )
@@ -28914,7 +28914,7 @@ struct ProfilePushNotificationRow: View {
     private var subtitle: String {
         pushNotifications.canOpenSettings
             ? "Gestisci l'autorizzazione dalle Impostazioni di iOS"
-            : "Ricevi avvisi su iscrizioni, posti che si liberano e aggiornamenti importanti."
+            : "Ricevi avvisi su iscrizioni, posti che si liberano e aggiornamenti importanti"
     }
 
     private var notificationToggleBinding: Binding<Bool> {
