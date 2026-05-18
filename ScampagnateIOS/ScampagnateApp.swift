@@ -2962,7 +2962,7 @@ struct SupabaseAPI {
     }
 
     private func replacePriceOptions(eventId: String, options: [OrganizerPriceOptionDraft], session: AuthSession) async throws {
-        let validOptions = options.filter { $0.name.nilIfBlank != nil }
+        let validOptions = options
         let existingOptions = try await fetchEventPriceOptions(eventId: eventId, session: session)
         let retainedServerIds = Set(validOptions.compactMap(\.serverId))
         let removedOptions = existingOptions.filter { !retainedServerIds.contains($0.id) }
@@ -2981,7 +2981,7 @@ struct SupabaseAPI {
             let resolvedBalance = max(0, resolvedPrice - option.depositAmount)
             let payload: [String: JSONValue] = [
                 "event_id": JSONValue.string(eventId),
-                "name": .string(option.name),
+                "name": .string(option.name.nilIfBlank ?? "Formula \(index + 1)"),
                 "price": .number(resolvedPrice),
                 "sort_order": .number(Double(index)),
                 "eligible_group": .string(eligibleGroup),
@@ -5004,7 +5004,7 @@ struct OrganizerPriceOptionDraft: Identifiable, Equatable {
     init() {}
 
     static func defaultFormula(
-        named name: String = "Formula 1",
+        named name: String = "",
         paymentType: String = "free",
         price: Double = 0,
         deposit: Double = 0,
@@ -5271,10 +5271,13 @@ struct OrganizerEventDraft: Equatable {
         exclusivityLabel = event.accessRules?.string(at: "exclusivity_label") ?? ""
         restrictionMessage = event.accessRules?.string(at: "restriction_message") ?? ""
         self.meetingPoints = meetingPoints.map(OrganizerMeetingPointDraft.init(point:))
-        let mappedPriceOptions = priceOptions.map { option in
+        let mappedPriceOptions = priceOptions.enumerated().map { index, option in
             var draft = OrganizerPriceOptionDraft(option: option)
             if duplicate {
                 draft.serverId = nil
+            }
+            if draft.name.trimmingCharacters(in: .whitespacesAndNewlines) == "Formula \(index + 1)" {
+                draft.name = ""
             }
             return draft
         }
@@ -5375,7 +5378,7 @@ struct OrganizerEventDraft: Equatable {
         if imageUrl.nilIfBlank == nil { messages.append("Immagine di copertina") }
         if fitScoreMainCategory.nilIfBlank == nil { messages.append("Categoria principale fit score") }
         if spotsTotal < 1 { messages.append("Capienza almeno 1 posto") }
-        let validOptions = priceOptions.filter { $0.name.nilIfBlank != nil }
+        let validOptions = priceOptions
         if validOptions.isEmpty {
             if paymentType != "free" && paymentType != "location" && price <= 0 { messages.append("Prezzo totale evento") }
             if paymentType == "deposit" && deposit <= 0 { messages.append("Acconto evento") }
@@ -5439,7 +5442,7 @@ struct OrganizerEventDraft: Equatable {
         let eventBadges = (manualBadges + baseUnknownBadges + [customBadge.nilIfBlank].compactMap { $0 })
             .removingDuplicates()
         let cleanDescription = EventDescriptionHTML.cleanStoredHTML(from: description).nilIfBlank ?? title
-        let validPriceOptions = priceOptions.filter { $0.name.nilIfBlank != nil }
+        let validPriceOptions = priceOptions
         let legacyOption = validPriceOptions.first
         let legacyPaymentType = legacyOption?.paymentType ?? paymentType
         let legacyPrice = legacyPaymentType == "free" ? 0 : (legacyOption?.price ?? price)
@@ -20898,8 +20901,8 @@ struct OrganizerEventEditorView: View {
                                         .foregroundStyle(Brand.mutedForeground)
                                 }
                             }
-                            ForEach($draft.priceOptions) { optionBinding in
-                                OrganizerPriceOptionEditor(option: optionBinding, specialBadges: allBadges, canDelete: draft.priceOptions.count > 1) {
+                            ForEach(Array($draft.priceOptions.enumerated()), id: \.element.id) { index, optionBinding in
+                                OrganizerPriceOptionEditor(title: "Formula \(index + 1)", option: optionBinding, specialBadges: allBadges, canDelete: draft.priceOptions.count > 1) {
                                     let optionId = optionBinding.wrappedValue.id
                                     draft.priceOptions.removeAll { $0.id == optionId }
                                 }
@@ -20908,7 +20911,6 @@ struct OrganizerEventEditorView: View {
                                 let previous = draft.priceOptions.last
                                 let paymentType = previous?.paymentType ?? "free"
                                 let option = OrganizerPriceOptionDraft.defaultFormula(
-                                    named: "Formula \(draft.priceOptions.count + 1)",
                                     paymentType: paymentType,
                                     price: previous?.price ?? 0,
                                     deposit: previous?.depositAmount ?? 0,
@@ -21020,7 +21022,7 @@ struct OrganizerEventEditorView: View {
                                 visibility: draft.visibility,
                                 registrationOpen: ["available", "published", "open"].contains(draft.status),
                                 accessRulesCount: draft.accessRules.count,
-                                priceOptionCount: draft.priceOptions.filter { $0.name.nilIfBlank != nil }.count
+                                priceOptionCount: draft.priceOptions.count
                             )
                         }
 
@@ -22780,6 +22782,7 @@ struct OrganizerBasePaymentEditor: View {
 }
 
 struct OrganizerPriceOptionEditor: View {
+    let title: String
     @Binding var option: OrganizerPriceOptionDraft
     let specialBadges: [BadgeDefinition]
     let canDelete: Bool
@@ -22788,7 +22791,7 @@ struct OrganizerPriceOptionEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(option.name.nilIfBlank ?? "Formula")
+                Text(option.name.nilIfBlank ?? title)
                     .font(.subheadline.weight(.bold))
                 Spacer()
                 if canDelete {
