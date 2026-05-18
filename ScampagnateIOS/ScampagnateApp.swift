@@ -28877,14 +28877,9 @@ struct ProfilePushNotificationRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
             VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    Image(systemName: iconName)
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(iconColor)
-                    Text("Notifiche app")
-                        .font(.subheadline.weight(.bold))
-                        .foregroundStyle(Brand.foreground)
-                }
+                Text("Notifiche app")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Brand.foreground)
                 Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(Brand.mutedForeground)
@@ -28911,15 +28906,6 @@ struct ProfilePushNotificationRow: View {
         .task {
             await pushNotifications.refreshAuthorizationStatus()
         }
-    }
-
-    private var iconName: String {
-        if pushNotifications.canOpenSettings { return "bell.slash" }
-        return pushNotifications.isPushActive ? "bell.badge" : "bell"
-    }
-
-    private var iconColor: Color {
-        pushNotifications.isPushActive ? Brand.success : Brand.secondary
     }
 
     private var subtitle: String {
