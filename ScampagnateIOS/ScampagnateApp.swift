@@ -2040,7 +2040,7 @@ final class PushNotificationService: ObservableObject {
 
 struct SupabaseAPI {
     private static let priceOptionSelect = "id,name,price,sort_order,original_price,eligible_group,is_promotional,promo_start,promo_end,payment_type,deposit_amount,balance_amount,balance_payment_mode,has_dedicated_spots,dedicated_spots,spots_taken,waitlist_enabled"
-    private static let eventSelect = "id,title,date,time,location,location_label,category_id,status,price,deposit,payment_type,balance_payment_mode,image_url,difficulty,distance,elevation,duration,spots_total,spots_taken,reserved_spots,featured,event_badges,organizer_id,organizer_name,description,cancellation_policy,equipment_list,additional_fields,visibility,gallery_images,access_rules,event_categories(id,name,icon),event_meeting_points(id,name,location,time,notes),event_price_options(\(priceOptionSelect))"
+    private static let eventSelect = "id,title,date,time,location,location_label,category_id,status,price,deposit,payment_type,balance_payment_mode,image_url,difficulty,distance,elevation,duration,spots_total,spots_taken,reserved_spots,featured,event_badges,organizer_id,organizer_name,description,cancellation_policy,equipment_list,additional_fields,visibility,gallery_images,access_rules,event_categories(id,name,icon),event_meeting_points(id,name,location,time,notes),event_price_options(\(priceOptionSelect)),event_staff(id,event_id,profile_id,display_name,role_label,avatar_url,sort_order,is_public)"
     private static let registrationSelect = "*,events(\(eventSelect)),meeting_point:event_meeting_points(id,name,location,time)"
     private static let organizerRegistrationSelect = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,sport_level,amount_paid,refund_amount,last_balance_reminder_sent_at,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,instagram_handle,avatar_url,total_points,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade,interests,birth_date,health_safety_status,health_safety_notes,emergency_medication_has,emergency_medication_notes,health_safety_help_notes),price_option:event_price_options(\(priceOptionSelect))"
     private static let nonManualRegistrationFilter = "&or=(sport_level.is.null,sport_level.not.like.manual:%25)"
@@ -3828,10 +3828,11 @@ struct Event: Codable, Identifiable, Hashable {
     let equipmentList: [EquipmentItem]?
     let additionalFields: JSONValue?
     let accessRules: JSONValue?
+    let eventStaff: [EventStaffMember]?
 
     enum CodingKeys: String, CodingKey {
         case id, title, date, time, location, categoryId, status, price, deposit, difficulty, distance, elevation, duration, featured, description, visibility
-        case locationLabel, paymentType, balancePaymentMode, imageUrl, spotsTotal, spotsTaken, reservedSpots, eventBadges, organizerId, organizerName, cancellationPolicy, galleryImages, equipmentList, additionalFields, accessRules
+        case locationLabel, paymentType, balancePaymentMode, imageUrl, spotsTotal, spotsTaken, reservedSpots, eventBadges, organizerId, organizerName, cancellationPolicy, galleryImages, equipmentList, additionalFields, accessRules, eventStaff
         case eventCategories, eventMeetingPoints, eventPriceOptions
     }
 
@@ -3840,6 +3841,7 @@ struct Event: Codable, Identifiable, Hashable {
     var priceOptions: [PriceOption] { (eventPriceOptions ?? []).sorted { ($0.sortOrder ?? 0) < ($1.sortOrder ?? 0) } }
     var gallery: [GalleryImage] { (galleryImages ?? []).sorted { ($0.order ?? 0) < ($1.order ?? 0) } }
     var equipmentItems: [EquipmentItem] { equipmentList ?? [] }
+    var staffMembers: [EventStaffMember] { (eventStaff ?? []).sorted { ($0.sortOrder ?? 0) < ($1.sortOrder ?? 0) } }
     var hasEquipment: Bool { !equipmentItems.isEmpty }
     var hasEventTopBadge: Bool { featured == true || (eventBadges ?? []).contains("evento_top") }
     var customBadgeText: String? {
@@ -3959,6 +3961,25 @@ struct Event: Codable, Identifiable, Hashable {
 
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
     static func == (lhs: Event, rhs: Event) -> Bool { lhs.id == rhs.id }
+}
+
+struct EventStaffMember: Codable, Identifiable, Hashable {
+    let id: String
+    let eventId: String?
+    let profileId: String?
+    let displayName: String
+    let roleLabel: String?
+    let avatarUrl: String?
+    let sortOrder: Int?
+    let isPublic: Bool?
+
+    var role: String {
+        roleLabel?.nilIfBlank ?? "Staff"
+    }
+
+    var name: String {
+        displayName.nilIfBlank ?? "Staff"
+    }
 }
 
 struct CheckoutCustomField: Identifiable, Hashable {
@@ -9680,6 +9701,7 @@ struct EventDetailView: View {
     @State private var showCancelConfirm = false
     @State private var feedback: AppFeedback?
     @State private var activeCheckout: ActiveCheckout?
+    @State private var showStaff = false
     @State private var showParticipants = false
     @State private var showGallery = false
     @State private var selectedGalleryIndex = 0
@@ -9853,6 +9875,10 @@ struct EventDetailView: View {
                     }
                     .sheet(isPresented: $showParticipants) {
                         ParticipantsSheet(eventId: eventId, fallbackCount: activeParticipantCount, showAuth: $showAuth)
+                            .presentationDetents([.medium, .large])
+                    }
+                    .sheet(isPresented: $showStaff) {
+                        EventStaffSheet(event: event, organizerProfile: organizerProfile)
                             .presentationDetents([.medium, .large])
                     }
                     .fullScreenCover(isPresented: $showGallery) {
@@ -10079,17 +10105,16 @@ struct EventDetailView: View {
             }
 
             HStack(alignment: .top) {
-                if let organizer = event.organizerName {
+                Button {
+                    showStaff = true
+                } label: {
                     VStack(alignment: .leading, spacing: 7) {
-                        SectionTitle("Organizzatore")
-                        Button {
-                            showOrganizerContact = true
-                        } label: {
-                            OrganizerRow(name: organizer, subtitle: "Contatta", profile: organizerProfile)
-                        }
-                        .buttonStyle(.plain)
+                        SectionTitle("Staff (\(event.staffMembers.count + 1))")
+                        EventStaffAvatarStack(event: event, organizerProfile: organizerProfile)
                     }
                 }
+                .buttonStyle(.plain)
+
                 Spacer(minLength: 12)
                 Button {
                     showParticipants = true
@@ -10685,6 +10710,133 @@ struct OrganizerRow: View {
             }
             Spacer()
         }
+    }
+}
+
+struct EventStaffAvatarStack: View {
+    let event: Event
+    let organizerProfile: PublicProfile?
+
+    private var organizerName: String {
+        organizerProfile?.firstName.nilIfBlank ?? event.organizerName ?? "Organizzatore"
+    }
+
+    private var preview: [(id: String, name: String, avatarUrl: String?)] {
+        let organizer = (id: event.organizerId ?? "organizer", name: organizerName, avatarUrl: organizerProfile?.avatarUrl)
+        let staff = event.staffMembers.map { member in
+            (id: member.id, name: member.name, avatarUrl: member.avatarUrl)
+        }
+        return [organizer] + staff
+    }
+
+    var body: some View {
+        HStack(spacing: -10) {
+            ForEach(Array(preview.prefix(3)), id: \.id) { member in
+                OrganizerAvatar(name: member.name, avatarUrl: member.avatarUrl, size: 38)
+                    .overlay(Circle().stroke(Brand.background, lineWidth: 2))
+            }
+            if preview.count > 3 {
+                Text("+\(preview.count - 3)")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(Brand.mutedForeground)
+                    .frame(width: 38, height: 38)
+                    .background(Brand.muted, in: Circle())
+                    .overlay(Circle().stroke(Brand.background, lineWidth: 2))
+            }
+        }
+    }
+}
+
+struct EventStaffSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let event: Event
+    let organizerProfile: PublicProfile?
+
+    private var organizerName: String {
+        organizerProfile?.firstName.nilIfBlank ?? event.organizerName ?? "Organizzatore"
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Staff evento")
+                            .font(.system(.title2, design: .rounded, weight: .bold))
+                            .foregroundStyle(Brand.foreground)
+                        Text("\(event.staffMembers.count + 1) persone presenti")
+                            .font(.system(.subheadline, design: .rounded))
+                            .foregroundStyle(Brand.mutedForeground)
+                    }
+                    Spacer()
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.headline.weight(.semibold))
+                            .foregroundStyle(Brand.mutedForeground)
+                            .frame(width: 36, height: 36)
+                            .background(Brand.muted.opacity(0.7), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("ORGANIZZATORE")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.primary)
+                    HStack(spacing: 14) {
+                        OrganizerAvatar(name: organizerName, avatarUrl: organizerProfile?.avatarUrl, size: 52)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(organizerName)
+                                .font(.system(.body, design: .rounded, weight: .semibold))
+                                .foregroundStyle(Brand.foreground)
+                            Text("Organizzatore")
+                                .font(.system(.caption, design: .rounded))
+                                .foregroundStyle(Brand.mutedForeground)
+                        }
+                        Spacer()
+                        if let phone = organizerProfile?.phone?.nilIfBlank {
+                            Button {
+                                openOrganizerWhatsApp(phone: phone, event: event)
+                            } label: {
+                                Image(systemName: "message.fill")
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 36, height: 36)
+                                    .background(Brand.primary, in: Circle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
+                if !event.staffMembers.isEmpty {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("STAFF PRESENTE")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(Brand.primary)
+                        ForEach(event.staffMembers) { member in
+                            HStack(spacing: 14) {
+                                OrganizerAvatar(name: member.name, avatarUrl: member.avatarUrl, size: 52)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(member.name)
+                                        .font(.system(.body, design: .rounded, weight: .semibold))
+                                        .foregroundStyle(Brand.foreground)
+                                    Text(member.role)
+                                        .font(.system(.caption, design: .rounded))
+                                        .foregroundStyle(Brand.mutedForeground)
+                                }
+                                Spacer()
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+            }
+            .padding(22)
+        }
+        .background(Brand.background)
     }
 }
 
