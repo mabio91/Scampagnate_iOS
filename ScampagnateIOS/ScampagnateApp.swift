@@ -4509,7 +4509,7 @@ struct PriceOption: Codable, Identifiable, Hashable {
         case "free":
             return "Gratis"
         case "location":
-            return "€\(money(totalPrice(fallback: event))) · pagamento sul posto"
+            return "Pagamento sul posto"
         case "deposit":
             let deposit = effectiveDepositAmount(fallback: event)
             let balance = effectiveBalanceAmount(fallback: event)
@@ -14184,6 +14184,10 @@ struct RegistrationCheckoutSheet: View {
         event.priceOptions.available(for: priceEligibilityContext)
     }
 
+    var singlePriceOption: PriceOption? {
+        eligiblePriceOptions.count == 1 ? eligiblePriceOptions[0] : nil
+    }
+
     var selectedPriceOption: PriceOption? {
         guard let selectedPriceOptionId else { return nil }
         return eligiblePriceOptions.first { $0.id == selectedPriceOptionId }
@@ -14525,7 +14529,9 @@ struct RegistrationCheckoutSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             CheckoutSectionTitle("Prezzo e tessera")
 
-            if !eligiblePriceOptions.isEmpty {
+            if let singlePriceOption {
+                CheckoutSinglePriceOptionRow(option: singlePriceOption, event: event)
+            } else if !eligiblePriceOptions.isEmpty {
                 Text("Scegli la formula *")
                     .font(.headline.weight(.bold))
                     .foregroundStyle(Brand.foreground)
@@ -15041,6 +15047,59 @@ struct CheckoutPriceOptionRow: View {
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
+    }
+}
+
+struct CheckoutSinglePriceOptionRow: View {
+    let option: PriceOption
+    let event: Event
+
+    private var price: Double {
+        option.totalPrice(fallback: event)
+    }
+
+    private var isDisabled: Bool {
+        !option.isBookable(in: event) && !option.canJoinWaitlist(in: event)
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: "ticket")
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.primary)
+                .frame(width: 28)
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Partecipazione evento")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.foreground)
+
+                Text(option.paymentSummary(in: event))
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Brand.mutedForeground)
+
+                Label(option.availabilityText(in: event), systemImage: option.isBookable(in: event) ? "person.2" : (option.canJoinWaitlist(in: event) ? "list.bullet" : "xmark.circle"))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(option.isBookable(in: event) ? Brand.success : (option.canJoinWaitlist(in: event) ? Brand.warning : Brand.destructive))
+            }
+
+            Spacer(minLength: 8)
+
+            VStack(alignment: .trailing, spacing: 3) {
+                if let originalPrice = option.originalPrice, originalPrice > price {
+                    Text("€\(money(originalPrice))")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Brand.mutedForeground)
+                        .strikethrough(true, color: Brand.mutedForeground)
+                }
+                Text("€\(money(price))")
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(isDisabled ? Brand.mutedForeground : (option.showsPromoBadge ? Brand.success : Brand.primary))
+            }
+        }
+        .padding()
+        .background(isDisabled ? Brand.muted.opacity(0.45) : Brand.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted.opacity(0.72), lineWidth: 1.2))
     }
 }
 
