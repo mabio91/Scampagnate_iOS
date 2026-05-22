@@ -11879,9 +11879,6 @@ struct OrganizerPublicParticipantDetailRow: View {
                     if let instagram = displayProfile?.instagramDisplay {
                         ParticipantDetailChip(icon: "camera.fill", text: instagram, color: Brand.primary)
                     }
-                    if let age = participant.age ?? displayProfile?.birthDate.flatMap({ calculateAge(from: $0) }) {
-                        ParticipantDetailChip(icon: "calendar", text: "\(age) anni", color: Brand.mutedForeground)
-                    }
                 }
             }
 
