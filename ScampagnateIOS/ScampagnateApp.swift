@@ -22301,30 +22301,8 @@ struct OrganizerEventTimePickerField: View {
     }
 }
 
-@MainActor
-private final class OrganizerRichTextEditorController: ObservableObject {
-    weak var webView: WKWebView?
-
-    func setHTML(_ html: String) {
-        evaluate("window.scampSetHTML(\(Self.jsStringLiteral(html)));")
-    }
-
-    private func evaluate(_ javaScript: String) {
-        webView?.evaluateJavaScript(javaScript)
-    }
-
-    private static func jsStringLiteral(_ value: String) -> String {
-        guard let data = try? JSONSerialization.data(withJSONObject: [value], options: []),
-              let arrayLiteral = String(data: data, encoding: .utf8),
-              arrayLiteral.count >= 2
-        else { return "\"\"" }
-        return String(arrayLiteral.dropFirst().dropLast())
-    }
-}
-
 private struct OrganizerRichTextEditor: View {
     @Binding var html: String
-    @StateObject private var controller = OrganizerRichTextEditorController()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -22332,10 +22310,19 @@ private struct OrganizerRichTextEditor: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(Brand.foreground)
 
-            VStack(spacing: 0) {
-                OrganizerRichTextTextView(html: $html, controller: controller)
+            ZStack(alignment: .topLeading) {
+                OrganizerRichTextTextView(html: $html)
                     .frame(maxWidth: .infinity, minHeight: 230, alignment: .leading)
                     .padding(10)
+
+                if html.htmlPlainText.nilIfBlank == nil {
+                    Text("Inizia a scrivere...")
+                        .font(.body)
+                        .foregroundStyle(Brand.inputMutedForeground)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 10)
+                        .allowsHitTesting(false)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 14))
@@ -22347,241 +22334,78 @@ private struct OrganizerRichTextEditor: View {
 
 private struct OrganizerRichTextTextView: UIViewRepresentable {
     @Binding var html: String
-    @ObservedObject var controller: OrganizerRichTextEditorController
 
-    func makeUIView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
-        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
-        configuration.userContentController.add(context.coordinator, name: Coordinator.messageHandlerName)
-        let webView = WKWebView(frame: .zero, configuration: configuration)
-        webView.navigationDelegate = context.coordinator
-        webView.isOpaque = false
-        webView.backgroundColor = .clear
-        webView.scrollView.backgroundColor = .clear
-        webView.scrollView.keyboardDismissMode = .interactive
-        webView.scrollView.alwaysBounceVertical = true
-        webView.scrollView.alwaysBounceHorizontal = false
-        webView.scrollView.isDirectionalLockEnabled = true
-        webView.scrollView.showsHorizontalScrollIndicator = false
-        webView.scrollView.contentInset = .zero
-        webView.scrollView.contentInsetAdjustmentBehavior = .never
-        context.coordinator.attach(webView)
-        context.coordinator.lastSyncedHTML = EventDescriptionHTML.cleanStoredHTML(from: html)
-        webView.loadHTMLString(Self.editorDocument(for: context.coordinator.lastSyncedHTML), baseURL: nil)
-        return webView
+    func makeUIView(context: Context) -> UITextView {
+        let textView = UITextView()
+        textView.delegate = context.coordinator
+        textView.backgroundColor = .clear
+        textView.isOpaque = false
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.allowsEditingTextAttributes = true
+        textView.keyboardDismissMode = .interactive
+        textView.alwaysBounceVertical = true
+        textView.showsHorizontalScrollIndicator = false
+        textView.contentInset = .zero
+        textView.textContainerInset = .zero
+        textView.textContainer.lineFragmentPadding = 0
+        textView.font = .systemFont(ofSize: 16)
+        textView.textColor = UIColor(Brand.inputForeground)
+        textView.tintColor = UIColor(Brand.primary)
+        textView.typingAttributes = EventDescriptionHTML.editorTypingAttributes()
+        context.coordinator.apply(html, to: textView)
+        return textView
     }
 
-    func updateUIView(_ webView: WKWebView, context: Context) {
+    func updateUIView(_ textView: UITextView, context: Context) {
         let cleanHTML = EventDescriptionHTML.cleanStoredHTML(from: html)
-        guard context.coordinator.isReady,
-              !context.coordinator.isReceivingHTML,
-              context.coordinator.lastSyncedHTML != cleanHTML
-        else { return }
-        context.coordinator.lastSyncedHTML = cleanHTML
-        controller.setHTML(cleanHTML)
-    }
-
-    static func dismantleUIView(_ webView: WKWebView, coordinator: Coordinator) {
-        webView.configuration.userContentController.removeScriptMessageHandler(forName: Coordinator.messageHandlerName)
-        if coordinator.controller?.webView === webView {
-            coordinator.controller?.webView = nil
+        textView.textColor = UIColor(Brand.inputForeground)
+        textView.tintColor = UIColor(Brand.primary)
+        textView.typingAttributes = EventDescriptionHTML.editorTypingAttributes()
+        guard !context.coordinator.isUpdatingFromTextView,
+              context.coordinator.lastSyncedHTML != cleanHTML else {
+            return
         }
+        context.coordinator.apply(cleanHTML, to: textView)
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(html: $html, controller: controller)
+        Coordinator(html: $html)
     }
 
-    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
-        static let messageHandlerName = "richTextEditor"
+    final class Coordinator: NSObject, UITextViewDelegate {
         @Binding private var html: String
-        weak var controller: OrganizerRichTextEditorController?
-        var isReady = false
-        var isReceivingHTML = false
         var lastSyncedHTML = ""
+        var isUpdatingFromTextView = false
 
-        init(html: Binding<String>, controller: OrganizerRichTextEditorController) {
+        init(html: Binding<String>) {
             self._html = html
-            self.controller = controller
         }
 
-        func attach(_ webView: WKWebView) {
-            controller?.webView = webView
-        }
-
-        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard let body = message.body as? [String: Any],
-                  let type = body["type"] as? String else { return }
-            if type == "ready" {
-                isReady = true
-            }
-            guard let rawHTML = body["html"] as? String else { return }
+        func apply(_ rawHTML: String, to textView: UITextView) {
             let cleanHTML = EventDescriptionHTML.cleanStoredHTML(from: rawHTML)
             lastSyncedHTML = cleanHTML
+            let selectedRange = textView.selectedRange
+            textView.attributedText = EventDescriptionHTML.attributedStringForEditing(from: cleanHTML)
+            textView.typingAttributes = EventDescriptionHTML.editorTypingAttributes()
+            if selectedRange.location <= textView.attributedText.length {
+                textView.selectedRange = NSRange(
+                    location: selectedRange.location,
+                    length: min(selectedRange.length, textView.attributedText.length - selectedRange.location)
+                )
+            }
+        }
+
+        func textViewDidChange(_ textView: UITextView) {
+            let cleanHTML = EventDescriptionHTML.cleanHTML(from: textView.attributedText)
+            lastSyncedHTML = cleanHTML
             guard html != cleanHTML else { return }
-            isReceivingHTML = true
+            isUpdatingFromTextView = true
             html = cleanHTML
             DispatchQueue.main.async { [weak self] in
-                self?.isReceivingHTML = false
+                self?.isUpdatingFromTextView = false
             }
         }
-    }
-
-    private static func editorDocument(for html: String) -> String {
-        """
-        <!doctype html>
-        <html>
-        <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-        <style>
-        :root { color-scheme: light dark; }
-        html, body {
-          margin: 0;
-          padding: 0;
-          width: 100%;
-          max-width: 100%;
-          box-sizing: border-box;
-          background: transparent;
-          min-height: 100%;
-          overflow-x: hidden;
-        }
-        body {
-          color: #15281F;
-          font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-          font-size: 16px;
-          line-height: 1.55;
-          -webkit-font-smoothing: antialiased;
-        }
-        #editor {
-          width: 100%;
-          max-width: 100%;
-          box-sizing: border-box;
-          min-height: 210px;
-          outline: none;
-          overflow-wrap: anywhere;
-          word-break: break-word;
-          -webkit-user-select: text;
-          user-select: text;
-        }
-        #editor:empty::before {
-          content: attr(data-placeholder);
-          color: #7B8B80;
-          pointer-events: none;
-        }
-        h1 {
-          font-size: 24px;
-          font-weight: 800;
-          line-height: 1.2;
-          margin: 24px 0 12px;
-        }
-        h2 {
-          font-size: 21px;
-          font-weight: 800;
-          line-height: 1.25;
-          margin: 22px 0 10px;
-        }
-        h3 {
-          font-size: 17px;
-          font-weight: 700;
-          line-height: 1.35;
-          margin: 18px 0 8px;
-        }
-        p {
-          margin: 0 0 12px;
-          line-height: 1.55;
-        }
-        ul, ol {
-          margin: 8px 0 14px;
-          padding-left: 24px;
-        }
-        li {
-          margin: 0 0 6px;
-          line-height: 1.5;
-        }
-        strong, b { font-weight: 800; }
-        em, i { font-style: italic; }
-        u {
-          text-decoration-thickness: 1px;
-          text-underline-offset: 3px;
-        }
-        s { text-decoration-thickness: 1px; }
-        a {
-          color: #224E38;
-          font-weight: 700;
-          text-decoration-thickness: 1px;
-          text-underline-offset: 3px;
-        }
-        img {
-          display: block;
-          max-width: 100%;
-          box-sizing: border-box;
-          height: auto;
-          border-radius: 14px;
-          margin: 14px 0;
-        }
-        h1:first-child, h2:first-child, h3:first-child, p:first-child, ul:first-child, ol:first-child, img:first-child { margin-top: 0; }
-        p:last-child, ul:last-child, ol:last-child, li:last-child, img:last-child { margin-bottom: 0; }
-        @media (prefers-color-scheme: dark) {
-          body { color: #EBE7E0; }
-          #editor:empty::before { color: #B8B0A4; }
-          a { color: #64B48C; }
-        }
-        </style>
-        </head>
-        <body>
-        <div id="editor" contenteditable="true" data-placeholder="Inizia a scrivere...">\(html)</div>
-        <script>
-        (() => {
-          const editor = document.getElementById('editor');
-          let savedRange = null;
-
-          function post(type) {
-            window.webkit.messageHandlers.\(Coordinator.messageHandlerName).postMessage({
-              type,
-              html: editor.innerHTML
-            });
-          }
-
-          function nodeInsideEditor(node) {
-            return node && (node === editor || editor.contains(node));
-          }
-
-          function saveSelection() {
-            const selection = window.getSelection();
-            if (!selection || selection.rangeCount === 0) return;
-            const range = selection.getRangeAt(0);
-            if (nodeInsideEditor(range.commonAncestorContainer)) {
-              savedRange = range.cloneRange();
-            }
-          }
-
-          window.scampSetHTML = (html) => {
-            editor.innerHTML = html || '';
-            post('update');
-            saveSelection();
-          };
-
-          editor.addEventListener('input', () => {
-            post('update');
-            saveSelection();
-          });
-          editor.addEventListener('keyup', saveSelection);
-          editor.addEventListener('mouseup', saveSelection);
-          editor.addEventListener('touchend', () => setTimeout(saveSelection, 0));
-          document.addEventListener('selectionchange', () => {
-            if (document.activeElement === editor) saveSelection();
-          });
-
-          setTimeout(() => {
-            post('ready');
-            saveSelection();
-          }, 0);
-        })();
-        </script>
-        </body>
-        </html>
-        """
     }
 }
 
