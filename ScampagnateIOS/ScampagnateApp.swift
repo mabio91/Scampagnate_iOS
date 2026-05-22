@@ -9031,13 +9031,13 @@ struct EventCalendarEventRow: View {
                     .fixedSize(horizontal: false, vertical: true)
 
                 HStack(spacing: 6) {
-                    Label(event.displayLocation, systemImage: "mappin")
-                        .lineLimit(1)
                     if let formattedTime {
-                        Text("·")
                         Label(formattedTime, systemImage: "clock")
                             .lineLimit(1)
+                        Text("·")
                     }
+                    Label(event.displayLocation, systemImage: "mappin")
+                        .lineLimit(1)
                 }
                 .font(.caption)
                 .foregroundStyle(Brand.mutedForeground)
