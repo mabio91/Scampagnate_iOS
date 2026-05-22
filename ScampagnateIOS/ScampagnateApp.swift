@@ -802,6 +802,16 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func fetchOrganizerEventStaff(eventId: String, reportingErrors: Bool = true) async -> [EventStaffMember] {
+        do {
+            let authSession = try await authenticatedSession()
+            return try await api.fetchOrganizerEventStaff(eventId: eventId, session: authSession)
+        } catch {
+            report(error, when: reportingErrors)
+            return []
+        }
+    }
+
     func loadOrganizerProfile(organizerId: String?) async {
         guard let organizerId = organizerId?.nilIfBlank, organizerPublicProfiles[organizerId] == nil else { return }
         if let organizer = try? await api.fetchOrganizerPublicProfile(userId: organizerId, session: session) {
@@ -2196,6 +2206,12 @@ struct SupabaseAPI {
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [EventStaffMember].self)
     }
 
+    func fetchOrganizerEventStaff(eventId: String, session: AuthSession) async throws -> [EventStaffMember] {
+        let select = "id,event_id,profile_id,display_name,role_label,avatar_url,sort_order,is_public"
+        let path = "/rest/v1/event_staff?select=\(select.urlEncoded)&event_id=eq.\(eventId.urlEncoded)&order=sort_order.asc&order=created_at.asc"
+        return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [EventStaffMember].self)
+    }
+
     func fetchCategories(session: AuthSession?) async throws -> [EventCategory] {
         try await request(path: "/rest/v1/event_categories?select=*&order=sort_order.asc", method: "GET", bodyData: nil, auth: session, decode: [EventCategory].self)
     }
@@ -2977,6 +2993,7 @@ struct SupabaseAPI {
         try await replaceMeetingPoints(eventId: eventId, points: draft.meetingPoints, session: session)
         try await replacePriceOptions(eventId: eventId, options: draft.priceOptions, session: session)
         try await replaceSpecialBadges(eventId: eventId, badgeIds: draft.specialBadgeIds, session: session)
+        try await replaceEventStaffIfAvailable(eventId: eventId, staff: draft.staffMembers, session: session)
         return eventId
     }
 
@@ -3064,6 +3081,44 @@ struct SupabaseAPI {
         }
         let data = try JSONEncoder().encode(rows)
         let _: EmptyResponse = try await request(path: "/rest/v1/event_special_badges", method: "POST", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
+    }
+
+    private func replaceEventStaffIfAvailable(eventId: String, staff: [OrganizerEventStaffDraft], session: AuthSession) async throws {
+        do {
+            try await replaceEventStaff(eventId: eventId, staff: staff, session: session)
+        } catch {
+            guard isEventStaffSchemaUnavailable(error) else { throw error }
+        }
+    }
+
+    private func replaceEventStaff(eventId: String, staff: [OrganizerEventStaffDraft], session: AuthSession) async throws {
+        let _: EmptyResponse = try await request(path: "/rest/v1/event_staff?event_id=eq.\(eventId.urlEncoded)", method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
+        let validStaff = staff.filter { $0.displayName.nilIfBlank != nil }
+        guard !validStaff.isEmpty else { return }
+        let rows = validStaff.enumerated().map { index, member in
+            [
+                "event_id": JSONValue.string(eventId),
+                "profile_id": member.profileId?.nilIfBlank.map { .string($0) } ?? .null,
+                "display_name": .string(member.displayName.nilIfBlank ?? "Staff"),
+                "role_label": .string(member.roleLabel.nilIfBlank ?? "STAFF"),
+                "avatar_url": member.avatarUrl?.nilIfBlank.map { .string($0) } ?? .null,
+                "sort_order": .number(Double(index)),
+                "is_public": .bool(member.isPublic)
+            ]
+        }
+        let data = try JSONEncoder().encode(rows)
+        let _: EmptyResponse = try await request(path: "/rest/v1/event_staff", method: "POST", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
+    }
+
+    private func isEventStaffSchemaUnavailable(_ error: Error) -> Bool {
+        let message = error.localizedDescription.lowercased()
+        guard message.contains("event_staff") else { return false }
+        return message.contains("schema cache")
+            || message.contains("relationship")
+            || message.contains("relation")
+            || message.contains("could not find")
+            || message.contains("does not exist")
+            || message.contains("404")
     }
 
     func deleteOrganizerEvent(eventId: String, session: AuthSession) async throws {
@@ -5049,6 +5104,43 @@ struct OrganizerMeetingPointDraft: Identifiable, Equatable {
     }
 }
 
+struct OrganizerEventStaffDraft: Identifiable, Equatable {
+    static let presetRoles = ["STAFF", "FOTOGRAFO", "GUIDA"]
+    static let customRoleValue = "__custom__"
+
+    var id = UUID()
+    var serverId: String?
+    var profileId: String?
+    var displayName = ""
+    var roleLabel = "STAFF"
+    var avatarUrl: String?
+    var isPublic = true
+    var profileSearch = ""
+
+    var roleSelection: String {
+        Self.presetRoles.contains(roleLabel) ? roleLabel : Self.customRoleValue
+    }
+
+    init() {}
+
+    init(member: EventStaffMember, duplicate: Bool = false) {
+        serverId = duplicate ? nil : member.id
+        profileId = member.profileId
+        displayName = member.name
+        roleLabel = member.role.uppercased()
+        avatarUrl = member.avatarUrl
+        isPublic = member.isPublic ?? true
+        profileSearch = member.name
+    }
+
+    init(profile: OrganizerSearchProfile) {
+        profileId = profile.id
+        displayName = profile.displayName
+        avatarUrl = profile.avatarUrl
+        profileSearch = profile.displayName
+    }
+}
+
 struct OrganizerPriceOptionDraft: Identifiable, Equatable {
     var id = UUID()
     var serverId: String?
@@ -5267,6 +5359,7 @@ struct OrganizerEventDraft: Equatable {
     var exclusivityLabel = ""
     var restrictionMessage = ""
     var meetingPoints: [OrganizerMeetingPointDraft] = []
+    var staffMembers: [OrganizerEventStaffDraft] = []
     var priceOptions: [OrganizerPriceOptionDraft] = [OrganizerPriceOptionDraft.defaultFormula()]
     var equipmentItems: [OrganizerEquipmentItemDraft] = []
     var additionalFields: [OrganizerAdditionalFieldDraft] = []
@@ -5278,7 +5371,7 @@ struct OrganizerEventDraft: Equatable {
 
     init() {}
 
-    init(event: Event, meetingPoints: [MeetingPoint] = [], priceOptions: [PriceOption] = [], specialBadgeIds: [String] = [], duplicate: Bool = false) {
+    init(event: Event, meetingPoints: [MeetingPoint] = [], staffMembers: [EventStaffMember] = [], priceOptions: [PriceOption] = [], specialBadgeIds: [String] = [], duplicate: Bool = false) {
         title = duplicate ? "Copia di \(event.title)" : event.title
         description = event.description ?? ""
         date = duplicate ? "" : (event.date ?? DateFormatter.eventDate.string(from: Date()))
@@ -5309,6 +5402,7 @@ struct OrganizerEventDraft: Equatable {
         originalCustomBadge = customBadge
         preservedEventBadges = Array(nonManualBadges.dropFirst())
         self.specialBadgeIds = duplicate ? [] : specialBadgeIds
+        self.staffMembers = staffMembers.map { OrganizerEventStaffDraft(member: $0, duplicate: duplicate) }
         originalAdditionalFields = duplicate ? [:] : (event.additionalFields?.objectValue ?? [:])
         originalAccessRules = duplicate ? [:] : (event.accessRules?.objectValue ?? [:])
         fitScoreMainCategory = event.additionalFields?.string(at: "fit_score_main_category") ?? ""
@@ -21774,6 +21868,28 @@ struct OrganizerEventEditorView: View {
                             .buttonStyle(SecondaryButtonStyle())
                         }
 
+                        OrganizerEditorSection(title: "Staff evento") {
+                            Text("L'organizzatore viene mostrato automaticamente per primo. Aggiungi qui le altre persone presenti nello staff.")
+                                .font(.caption)
+                                .foregroundStyle(Brand.mutedForeground)
+                            ForEach(draft.staffMembers) { member in
+                                OrganizerEventStaffEditor(member: staffMemberBinding(for: member.id)) {
+                                    draft.staffMembers.removeAll { $0.id == member.id }
+                                }
+                            }
+                            if draft.staffMembers.isEmpty {
+                                Text("Nessun membro staff aggiunto.")
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.mutedForeground)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 6)
+                            }
+                            Button("Aggiungi staff") {
+                                draft.staffMembers.append(OrganizerEventStaffDraft())
+                            }
+                            .buttonStyle(SecondaryButtonStyle())
+                        }
+
                         OrganizerEditorSection(title: "Lista attrezzatura") {
                             if !equipmentTemplates.isEmpty {
                                 Menu("Carica template attrezzatura") {
@@ -21959,13 +22075,15 @@ struct OrganizerEventEditorView: View {
         case .edit(let eventId), .duplicate(let eventId):
             async let eventTask = store.fetchOrganizerEvent(eventId: eventId, reportingErrors: false)
             async let pointsTask = store.fetchOrganizerMeetingPoints(eventId: eventId, reportingErrors: false)
+            async let staffTask = store.fetchOrganizerEventStaff(eventId: eventId, reportingErrors: false)
             async let pricesTask = store.fetchOrganizerPriceOptions(eventId: eventId, reportingErrors: false)
             async let specialBadgeIdsTask = store.fetchOrganizerSpecialBadgeIds(eventId: eventId, reportingErrors: false)
             if let event = await eventTask {
                 let points = await pointsTask
+                let staff = await staffTask
                 let prices = await pricesTask
                 let badges = await specialBadgeIdsTask
-                draft = OrganizerEventDraft(event: event, meetingPoints: points, priceOptions: prices, specialBadgeIds: badges, duplicate: route.mode.isDuplicate)
+                draft = OrganizerEventDraft(event: event, meetingPoints: points, staffMembers: staff, priceOptions: prices, specialBadgeIds: badges, duplicate: route.mode.isDuplicate)
             }
         }
         loading = false
@@ -22066,6 +22184,15 @@ struct OrganizerEventEditorView: View {
         }
     }
 
+    private func staffMemberBinding(for id: UUID) -> Binding<OrganizerEventStaffDraft> {
+        Binding {
+            draft.staffMembers.first { $0.id == id } ?? OrganizerEventStaffDraft()
+        } set: { updated in
+            guard let index = draft.staffMembers.firstIndex(where: { $0.id == id }) else { return }
+            draft.staffMembers[index] = updated
+        }
+    }
+
     private func equipmentItemBinding(for id: UUID) -> Binding<OrganizerEquipmentItemDraft> {
         Binding {
             draft.equipmentItems.first { $0.id == id } ?? OrganizerEquipmentItemDraft()
@@ -22083,6 +22210,146 @@ struct OrganizerEventEditorView: View {
             draft.additionalFields[index] = updated
         }
     }
+}
+
+struct OrganizerEventStaffEditor: View {
+    @EnvironmentObject private var store: AppStore
+    @Binding var member: OrganizerEventStaffDraft
+    let onDelete: () -> Void
+    @State private var searchResults: [OrganizerSearchProfile] = []
+    @State private var searching = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(member.displayName.nilIfBlank ?? "Nuovo staff")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                    Text(member.roleLabel.nilIfBlank ?? "STAFF")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Brand.mutedForeground)
+                }
+                Spacer()
+                Button(role: .destructive, action: onDelete) {
+                    Image(systemName: "trash")
+                        .font(.subheadline.weight(.bold))
+                }
+                .buttonStyle(.borderless)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Profilo utente")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Brand.mutedForeground)
+                if member.profileId?.nilIfBlank != nil {
+                    HStack(spacing: 10) {
+                        OrganizerOwnerAvatar(name: member.displayName, avatarUrl: member.avatarUrl, size: 32)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(member.displayName.nilIfBlank ?? "Profilo collegato")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Brand.inputForeground)
+                            Text("Collegato a un utente")
+                                .font(.caption2)
+                                .foregroundStyle(Brand.inputMutedForeground)
+                        }
+                        Spacer()
+                        Button("Scollega") {
+                            member.profileId = nil
+                            member.avatarUrl = nil
+                            member.profileSearch = ""
+                        }
+                        .font(.caption.weight(.semibold))
+                    }
+                    .padding(10)
+                    .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(Brand.inputBorder, lineWidth: 1))
+                } else {
+                    Field("Cerca profilo o lascia manuale", text: $member.profileSearch)
+                        .textInputAutocapitalization(.words)
+                    if searching {
+                        ProgressView()
+                            .tint(Brand.primary)
+                            .frame(maxWidth: .infinity)
+                    } else if !searchResults.isEmpty {
+                        VStack(spacing: 6) {
+                            ForEach(searchResults) { profile in
+                                Button {
+                                    member.profileId = profile.id
+                                    member.displayName = profile.displayName
+                                    member.avatarUrl = profile.avatarUrl
+                                    member.profileSearch = profile.displayName
+                                    searchResults = []
+                                } label: {
+                                    OrganizerSearchProfileRow(profile: profile, selected: false)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Field("Nome e cognome", text: $member.displayName)
+                .textInputAutocapitalization(.words)
+
+            Text("Ruolo")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Brand.mutedForeground)
+            Picker("Ruolo", selection: roleSelectionBinding) {
+                ForEach(OrganizerEventStaffDraft.presetRoles, id: \.self) { role in
+                    Text(role).tag(role)
+                }
+                Text("Campo libero").tag(OrganizerEventStaffDraft.customRoleValue)
+            }
+            .editableControlSurface()
+            if member.roleSelection == OrganizerEventStaffDraft.customRoleValue {
+                Field("Ruolo personalizzato", text: $member.roleLabel)
+                    .textInputAutocapitalization(.words)
+            }
+
+            Toggle("Visibile nel dettaglio evento", isOn: $member.isPublic)
+                .editableControlSurface()
+        }
+        .padding(12)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.muted, lineWidth: 1))
+        .task(id: member.profileSearch) { await searchProfiles() }
+    }
+
+    private var roleSelectionBinding: Binding<String> {
+        Binding {
+            member.roleSelection
+        } set: { value in
+            if value == OrganizerEventStaffDraft.customRoleValue {
+                if OrganizerEventStaffDraft.presetRoles.contains(member.roleLabel) {
+                    member.roleLabel = ""
+                }
+            } else {
+                member.roleLabel = value
+            }
+        }
+    }
+
+    @MainActor
+    private func searchProfiles() async {
+        let term = member.profileSearch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard member.profileId?.nilIfBlank == nil, term.count >= 2 else {
+            searchResults = []
+            searching = false
+            return
+        }
+        searching = true
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        guard term == member.profileSearch.trimmingCharacters(in: .whitespacesAndNewlines),
+              member.profileId?.nilIfBlank == nil else {
+            searching = false
+            return
+        }
+        searchResults = await store.searchOrganizerProfiles(term)
+        searching = false
+    }
+
 }
 
 struct OrganizerEventDatePickerField: View {
