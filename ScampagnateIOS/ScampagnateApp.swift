@@ -9745,16 +9745,29 @@ struct EventDetailView: View {
                             }
                             .frame(width: proxy.size.width, alignment: .leading)
                             .padding(.bottom, 20)
+                            .background {
+                                GeometryReader { scrollProxy in
+                                    Color.clear.preference(
+                                        key: ScrollOffsetPreferenceKey.self,
+                                        value: max(0, -scrollProxy.frame(in: .named("event-detail-scroll")).minY)
+                                    )
+                                }
+                            }
                         }
+                        .coordinateSpace(name: "event-detail-scroll")
                         .refreshable {
                             await store.refreshEventDetail(eventId: eventId)
                         }
                         .ignoresSafeArea(edges: .top)
                         .modifier(EventDetailScrollTracker(scrollOffset: $scrollOffset))
+                        .onPreferenceChange(ScrollOffsetPreferenceKey.self) { newValue in
+                            scrollOffset = newValue
+                        }
 
                         let opacity = compactHeaderOpacity()
                         compactHeader(event)
                             .opacity(opacity)
+                            .offset(y: -10 * (1 - opacity))
                             .allowsHitTesting(opacity > 0.98)
                             .zIndex(20)
                     }
@@ -9892,10 +9905,16 @@ struct EventDetailView: View {
     private func hero(_ event: Event, width: CGFloat, topInset: CGFloat) -> some View {
         let heroHeight: CGFloat = 340
         let safeTop = max(topInset, 22)
+        let heroOpacity = heroOpacity(heroHeight: heroHeight)
+        let heroScale = 1 + scrollOffset * 0.0005
+        let heroTranslateY = scrollOffset * 0.4
         return ZStack(alignment: .bottomLeading) {
             RemoteImage(urlString: event.imageUrl)
                 .frame(width: width, height: heroHeight)
                 .saturation(event.isSoldOut ? 0 : 1)
+                .scaleEffect(heroScale)
+                .offset(y: heroTranslateY)
+                .opacity(heroOpacity)
                 .overlay {
                     LinearGradient(
                         colors: event.isSoldOut
@@ -9904,10 +9923,12 @@ struct EventDetailView: View {
                         startPoint: .top,
                         endPoint: .bottom
                     )
+                    .opacity(heroOpacity)
                 }
                 .overlay {
                     if event.isSoldOut {
                         SoldOutRibbon(fontSize: 18)
+                            .opacity(heroOpacity)
                     }
                 }
             VStack {
@@ -9931,6 +9952,7 @@ struct EventDetailView: View {
                 Spacer()
             }
             .frame(width: width, height: heroHeight)
+            .opacity(heroOpacity)
             VStack(alignment: .leading, spacing: 12) {
                 Spacer()
                 Text(event.title)
@@ -9944,16 +9966,23 @@ struct EventDetailView: View {
                     .padding(.bottom, 34)
             }
             .frame(width: width, height: heroHeight, alignment: .bottomLeading)
+            .opacity(heroOpacity)
         }
         .frame(width: width, height: heroHeight)
+        .background(Brand.background)
         .clipped()
     }
 
+    private func heroOpacity(heroHeight: CGFloat) -> Double {
+        max(0, min(Double(1 - scrollOffset / (heroHeight * 0.7)), 1))
+    }
+
     private func compactHeaderOpacity() -> Double {
-        let revealStart: CGFloat = 280
-        let revealEnd: CGFloat = 320
+        let revealStart: CGFloat = 295
+        let revealEnd: CGFloat = 365
         guard scrollOffset > revealStart else { return 0 }
-        return min(Double((scrollOffset - revealStart) / (revealEnd - revealStart)), 1)
+        let progress = min(Double((scrollOffset - revealStart) / (revealEnd - revealStart)), 1)
+        return progress * progress * (3 - 2 * progress)
     }
 
     private func compactHeader(_ event: Event) -> some View {
