@@ -4514,7 +4514,7 @@ struct PriceOption: Codable, Identifiable, Hashable {
             let deposit = effectiveDepositAmount(fallback: event)
             let balance = effectiveBalanceAmount(fallback: event)
             let balanceLabel = effectiveBalancePaymentMode(fallback: event) == "on_site" ? "sul posto" : "online"
-            return "€\(money(totalPrice(fallback: event))) · €\(money(deposit)) ora + €\(money(balance)) \(balanceLabel)"
+            return "€\(money(deposit)) ora + €\(money(balance)) \(balanceLabel)"
         default:
             return "Pagamento online"
         }
