@@ -22029,16 +22029,9 @@ struct OrganizerEventEditorView: View {
             switch kind {
             case .cover:
                 draft.imageUrl = url
-            case .gallery:
-                if !draft.galleryImageURLs.contains(url) {
-                    draft.galleryImageURLs.append(url)
-                }
             }
         }
         uploadingImages = false
-        if kind == .gallery {
-            await uploadNextGalleryImage()
-        }
     }
 
     @MainActor
@@ -23853,8 +23846,9 @@ struct OrganizerGalleryEditor: View {
                 HStack(spacing: 10) {
                     let currentURL = urls.indices.contains(index) ? urls[index] : ""
                     if currentURL.nilIfBlank != nil {
-                        RemoteImage(urlString: currentURL)
+                        RemoteImage(urlString: currentURL, contentMode: .fit)
                             .frame(width: 58, height: 58)
+                            .background(Brand.muted, in: RoundedRectangle(cornerRadius: 10))
                             .clipShape(RoundedRectangle(cornerRadius: 10))
                     } else {
                         RoundedRectangle(cornerRadius: 10)
@@ -23918,33 +23912,28 @@ struct OrganizerGalleryEditor: View {
 
 enum OrganizerImageCropKind {
     case cover
-    case gallery
 
     var title: String {
         switch self {
         case .cover: "Immagine evento"
-        case .gallery: "Immagine galleria"
         }
     }
 
     var subtitle: String {
         switch self {
         case .cover: "Ritaglio 16:9 per copertina e card evento"
-        case .gallery: "Ritaglio quadrato per la galleria"
         }
     }
 
     var aspectRatio: CGFloat {
         switch self {
         case .cover: 16 / 9
-        case .gallery: 1
         }
     }
 
     var outputSize: CGSize {
         switch self {
         case .cover: CGSize(width: 1200, height: 675)
-        case .gallery: CGSize(width: 1000, height: 1000)
         }
     }
 }
