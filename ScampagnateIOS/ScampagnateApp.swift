@@ -122,6 +122,7 @@ final class AppStore: ObservableObject {
     @Published var savedEvents: [SavedEvent] = []
     @Published var eventOpeningReminders: [EventOpeningReminder] = []
     @Published var eventParticipants: [String: [EventParticipant]] = [:]
+    @Published var eventStaff: [String: [EventStaffMember]] = [:]
     @Published var organizerProfiles: [String: PublicProfile] = [:]
     @Published var organizerPublicProfiles: [String: OrganizerPublicProfile] = [:]
     @Published var notifications: [UserNotification] = []
@@ -293,6 +294,7 @@ final class AppStore: ObservableObject {
                 do { eventOpeningReminders = try await openingRemindersTask } catch { remember(error, in: &firstError) }
 
                 report(firstError, when: reportingErrors)
+                await loadEventStaff(eventId: eventId)
                 await refreshParticipants(eventId: eventId, session: authSession)
             } catch {
                 report(error, when: reportingErrors)
@@ -304,6 +306,7 @@ final class AppStore: ObservableObject {
                 await refreshEventData(reportingErrors: false)
                 report(error, when: reportingErrors)
             }
+            await loadEventStaff(eventId: eventId)
             await loadParticipants(eventId: eventId)
         }
     }
@@ -789,6 +792,14 @@ final class AppStore: ObservableObject {
 
     func loadParticipants(eventId: String) async {
         await refreshParticipants(eventId: eventId, session: session)
+    }
+
+    func loadEventStaff(eventId: String) async {
+        do {
+            eventStaff[eventId] = try await api.fetchEventStaff(eventId: eventId, session: session)
+        } catch {
+            eventStaff[eventId] = []
+        }
     }
 
     func loadOrganizerProfile(organizerId: String?) async {
@@ -2040,7 +2051,7 @@ final class PushNotificationService: ObservableObject {
 
 struct SupabaseAPI {
     private static let priceOptionSelect = "id,name,price,sort_order,original_price,eligible_group,is_promotional,promo_start,promo_end,payment_type,deposit_amount,balance_amount,balance_payment_mode,has_dedicated_spots,dedicated_spots,spots_taken,waitlist_enabled"
-    private static let eventSelect = "id,title,date,time,location,location_label,category_id,status,price,deposit,payment_type,balance_payment_mode,image_url,difficulty,distance,elevation,duration,spots_total,spots_taken,reserved_spots,featured,event_badges,organizer_id,organizer_name,description,cancellation_policy,equipment_list,additional_fields,visibility,gallery_images,access_rules,event_categories(id,name,icon),event_meeting_points(id,name,location,time,notes),event_price_options(\(priceOptionSelect)),event_staff(id,event_id,profile_id,display_name,role_label,avatar_url,sort_order,is_public)"
+    private static let eventSelect = "id,title,date,time,location,location_label,category_id,status,price,deposit,payment_type,balance_payment_mode,image_url,difficulty,distance,elevation,duration,spots_total,spots_taken,reserved_spots,featured,event_badges,organizer_id,organizer_name,description,cancellation_policy,equipment_list,additional_fields,visibility,gallery_images,access_rules,event_categories(id,name,icon),event_meeting_points(id,name,location,time,notes),event_price_options(\(priceOptionSelect))"
     private static let registrationSelect = "*,events(\(eventSelect)),meeting_point:event_meeting_points(id,name,location,time)"
     private static let organizerRegistrationSelect = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,sport_level,amount_paid,refund_amount,last_balance_reminder_sent_at,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,instagram_handle,avatar_url,total_points,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade,interests,birth_date,health_safety_status,health_safety_notes,emergency_medication_has,emergency_medication_notes,health_safety_help_notes),price_option:event_price_options(\(priceOptionSelect))"
     private static let nonManualRegistrationFilter = "&or=(sport_level.is.null,sport_level.not.like.manual:%25)"
@@ -2177,6 +2188,12 @@ struct SupabaseAPI {
         let events = try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [Event].self)
         guard let event = events.first else { throw AppError.message("Evento non disponibile") }
         return event
+    }
+
+    func fetchEventStaff(eventId: String, session: AuthSession?) async throws -> [EventStaffMember] {
+        let select = "id,event_id,profile_id,display_name,role_label,avatar_url,sort_order,is_public"
+        let path = "/rest/v1/event_staff?select=\(select.urlEncoded)&event_id=eq.\(eventId.urlEncoded)&is_public=eq.true&order=sort_order.asc&order=created_at.asc"
+        return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [EventStaffMember].self)
     }
 
     func fetchCategories(session: AuthSession?) async throws -> [EventCategory] {
@@ -9764,6 +9781,10 @@ struct EventDetailView: View {
         attendeeParticipants.isEmpty ? (event?.attendeeSpotsTaken ?? 0) : attendeeParticipants.count
     }
 
+    var staffMembers: [EventStaffMember] {
+        store.eventStaff[eventId] ?? event?.staffMembers ?? []
+    }
+
     var canViewParticipantDetails: Bool {
         store.isAuthenticated && store.profile != nil && !store.needsOnboarding
     }
@@ -9878,7 +9899,7 @@ struct EventDetailView: View {
                             .presentationDetents([.medium, .large])
                     }
                     .sheet(isPresented: $showStaff) {
-                        EventStaffSheet(event: event, organizerProfile: organizerProfile)
+                        EventStaffSheet(event: event, staffMembers: staffMembers, organizerProfile: organizerProfile)
                             .presentationDetents([.medium, .large])
                     }
                     .fullScreenCover(isPresented: $showGallery) {
@@ -10109,8 +10130,8 @@ struct EventDetailView: View {
                     showStaff = true
                 } label: {
                     VStack(alignment: .leading, spacing: 7) {
-                        SectionTitle("Staff (\(event.staffMembers.count + 1))")
-                        EventStaffAvatarStack(event: event, organizerProfile: organizerProfile)
+                        SectionTitle("Staff (\(staffMembers.count + 1))")
+                        EventStaffAvatarStack(event: event, staffMembers: staffMembers, organizerProfile: organizerProfile)
                     }
                 }
                 .buttonStyle(.plain)
@@ -10715,6 +10736,7 @@ struct OrganizerRow: View {
 
 struct EventStaffAvatarStack: View {
     let event: Event
+    let staffMembers: [EventStaffMember]
     let organizerProfile: PublicProfile?
 
     private var organizerName: String {
@@ -10723,7 +10745,7 @@ struct EventStaffAvatarStack: View {
 
     private var preview: [(id: String, name: String, avatarUrl: String?)] {
         let organizer = (id: event.organizerId ?? "organizer", name: organizerName, avatarUrl: organizerProfile?.avatarUrl)
-        let staff = event.staffMembers.map { member in
+        let staff = staffMembers.map { member in
             (id: member.id, name: member.name, avatarUrl: member.avatarUrl)
         }
         return [organizer] + staff
@@ -10750,6 +10772,7 @@ struct EventStaffAvatarStack: View {
 struct EventStaffSheet: View {
     @Environment(\.dismiss) private var dismiss
     let event: Event
+    let staffMembers: [EventStaffMember]
     let organizerProfile: PublicProfile?
 
     private var organizerName: String {
@@ -10764,7 +10787,7 @@ struct EventStaffSheet: View {
                         Text("Staff evento")
                             .font(.system(.title2, design: .rounded, weight: .bold))
                             .foregroundStyle(Brand.foreground)
-                        Text("\(event.staffMembers.count + 1) persone presenti")
+                        Text("\(staffMembers.count + 1) persone presenti")
                             .font(.system(.subheadline, design: .rounded))
                             .foregroundStyle(Brand.mutedForeground)
                     }
@@ -10811,12 +10834,12 @@ struct EventStaffSheet: View {
                     }
                 }
 
-                if !event.staffMembers.isEmpty {
+                if !staffMembers.isEmpty {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("STAFF PRESENTE")
                             .font(.caption.weight(.bold))
                             .foregroundStyle(Brand.primary)
-                        ForEach(event.staffMembers) { member in
+                        ForEach(staffMembers) { member in
                             HStack(spacing: 14) {
                                 OrganizerAvatar(name: member.name, avatarUrl: member.avatarUrl, size: 52)
                                 VStack(alignment: .leading, spacing: 3) {
