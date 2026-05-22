@@ -6920,6 +6920,24 @@ private extension Error {
 }
 
 private extension UIImage {
+    func resizedJPEGData(maxDimension: CGFloat = 1800, compressionQuality: CGFloat = 0.82) -> Data? {
+        let longestSide = max(size.width, size.height)
+        guard longestSide > 0 else { return nil }
+        let scale = min(1, maxDimension / longestSide)
+        let targetSize = CGSize(width: size.width * scale, height: size.height * scale)
+
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+        let image = renderer.image { context in
+            UIColor.white.setFill()
+            context.fill(CGRect(origin: .zero, size: targetSize))
+            draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+        return image.jpegData(compressionQuality: compressionQuality)
+    }
+
     func avatarJPEGData(maxDimension: CGFloat = 512, compressionQuality: CGFloat = 0.8) -> Data? {
         let longestSide = max(size.width, size.height)
         guard longestSide > 0 else { return nil }
@@ -10108,9 +10126,7 @@ struct EventDetailView: View {
                                 selectedGalleryIndex = index
                                 showGallery = true
                             } label: {
-                                RemoteImage(urlString: url)
-                                    .frame(width: 140, height: 140)
-                                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                                GalleryPreviewImage(urlString: url)
                                     .overlay(alignment: .bottomTrailing) {
                                         Image(systemName: "arrow.up.left.and.arrow.down.right")
                                             .font(.caption.weight(.bold))
@@ -13057,6 +13073,84 @@ struct GalleryViewer: View {
     private func clampedIndex(_ index: Int) -> Int {
         guard !images.isEmpty else { return 0 }
         return min(max(index, 0), images.count - 1)
+    }
+}
+
+struct GalleryPreviewImage: View {
+    let urlString: String?
+    @State private var phase: RemoteImageLoadPhase = .idle
+
+    private let previewHeight: CGFloat = 152
+    private let minPreviewWidth: CGFloat = 92
+    private let maxPreviewWidth: CGFloat = 228
+
+    var body: some View {
+        ZStack {
+            Brand.muted
+            content
+        }
+        .frame(width: previewWidth, height: previewHeight)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .task(id: imageURL?.absoluteString ?? urlString ?? "") {
+            await loadImage()
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch phase {
+        case .idle, .loading:
+            ProgressView()
+                .tint(Brand.primary)
+        case .success(let image):
+            Image(uiImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: previewWidth, height: previewHeight)
+        case .failure:
+            Image(systemName: "photo")
+                .font(.title2)
+                .foregroundStyle(Brand.mutedForeground)
+        }
+    }
+
+    private var previewWidth: CGFloat {
+        guard case .success(let image) = phase,
+              image.size.width > 0,
+              image.size.height > 0 else {
+            return 152
+        }
+        let aspectRatio = image.size.width / image.size.height
+        return min(max(previewHeight * aspectRatio, minPreviewWidth), maxPreviewWidth)
+    }
+
+    private var imageURL: URL? {
+        SupabaseImageTransform.url(from: urlString, maxWidth: 900, quality: 78)
+    }
+
+    @MainActor
+    private func loadImage() async {
+        guard let imageURL else {
+            phase = .failure
+            return
+        }
+
+        if let cachedImage = RemoteImageStore.shared.cachedImage(for: imageURL) {
+            phase = .success(cachedImage)
+            return
+        }
+
+        phase = .loading
+        do {
+            let image = try await RemoteImageStore.shared.image(for: imageURL)
+            guard !Task.isCancelled else { return }
+            phase = .success(image)
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled else { return }
+            phase = .failure
+        }
     }
 }
 
@@ -21213,7 +21307,7 @@ struct OrganizerEventEditorView: View {
         }
         .onChange(of: selectedGalleryPhotos) { _, items in
             guard !items.isEmpty else { return }
-            Task { await prepareGalleryCropQueue(items) }
+            Task { await prepareGalleryUploadQueue(items) }
         }
         .sheet(item: $activeImageCrop) { crop in
             OrganizerImageCropView(
@@ -21335,23 +21429,24 @@ struct OrganizerEventEditorView: View {
     }
 
     @MainActor
-    private func prepareGalleryCropQueue(_ items: [PhotosPickerItem]) async {
+    private func prepareGalleryUploadQueue(_ items: [PhotosPickerItem]) async {
         let remaining = max(0, 5 - draft.galleryImageURLs.count)
         pendingGalleryPhotos = Array(items.prefix(remaining))
         selectedGalleryPhotos = []
-        await presentNextGalleryCrop()
+        await uploadNextGalleryImage()
     }
 
     @MainActor
-    private func presentNextGalleryCrop() async {
+    private func uploadNextGalleryImage() async {
         guard activeImageCrop == nil, !pendingGalleryPhotos.isEmpty else { return }
         let item = pendingGalleryPhotos.removeFirst()
         guard let data = try? await item.loadTransferable(type: Data.self),
               let image = UIImage(data: data) else {
-            await presentNextGalleryCrop()
+            await uploadNextGalleryImage()
             return
         }
-        activeImageCrop = OrganizerImageCropDraft(image: image, kind: .gallery)
+        await uploadGalleryImage(image)
+        await uploadNextGalleryImage()
     }
 
     @MainActor
@@ -21370,8 +21465,19 @@ struct OrganizerEventEditorView: View {
         }
         uploadingImages = false
         if kind == .gallery {
-            await presentNextGalleryCrop()
+            await uploadNextGalleryImage()
         }
+    }
+
+    @MainActor
+    private func uploadGalleryImage(_ image: UIImage) async {
+        guard let data = image.resizedJPEGData() else { return }
+        uploadingImages = true
+        if let url = await store.uploadOrganizerEventImage(data: data, fileExtension: "jpg"),
+           !draft.galleryImageURLs.contains(url) {
+            draft.galleryImageURLs.append(url)
+        }
+        uploadingImages = false
     }
 
     private func toggleValue(_ value: String, in values: inout [String]) {
