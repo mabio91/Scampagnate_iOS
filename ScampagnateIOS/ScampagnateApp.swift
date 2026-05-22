@@ -18877,17 +18877,47 @@ private enum OrganizerParticipantCSVExporter {
     }
 
     private static func makeCSV(registrations: [OrganizerRegistration], meetingPoints: [MeetingPoint]) -> String {
-        let header = "Nome,Cognome,Telefono,Instagram,Livello,Formula,Stato,Pagamento,Importo pagato,Rimborso,Ritrovo,Check-in,Registrato"
+        let header = [
+            "Nome",
+            "Cognome",
+            "Telefono",
+            "Instagram",
+            "Tipo",
+            "Livello registrazione",
+            "Formula",
+            "Stato",
+            "Pagamento",
+            "Importo pagato",
+            "Rimborso",
+            "Ritrovo",
+            "Check-in",
+            "Registrato",
+            "ID tessera",
+            "Stato tessera",
+            "Data di nascita",
+            "Livello esperienza",
+            "Esperienza trekking",
+            "Frequenza attivita",
+            "Grade esperienza",
+            "Interessi",
+            "Salute e sicurezza",
+            "Note salute",
+            "Farmaci salvavita",
+            "Note farmaci",
+            "Supporto richiesto"
+        ].joined(separator: ",")
         let meetingPointNames = Dictionary(uniqueKeysWithValues: meetingPoints.map { ($0.id, $0.name ?? "") })
         let rows = registrations.filter(\.isActive).map { registration in
             let meetingPoint = registration.meetingPointId.flatMap { meetingPointNames[$0] } ?? ""
             let firstName = registration.isManual ? (registration.manualName ?? registration.displayName) : (registration.profiles?.firstName ?? "")
-            let lastName = registration.isManual ? "(manual)" : (registration.profiles?.lastName ?? "")
+            let lastName = registration.isManual ? "(manuale)" : (registration.profiles?.lastName ?? "")
+            let profile = registration.profiles
             return [
                 (firstName.nilIfBlank ?? "-").csvEscaped,
                 (lastName.nilIfBlank ?? "-").csvEscaped,
-                (registration.isManual ? "-" : (registration.profiles?.phone ?? "-")).csvEscaped,
-                (registration.isManual ? "-" : (registration.profiles?.instagramDisplay ?? "-")).csvEscaped,
+                (registration.isManual ? "-" : (profile?.phone ?? "-")).csvEscaped,
+                (registration.isManual ? "-" : (profile?.instagramDisplay ?? "-")).csvEscaped,
+                (registration.isManual ? "manuale" : "utente").csvEscaped,
                 (registration.isManual ? "-" : (registration.sportLevel ?? "-")).csvEscaped,
                 (registration.priceOption?.displayName ?? "-").csvEscaped,
                 registration.statusLabel.csvEscaped,
@@ -18896,10 +18926,44 @@ private enum OrganizerParticipantCSVExporter {
                 money(registration.refundAmount ?? 0).csvEscaped,
                 (meetingPoint.nilIfBlank ?? "-").csvEscaped,
                 (registration.checkedIn == true ? "Si" : "No").csvEscaped,
-                formattedRegistrationDate(registration.createdAt).csvEscaped
+                formattedRegistrationDate(registration.createdAt).csvEscaped,
+                (registration.isManual ? "-" : (profile?.membershipId.map(String.init) ?? "-")).csvEscaped,
+                (registration.isManual ? "-" : (profile?.membershipStatus ?? "-")).csvEscaped,
+                (registration.isManual ? "-" : (profile?.birthDate ?? "-")).csvEscaped,
+                (registration.isManual ? "-" : (profile?.selfLevel ?? "-")).csvEscaped,
+                (registration.isManual ? "-" : (profile?.trekkingExperience ?? "-")).csvEscaped,
+                (registration.isManual ? "-" : (profile?.activityFrequency ?? "-")).csvEscaped,
+                (registration.isManual ? "-" : (profile?.experienceGrade.map(String.init) ?? "-")).csvEscaped,
+                (registration.isManual ? "-" : formattedInterests(profile?.interests)).csvEscaped,
+                (registration.isManual ? "-" : formattedHealthSafetyStatus(profile?.healthSafetyStatus)).csvEscaped,
+                (registration.isManual ? "-" : (profile?.healthSafetyNotes ?? "-")).csvEscaped,
+                (registration.isManual ? "-" : formattedEmergencyMedication(profile?.emergencyMedicationHas)).csvEscaped,
+                (registration.isManual ? "-" : (profile?.emergencyMedicationNotes ?? "-")).csvEscaped,
+                (registration.isManual ? "-" : (profile?.healthSafetyHelpNotes ?? "-")).csvEscaped
             ].joined(separator: ",")
         }
         return ([header] + rows).joined(separator: "\n")
+    }
+
+    private static func formattedHealthSafetyStatus(_ value: String?) -> String {
+        switch value {
+        case "none": return "Nessuna da segnalare"
+        case "has_info": return "Informazioni da leggere"
+        default: return "Non compilato"
+        }
+    }
+
+    private static func formattedEmergencyMedication(_ value: Bool?) -> String {
+        switch value {
+        case true: return "Si"
+        case false: return "No"
+        default: return "-"
+        }
+    }
+
+    private static func formattedInterests(_ value: [String]?) -> String {
+        let interests = (value ?? []).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return interests.isEmpty ? "-" : interests.joined(separator: "; ")
     }
 
     private static func formattedRegistrationDate(_ value: String?) -> String {
