@@ -10095,11 +10095,11 @@ struct EventDetailView: View {
                             scrollOffset = newValue
                         }
 
-                        let opacity = compactHeaderOpacity()
+                        let headerProgress = compactHeaderProgress()
                         compactHeader(event)
-                            .opacity(opacity)
-                            .offset(y: -10 * (1 - opacity))
-                            .allowsHitTesting(opacity > 0.98)
+                            .opacity(headerProgress > 0.04 ? 1 : 0)
+                            .offset(y: compactHeaderOffset(progress: headerProgress))
+                            .allowsHitTesting(headerProgress > 0.35)
                             .zIndex(20)
                     }
                     .safeAreaInset(edge: .bottom) {
@@ -10312,12 +10312,19 @@ struct EventDetailView: View {
         max(0, min(Double(1 - scrollOffset / (heroHeight * 0.7)), 1))
     }
 
-    private func compactHeaderOpacity() -> Double {
-        let revealStart: CGFloat = 295
-        let revealEnd: CGFloat = 365
+    private func compactHeaderProgress() -> Double {
+        let revealStart: CGFloat = 190
+        let revealEnd: CGFloat = 260
         guard scrollOffset > revealStart else { return 0 }
         let progress = min(Double((scrollOffset - revealStart) / (revealEnd - revealStart)), 1)
         return progress * progress * (3 - 2 * progress)
+    }
+
+    private func compactHeaderOffset(progress: Double) -> CGFloat {
+        guard progress > 0 else { return -78 }
+        let entrance = -78 * (1 - progress)
+        let bump = sin(progress * .pi) * 9
+        return CGFloat(entrance + bump)
     }
 
     private func compactHeader(_ event: Event) -> some View {
