@@ -4516,7 +4516,7 @@ struct PriceOption: Codable, Identifiable, Hashable {
             let balanceLabel = effectiveBalancePaymentMode(fallback: event) == "on_site" ? "sul posto" : "online"
             return "€\(money(totalPrice(fallback: event))) · €\(money(deposit)) ora + €\(money(balance)) \(balanceLabel)"
         default:
-            return "€\(money(totalPrice(fallback: event))) · pagamento online"
+            return "Pagamento online"
         }
     }
 
@@ -15073,6 +15073,10 @@ struct CheckoutSinglePriceOptionRow: View {
         !option.isBookable(in: event) && !option.canJoinWaitlist(in: event)
     }
 
+    private var title: String {
+        option.name?.nilIfBlank ?? "Partecipazione evento"
+    }
+
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
             Image(systemName: "ticket")
@@ -15081,7 +15085,7 @@ struct CheckoutSinglePriceOptionRow: View {
                 .frame(width: 28)
 
             VStack(alignment: .leading, spacing: 5) {
-                Text("Partecipazione evento")
+                Text(title)
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.foreground)
 
