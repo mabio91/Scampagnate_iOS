@@ -10524,14 +10524,13 @@ struct EventPillsRow: View {
     let event: Event
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             if shouldShowStatusPill {
                 CompactEventPill(text: event.statusStyle.label, color: event.statusStyle.background, foreground: event.statusStyle.foreground)
             }
 
             if let difficulty = event.difficultyLabel {
                 CompactEventPill(text: difficulty.text, color: difficulty.background, foreground: difficulty.foreground)
-                    .overlay(Capsule().stroke(difficulty.foreground.opacity(0.55), lineWidth: 1))
             }
 
             if let customBadge = event.customBadgeText {
@@ -10615,14 +10614,14 @@ struct CompactEventPill: View {
 
     var body: some View {
         Text(text)
-            .font(.system(size: 10, weight: .bold, design: .rounded))
+            .font(.system(size: 10, weight: .semibold, design: .rounded))
             .lineLimit(1)
             .minimumScaleFactor(0.62)
             .allowsTightening(true)
             .foregroundStyle(foreground)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 5)
+            .padding(.horizontal, 10)
             .frame(minWidth: 0)
+            .frame(height: 28)
             .background(color, in: Capsule())
     }
 }
