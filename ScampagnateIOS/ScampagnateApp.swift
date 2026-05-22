@@ -9012,12 +9012,24 @@ struct EventCalendarDayButton: View {
 struct EventCalendarEventRow: View {
     let event: Event
 
+    private var formattedTime: String? {
+        event.time.map { String($0.prefix(5)) }
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            RemoteImage(urlString: event.imageUrl)
-                .frame(width: 58, height: 58)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Brand.muted, lineWidth: 1))
+            ZStack {
+                RemoteImage(urlString: event.imageUrl)
+                    .frame(width: 58, height: 58)
+                    .saturation(event.isSoldOut ? 0 : 1)
+                if event.isSoldOut {
+                    SoldOutRibbon(fontSize: 5.5, horizontalPadding: 9, verticalPadding: 2)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                }
+            }
+            .frame(width: 58, height: 58)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Brand.muted, lineWidth: 1))
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(event.title)
@@ -9029,11 +9041,11 @@ struct EventCalendarEventRow: View {
                 HStack(spacing: 6) {
                     Label(event.displayLocation, systemImage: "mappin")
                         .lineLimit(1)
-                    Text("·")
-                    Text(event.displayPrice(profile: nil, badges: [], registrations: []))
-                    Text("·")
-                    Text(event.availabilityLabel)
-                        .lineLimit(1)
+                    if let formattedTime {
+                        Text("·")
+                        Label(formattedTime, systemImage: "clock")
+                            .lineLimit(1)
+                    }
                 }
                 .font(.caption)
                 .foregroundStyle(Brand.mutedForeground)
@@ -9570,6 +9582,8 @@ struct EventCard: View {
 
 struct SoldOutRibbon: View {
     var fontSize: CGFloat = 9
+    var horizontalPadding: CGFloat = 16
+    var verticalPadding: CGFloat = 4
 
     var body: some View {
         GeometryReader { proxy in
@@ -9577,8 +9591,8 @@ struct SoldOutRibbon: View {
                 .font(.system(size: fontSize, weight: .black, design: .rounded))
                 .tracking(1.1)
                 .foregroundStyle(.white)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 4)
+                .padding(.horizontal, horizontalPadding)
+                .padding(.vertical, verticalPadding)
                 .background(Brand.destructive)
                 .rotationEffect(.degrees(45))
                 .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
