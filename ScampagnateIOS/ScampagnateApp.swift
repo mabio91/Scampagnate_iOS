@@ -8999,10 +8999,10 @@ struct EventCalendarEventRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Text(event.time.map { String($0.prefix(5)) } ?? "--:--")
-                .font(.caption.weight(.bold))
-                .foregroundStyle(Brand.primary)
-                .frame(width: 46, alignment: .leading)
+            RemoteImage(urlString: event.imageUrl)
+                .frame(width: 58, height: 58)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Brand.muted, lineWidth: 1))
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(event.title)
