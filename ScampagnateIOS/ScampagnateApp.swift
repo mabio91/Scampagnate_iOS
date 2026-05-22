@@ -8811,9 +8811,12 @@ struct EventCalendarView: View {
     @State private var visibleMonth = Calendar.current.startOfMonth(for: Date())
     @State private var selectedDate = Calendar.current.startOfDay(for: Date())
     @State private var selectedEvent: Event?
+    @State private var selectedCategory: String?
 
     private var visibleEvents: [Event] {
-        store.events.filter { $0.isVisibleInUpcomingList }
+        store.events.filter { event in
+            event.isVisibleInUpcomingList && (selectedCategory == nil || event.category?.name == selectedCategory)
+        }
     }
 
     private var eventsByDay: [Date: [Event]] {
@@ -8835,6 +8838,8 @@ struct EventCalendarView: View {
         GeometryReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
+                    CategoryStrip(categories: store.categories, selected: $selectedCategory)
+
                     EventMonthCalendar(
                         visibleMonth: $visibleMonth,
                         selectedDate: $selectedDate,
@@ -8970,24 +8975,34 @@ struct EventCalendarDayButton: View {
     let eventCount: Int
     let action: () -> Void
 
+    private var dayNumber: String {
+        "\(Calendar.current.component(.day, from: day))"
+    }
+
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 4) {
-                Text("\(Calendar.current.component(.day, from: day))")
-                    .font(.subheadline.weight(.bold))
+            VStack(spacing: 5) {
+                ZStack {
+                    Circle()
+                        .fill(isSelected ? Brand.primary : Color.clear)
+                        .frame(width: 32, height: 32)
+                    Text(dayNumber)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(isSelected ? .white : (isToday ? Brand.primary : Brand.foreground))
+                }
+                .frame(height: 32)
+
                 HStack(spacing: 2) {
                     ForEach(0..<min(eventCount, 3), id: \.self) { _ in
                         Circle()
-                            .fill(isSelected ? .white : Brand.secondary)
+                            .fill(Brand.secondary)
                             .frame(width: 4, height: 4)
                     }
                 }
                 .frame(height: 5)
             }
-            .foregroundStyle(isSelected ? .white : (isToday ? Brand.primary : Brand.foreground))
             .frame(maxWidth: .infinity)
             .aspectRatio(1, contentMode: .fit)
-            .background(isSelected ? Brand.primary : Color.clear, in: RoundedRectangle(cornerRadius: 12))
             .contentShape(RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(.plain)
