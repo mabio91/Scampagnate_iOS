@@ -10337,31 +10337,26 @@ struct EventDetailView: View {
     }
 
     private func hero(_ event: Event, width: CGFloat, topInset: CGFloat) -> some View {
-        let heroHeight: CGFloat = 340
         let safeTop = max(topInset, 22)
+        let imageHeight = max(220, min(width * 9 / 16, 260))
+        let heroHeight = safeTop + imageHeight + 24
         let heroOpacity = heroOpacity(heroHeight: heroHeight)
-        let heroScale = 1 + min(scrollOffset, heroHeight) * 0.00012
-        let heroTranslateY = scrollOffset * 0.18
-        return ZStack(alignment: .bottomLeading) {
-            ZStack {
-                RemoteImage(urlString: event.imageUrl)
-                    .frame(width: width, height: heroHeight)
-                    .scaleEffect(1.05)
-                    .blur(radius: 18)
-                    .opacity(event.isSoldOut ? 0.32 : 0.44)
-                RemoteImage(urlString: event.imageUrl, contentMode: .fit)
-                    .frame(width: width, height: heroHeight)
-            }
-                .frame(width: width, height: heroHeight)
+        let heroTranslateY = scrollOffset * 0.08
+
+        return ZStack(alignment: .top) {
+            Brand.background
+
+            RemoteImage(urlString: event.imageUrl, contentMode: .fit)
+                .frame(width: width, height: imageHeight)
+                .background(Brand.muted.opacity(0.28))
                 .saturation(event.isSoldOut ? 0 : 1)
-                .scaleEffect(heroScale)
                 .offset(y: heroTranslateY)
                 .opacity(heroOpacity)
                 .overlay {
                     LinearGradient(
                         colors: event.isSoldOut
-                            ? [.black.opacity(0.04), .black.opacity(0.52)]
-                            : [.black.opacity(0.06), .black.opacity(0.42)],
+                            ? [.black.opacity(0.12), .clear, .black.opacity(0.18)]
+                            : [.black.opacity(0.10), .clear, .black.opacity(0.12)],
                         startPoint: .top,
                         endPoint: .bottom
                     )
@@ -10373,6 +10368,9 @@ struct EventDetailView: View {
                             .opacity(heroOpacity)
                     }
                 }
+                .clipped()
+                .padding(.top, safeTop)
+
             VStack {
                 HStack {
                     EventDetailCircleButton(systemImage: "chevron.left") {
@@ -10393,21 +10391,7 @@ struct EventDetailView: View {
                 .padding(.top, safeTop + 10)
                 Spacer()
             }
-            .frame(width: width, height: heroHeight)
-            .opacity(heroOpacity)
-            VStack(alignment: .leading, spacing: 12) {
-                Spacer()
-                Text(event.title)
-                    .font(.system(size: 28, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .lineLimit(3)
-                    .minimumScaleFactor(0.75)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(width: max(width - 36, 0), alignment: .leading)
-                    .padding(.horizontal, 18)
-                    .padding(.bottom, 34)
-            }
-            .frame(width: width, height: heroHeight, alignment: .bottomLeading)
+            .frame(width: width, height: safeTop + imageHeight)
             .opacity(heroOpacity)
         }
         .frame(width: width, height: heroHeight)
@@ -10490,6 +10474,14 @@ struct EventDetailView: View {
         let fitScore = EventFitScoreResult(profile: store.profile, event: event)
 
         return VStack(alignment: .leading, spacing: 16) {
+            Text(event.title)
+                .font(.system(size: 28, weight: .bold, design: .rounded))
+                .foregroundStyle(Brand.foreground)
+                .lineLimit(3)
+                .minimumScaleFactor(0.82)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
             EventPillsRow(event: event)
 
             VStack(alignment: .leading, spacing: 12) {
