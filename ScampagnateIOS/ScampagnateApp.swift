@@ -790,6 +790,47 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func quoteRegistrationPriceChange(registrationId: String, eventId: String, priceOptionId: String) async -> RegistrationChangeQuote? {
+        do {
+            let authSession = try await authenticatedSession()
+            return try await api.changeRegistrationPriceOption(
+                mode: "quote",
+                eventId: eventId,
+                registrationId: registrationId,
+                priceOptionId: priceOptionId,
+                session: authSession
+            ).quote
+        } catch {
+            report(error)
+            return nil
+        }
+    }
+
+    func commitRegistrationPriceChange(registrationId: String, eventId: String, priceOptionId: String) async -> RegistrationChangeResult? {
+        do {
+            let authSession = try await authenticatedSession()
+            let result = try await api.changeRegistrationPriceOption(
+                mode: "commit",
+                eventId: eventId,
+                registrationId: registrationId,
+                priceOptionId: priceOptionId,
+                session: authSession
+            )
+            if let sessionId = result.sessionId, let url = result.url {
+                let pending = PendingPayment(sessionId: sessionId, eventId: eventId, registrationId: registrationId, checkoutURL: url)
+                pending.save()
+                pendingPayment = pending
+            }
+            if result.completed == true {
+                await refreshEventState(session: authSession, participantEventId: eventId)
+            }
+            return result
+        } catch {
+            report(error)
+            return nil
+        }
+    }
+
     func loadParticipants(eventId: String) async {
         await refreshParticipants(eventId: eventId, session: session)
     }
@@ -3335,6 +3376,30 @@ struct SupabaseAPI {
         let result: CheckoutFunctionResponse = try await function(name: "create-event-checkout", body: body, session: session)
         let url = result.url.flatMap(URL.init(string:))
         return CheckoutResult(url: url, sessionId: url?.stripeCheckoutSessionId, free: result.free ?? false, kind: .eventPayment)
+    }
+
+    func changeRegistrationPriceOption(mode: String, eventId: String, registrationId: String, priceOptionId: String, session: AuthSession) async throws -> RegistrationChangeResult {
+        let result: RegistrationChangeFunctionResponse = try await function(
+            name: "change-registration-price-option",
+            body: [
+                "mode": .string(mode),
+                "eventId": .string(eventId),
+                "registrationId": .string(registrationId),
+                "priceOptionId": .string(priceOptionId),
+                "returnUrlBase": .string("scampagnate://payment-success"),
+                "cancelUrlBase": .string("scampagnate://payment-cancelled")
+            ],
+            session: session
+        )
+        let url = result.url.flatMap(URL.init(string:))
+        return RegistrationChangeResult(
+            url: url,
+            sessionId: url?.stripeCheckoutSessionId,
+            completed: result.completed,
+            refunded: result.refunded,
+            changeRequestId: result.changeRequestId,
+            quote: result.quote
+        )
     }
 
     func createMembershipCheckout(eventId: String, session: AuthSession) async throws -> CheckoutResult {
@@ -6765,6 +6830,34 @@ struct CheckoutFunctionResponse: Decodable {
     let free: Bool?
 }
 
+struct RegistrationChangeQuote: Decodable, Equatable {
+    let oldPriceOptionName: String?
+    let newPriceOptionName: String?
+    let oldTotalAmount: Double
+    let newTotalAmount: Double
+    let amountPaidBefore: Double
+    let additionalPaymentAmount: Double
+    let refundAmount: Double
+    let newBalanceDueAmount: Double
+}
+
+struct RegistrationChangeFunctionResponse: Decodable {
+    let url: String?
+    let completed: Bool?
+    let refunded: Bool?
+    let changeRequestId: String?
+    let quote: RegistrationChangeQuote?
+}
+
+struct RegistrationChangeResult {
+    let url: URL?
+    let sessionId: String?
+    let completed: Bool?
+    let refunded: Bool?
+    let changeRequestId: String?
+    let quote: RegistrationChangeQuote?
+}
+
 struct CheckoutResult {
     let url: URL?
     let sessionId: String?
@@ -8071,7 +8164,7 @@ struct PaymentAuthenticationView: View {
             let status: PaymentVerificationStatus
             switch checkout.kind {
             case .eventPayment:
-                status = await store.verifyPendingPayment()
+                status = await store.verifyEventPayment(sessionId: sessionId, eventId: checkout.eventId)
             case .membership:
                 status = await store.verifyMembershipPayment(sessionId: sessionId)
             }
@@ -8090,7 +8183,8 @@ struct PaymentAuthenticationView: View {
             let status: PaymentVerificationStatus
             switch checkout.kind {
             case .eventPayment:
-                status = await store.verifyPendingPayment()
+                guard let sessionId = checkout.sessionId else { return }
+                status = await store.verifyEventPayment(sessionId: sessionId, eventId: checkout.eventId)
             case .membership:
                 guard let sessionId = checkout.sessionId else { return }
                 status = await store.verifyMembershipPayment(sessionId: sessionId)
@@ -15663,7 +15757,7 @@ struct EventRegistrationCard: View {
 
     private var canEditDetails: Bool {
         guard showActions, let event, registration.normalizedStatus != "cancelled" else { return false }
-        let hasEditableFields = !event.meetingPoints.isEmpty || event.asksCarAvailability || !event.checkoutCustomFields.isEmpty
+        let hasEditableFields = !event.meetingPoints.isEmpty || event.asksCarAvailability || !event.checkoutCustomFields.isEmpty || event.priceOptions.count > 1
         guard hasEditableFields else { return false }
         return event.calendarStartDate.map { $0 > Date() } ?? false
     }
@@ -15855,16 +15949,30 @@ struct EditRegistrationDetailsSheet: View {
     let registration: Registration
     let onSaved: () -> Void
     @State private var selectedMeetingPointId = ""
+    @State private var selectedPriceOptionId = ""
+    @State private var priceChangeQuote: RegistrationChangeQuote?
+    @State private var priceChangeLoading = false
+    @State private var priceChangeSubmitting = false
     @State private var carAvailability = ""
     @State private var customResponses: [String: String] = [:]
     @State private var saving = false
+    @State private var activeCheckout: ActiveCheckout?
+    @State private var feedback: AppFeedback?
 
     private var customFields: [CheckoutCustomField] {
         event.checkoutCustomFields
     }
 
-    private var hasEditableFields: Bool {
+    private var hasEditableDetailFields: Bool {
         !event.meetingPoints.isEmpty || event.asksCarAvailability || !customFields.isEmpty
+    }
+
+    private var canChangeFormula: Bool {
+        event.priceOptions.count > 1 && ["registered", "paid", "deposit_paid"].contains(registration.normalizedStatus)
+    }
+
+    private var hasSelectedDifferentFormula: Bool {
+        selectedPriceOptionId.nilIfBlank != nil && selectedPriceOptionId != (registration.priceOptionId ?? "")
     }
 
     private var hasIncompleteRequiredCustomFields: Bool {
@@ -15874,7 +15982,7 @@ struct EditRegistrationDetailsSheet: View {
     }
 
     private var saveDisabled: Bool {
-        saving || !hasEditableFields || (!event.meetingPoints.isEmpty && selectedMeetingPointId.nilIfBlank == nil) || hasIncompleteRequiredCustomFields
+        saving || !hasEditableDetailFields || (!event.meetingPoints.isEmpty && selectedMeetingPointId.nilIfBlank == nil) || hasIncompleteRequiredCustomFields
     }
 
     var body: some View {
@@ -15924,6 +16032,10 @@ struct EditRegistrationDetailsSheet: View {
                         CheckoutCustomFieldView(field: field, responses: $customResponses)
                     }
 
+                    if canChangeFormula {
+                        formulaChangeSection
+                    }
+
                     Button {
                         Task { await save() }
                     } label: {
@@ -15949,11 +16061,137 @@ struct EditRegistrationDetailsSheet: View {
             }
             .onAppear {
                 selectedMeetingPointId = registration.meetingPointId ?? registration.meetingPoint?.id ?? ""
+                selectedPriceOptionId = registration.priceOptionId ?? ""
                 carAvailability = registration.carAvailability ?? ""
                 customResponses = registration.additionalResponses ?? [:]
             }
+            .fullScreenCover(item: $activeCheckout) { checkout in
+                PaymentAuthenticationView(checkout: checkout) { result in
+                    feedback = result
+                    onSaved()
+                    dismiss()
+                }
+            }
+            .sheet(item: $feedback) { feedback in
+                AppFeedbackSheet(feedback: feedback)
+                    .presentationDetents([.height(300)])
+            }
             .interactiveDismissDisabled(saving)
         }
+    }
+
+    private var formulaChangeSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Formula di iscrizione")
+                .font(.headline.weight(.bold))
+                .foregroundStyle(Brand.foreground)
+
+            VStack(spacing: 10) {
+                ForEach(event.priceOptions) { option in
+                    SelectionRow(
+                        selected: selectedPriceOptionId == option.id,
+                        title: option.displayName,
+                        subtitle: option.paymentSummary(in: event),
+                        trailing: "€\(money(option.totalPrice(fallback: event)))"
+                    ) {
+                        selectedPriceOptionId = option.id
+                        priceChangeQuote = nil
+                        if option.id != (registration.priceOptionId ?? "") {
+                            Task { await quoteFormulaChange(option.id) }
+                        }
+                    }
+                }
+            }
+
+            if hasSelectedDifferentFormula {
+                VStack(alignment: .leading, spacing: 8) {
+                    if priceChangeLoading {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Calcolo differenza...")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Brand.mutedForeground)
+                        }
+                    } else if let priceChangeQuote {
+                        SummaryRow("Prezzo attuale", "€\(money(priceChangeQuote.oldTotalAmount))")
+                        SummaryRow("Nuovo prezzo", "€\(money(priceChangeQuote.newTotalAmount))")
+                        if priceChangeQuote.additionalPaymentAmount > 0 {
+                            SummaryRow("Saldo da pagare", "€\(money(priceChangeQuote.additionalPaymentAmount))", bold: true)
+                        }
+                        if priceChangeQuote.refundAmount > 0 {
+                            SummaryRow("Rimborso automatico", "€\(money(priceChangeQuote.refundAmount))", bold: true)
+                        }
+                        if priceChangeQuote.newBalanceDueAmount > 0 {
+                            SummaryRow("Saldo residuo", "€\(money(priceChangeQuote.newBalanceDueAmount))")
+                        }
+                        if priceChangeQuote.additionalPaymentAmount == 0 && priceChangeQuote.refundAmount == 0 {
+                            Text("Nessun pagamento o rimborso immediato.")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(Brand.mutedForeground)
+                        }
+                    }
+
+                    Button {
+                        Task { await confirmFormulaChange() }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if priceChangeSubmitting {
+                                ProgressView()
+                                    .tint(.white)
+                            }
+                            Text(priceChangeSubmitting ? "Aggiornamento..." : "Conferma cambio formula")
+                        }
+                    }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .disabled(priceChangeSubmitting || priceChangeLoading || priceChangeQuote == nil)
+                }
+                .padding()
+                .background(Brand.muted, in: RoundedRectangle(cornerRadius: 16))
+            }
+        }
+    }
+
+    private func quoteFormulaChange(_ priceOptionId: String) async {
+        guard !priceChangeLoading else { return }
+        priceChangeLoading = true
+        priceChangeQuote = await store.quoteRegistrationPriceChange(
+            registrationId: registration.id,
+            eventId: event.id,
+            priceOptionId: priceOptionId
+        )
+        priceChangeLoading = false
+    }
+
+    private func confirmFormulaChange() async {
+        guard hasSelectedDifferentFormula, !priceChangeSubmitting else { return }
+        priceChangeSubmitting = true
+        defer { priceChangeSubmitting = false }
+        guard let result = await store.commitRegistrationPriceChange(
+            registrationId: registration.id,
+            eventId: event.id,
+            priceOptionId: selectedPriceOptionId
+        ) else { return }
+
+        if let url = result.url {
+            activeCheckout = ActiveCheckout(
+                url: url,
+                sessionId: result.sessionId,
+                kind: .eventPayment,
+                eventId: event.id,
+                registrationId: registration.id
+            )
+            return
+        }
+
+        onSaved()
+        feedback = AppFeedback(
+            title: "Formula aggiornata",
+            message: result.refunded == true ? "Abbiamo aggiornato l'iscrizione e avviato il rimborso automatico." : "La tua iscrizione è stata aggiornata.",
+            icon: "checkmark.seal.fill",
+            tone: .success
+        )
+        dismiss()
     }
 
     private func save() async {
