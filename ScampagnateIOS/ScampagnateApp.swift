@@ -10362,8 +10362,8 @@ struct EventDetailView: View {
                 .overlay {
                     LinearGradient(
                         colors: event.isSoldOut
-                            ? [.black.opacity(0.12), .clear, .black.opacity(0.18)]
-                            : [.black.opacity(0.10), .clear, .black.opacity(0.12)],
+                            ? [.black.opacity(0.08), .clear, .black.opacity(0.52)]
+                            : [.black.opacity(0.06), .clear, .black.opacity(0.42)],
                         startPoint: .top,
                         endPoint: .bottom
                     )
@@ -10399,6 +10399,22 @@ struct EventDetailView: View {
                 Spacer()
             }
             .frame(width: width, height: safeTop + imageHeight)
+            .opacity(heroOpacity)
+
+            VStack(alignment: .leading) {
+                Spacer()
+                Text(event.title)
+                    .font(.system(size: 28, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .lineLimit(3)
+                    .minimumScaleFactor(0.75)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .shadow(color: .black.opacity(0.35), radius: 10, x: 0, y: 3)
+                    .frame(width: max(width - 36, 0), alignment: .leading)
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 42)
+            }
+            .frame(width: width, height: safeTop + imageHeight, alignment: .bottomLeading)
             .opacity(heroOpacity)
         }
         .frame(width: width, height: heroHeight)
@@ -10481,14 +10497,6 @@ struct EventDetailView: View {
         let fitScore = EventFitScoreResult(profile: store.profile, event: event)
 
         return VStack(alignment: .leading, spacing: 16) {
-            Text(event.title)
-                .font(.system(size: 28, weight: .bold, design: .rounded))
-                .foregroundStyle(Brand.foreground)
-                .lineLimit(3)
-                .minimumScaleFactor(0.82)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
             EventPillsRow(event: event)
 
             VStack(alignment: .leading, spacing: 12) {
