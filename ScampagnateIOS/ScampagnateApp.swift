@@ -10746,6 +10746,15 @@ struct EventDetailView: View {
         .padding(.bottom, 18)
         .background(Brand.background)
         .clipShape(UnevenRoundedRectangle(topLeadingRadius: 24, topTrailingRadius: 24))
+        .overlay(alignment: .top) {
+            UnevenRoundedRectangle(topLeadingRadius: 24, topTrailingRadius: 24)
+                .stroke(Brand.muted.opacity(0.55), lineWidth: 1)
+                .frame(height: 44)
+                .mask(alignment: .top) {
+                    Rectangle().frame(height: 25)
+                }
+                .allowsHitTesting(false)
+        }
         .offset(y: -20)
     }
 
