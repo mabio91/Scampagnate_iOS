@@ -4577,6 +4577,13 @@ struct PriceOption: Codable, Identifiable, Hashable {
         }
     }
 
+    func checkoutSingleOptionTitle() -> String {
+        guard let cleanName = name?.nilIfBlank else { return "Partecipazione evento" }
+        return cleanName.range(of: #"^formula\s+\d+$"#, options: [.regularExpression, .caseInsensitive]) == nil
+            ? cleanName
+            : "Partecipazione evento"
+    }
+
     var isCurrentlyAvailable: Bool {
         guard isPromotional == true else { return true }
         let today = Calendar.current.startOfDay(for: Date())
@@ -10339,7 +10346,7 @@ struct EventDetailView: View {
     private func hero(_ event: Event, width: CGFloat, topInset: CGFloat) -> some View {
         let safeTop = max(topInset, 22)
         let imageHeight = max(220, min(width * 9 / 16, 260))
-        let heroHeight = safeTop + imageHeight + 24
+        let heroHeight = safeTop + imageHeight
         let heroOpacity = heroOpacity(heroHeight: heroHeight)
         let heroTranslateY = scrollOffset * 0.08
 
@@ -15098,6 +15105,14 @@ struct CheckoutPriceOptionRow: View {
         option.totalPrice(fallback: event)
     }
 
+    private var isFree: Bool {
+        option.effectivePaymentType(fallback: event) == "free"
+    }
+
+    private var priceLabel: String {
+        isFree ? "Gratis" : "€\(money(price))"
+    }
+
     private var isDisabled: Bool {
         !option.isBookable(in: event) && !option.canJoinWaitlist(in: event)
     }
@@ -15129,9 +15144,11 @@ struct CheckoutPriceOptionRow: View {
                             .font(.caption.weight(.medium))
                             .foregroundStyle(Brand.mutedForeground)
                     }
-                    Text(option.paymentSummary(in: event))
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(Brand.mutedForeground)
+                    if !isFree {
+                        Text(option.paymentSummary(in: event))
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(Brand.mutedForeground)
+                    }
                     Label(option.availabilityText(in: event), systemImage: option.isBookable(in: event) ? "person.2" : (option.canJoinWaitlist(in: event) ? "list.bullet" : "xmark.circle"))
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(option.isBookable(in: event) ? Brand.success : (option.canJoinWaitlist(in: event) ? Brand.warning : Brand.destructive))
@@ -15146,7 +15163,7 @@ struct CheckoutPriceOptionRow: View {
                             .foregroundStyle(Brand.mutedForeground)
                             .strikethrough(true, color: Brand.mutedForeground)
                     }
-                    Text("€\(money(price))")
+                    Text(priceLabel)
                         .font(.headline.weight(.bold))
                         .foregroundStyle(isDisabled ? Brand.mutedForeground : (option.showsPromoBadge ? Brand.success : Brand.primary))
                 }
@@ -15168,12 +15185,20 @@ struct CheckoutSinglePriceOptionRow: View {
         option.totalPrice(fallback: event)
     }
 
+    private var isFree: Bool {
+        option.effectivePaymentType(fallback: event) == "free"
+    }
+
+    private var priceLabel: String {
+        isFree ? "Gratis" : "€\(money(price))"
+    }
+
     private var isDisabled: Bool {
         !option.isBookable(in: event) && !option.canJoinWaitlist(in: event)
     }
 
     private var title: String {
-        option.name?.nilIfBlank ?? "Partecipazione evento"
+        option.checkoutSingleOptionTitle()
     }
 
     var body: some View {
@@ -15188,9 +15213,11 @@ struct CheckoutSinglePriceOptionRow: View {
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.foreground)
 
-                Text(option.paymentSummary(in: event))
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(Brand.mutedForeground)
+                if !isFree {
+                    Text(option.paymentSummary(in: event))
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(Brand.mutedForeground)
+                }
 
                 Label(option.availabilityText(in: event), systemImage: option.isBookable(in: event) ? "person.2" : (option.canJoinWaitlist(in: event) ? "list.bullet" : "xmark.circle"))
                     .font(.caption.weight(.semibold))
@@ -15206,7 +15233,7 @@ struct CheckoutSinglePriceOptionRow: View {
                         .foregroundStyle(Brand.mutedForeground)
                         .strikethrough(true, color: Brand.mutedForeground)
                 }
-                Text("€\(money(price))")
+                Text(priceLabel)
                     .font(.headline.weight(.bold))
                     .foregroundStyle(isDisabled ? Brand.mutedForeground : (option.showsPromoBadge ? Brand.success : Brand.primary))
             }
