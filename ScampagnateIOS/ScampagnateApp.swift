@@ -10353,7 +10353,9 @@ struct EventDetailView: View {
         return ZStack(alignment: .top) {
             Brand.background
 
-            RemoteImage(urlString: event.imageUrl, contentMode: .fit)
+            RemoteImage(urlString: event.imageUrl, contentMode: .fit) { imageSize in
+                heroImageContentMode(for: imageSize)
+            }
                 .frame(width: width, height: imageHeight)
                 .background(Brand.muted.opacity(0.28))
                 .saturation(event.isSoldOut ? 0 : 1)
@@ -10433,6 +10435,16 @@ struct EventDetailView: View {
 
     private func heroOpacity(heroHeight: CGFloat) -> Double {
         max(0, min(Double(1 - scrollOffset / (heroHeight * 0.7)), 1))
+    }
+
+    private func heroImageContentMode(for imageSize: CGSize) -> ContentMode {
+        isApproximatelySixteenNine(imageSize) ? .fit : .fill
+    }
+
+    private func isApproximatelySixteenNine(_ imageSize: CGSize) -> Bool {
+        guard imageSize.width > 0, imageSize.height > 0 else { return true }
+        let aspectRatio = imageSize.width / imageSize.height
+        return abs(aspectRatio - 16 / 9) <= 0.04
     }
 
     private func compactHeaderProgress() -> Double {
@@ -32010,6 +32022,7 @@ private enum SupabaseImageTransform {
 struct RemoteImage: View {
     let urlString: String?
     var contentMode: ContentMode = .fill
+    var resolvedContentMode: ((CGSize) -> ContentMode)?
     @State private var phase: RemoteImageLoadPhase = .idle
 
     var body: some View {
@@ -32028,9 +32041,10 @@ struct RemoteImage: View {
         case .loading:
             placeholder(showProgress: true)
         case .success(let image):
+            let imageContentMode = resolvedContentMode?(image.size) ?? contentMode
             Image(uiImage: image)
                 .resizable()
-                .aspectRatio(contentMode: contentMode)
+                .aspectRatio(contentMode: imageContentMode)
         case .failure:
             placeholder(showProgress: false)
         }
