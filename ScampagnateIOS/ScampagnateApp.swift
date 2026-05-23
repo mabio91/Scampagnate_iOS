@@ -10448,7 +10448,7 @@ struct EventDetailView: View {
 
     private func hero(_ event: Event, width: CGFloat, topInset: CGFloat) -> some View {
         let safeTop = max(topInset, 22)
-        let imageHeight = max(220, min(width * 9 / 16, 260))
+        let imageHeight = width
         let heroHeight = safeTop + imageHeight
         let heroOpacity = heroOpacity(heroHeight: heroHeight)
         let heroTranslateY = scrollOffset * 0.08
@@ -10456,9 +10456,7 @@ struct EventDetailView: View {
         return ZStack(alignment: .top) {
             Brand.background
 
-            RemoteImage(urlString: event.imageUrl, contentMode: .fit) { imageSize in
-                heroImageContentMode(for: imageSize)
-            }
+            RemoteImage(urlString: event.imageUrl, contentMode: .fill)
                 .frame(width: width, height: imageHeight)
                 .background(Brand.muted.opacity(0.28))
                 .saturation(event.isSoldOut ? 0 : 1)
@@ -10538,16 +10536,6 @@ struct EventDetailView: View {
 
     private func heroOpacity(heroHeight: CGFloat) -> Double {
         max(0, min(Double(1 - scrollOffset / (heroHeight * 0.7)), 1))
-    }
-
-    private func heroImageContentMode(for imageSize: CGSize) -> ContentMode {
-        isApproximatelySixteenNine(imageSize) ? .fit : .fill
-    }
-
-    private func isApproximatelySixteenNine(_ imageSize: CGSize) -> Bool {
-        guard imageSize.width > 0, imageSize.height > 0 else { return true }
-        let aspectRatio = imageSize.width / imageSize.height
-        return abs(aspectRatio - 16 / 9) <= 0.04
     }
 
     private func compactHeaderProgress() -> Double {
@@ -22169,7 +22157,7 @@ struct OrganizerEventEditorView: View {
                         OrganizerEditorSection(title: "Galleria") {
                             if draft.imageUrl.nilIfBlank != nil {
                                 RemoteImage(urlString: draft.imageUrl)
-                                    .frame(height: 150)
+                                    .aspectRatio(1, contentMode: .fit)
                                     .clipShape(RoundedRectangle(cornerRadius: 14))
                                 HStack(spacing: 12) {
                                     RemoteImage(urlString: draft.homeCardImageUrl.nilIfBlank ?? draft.imageUrl)
@@ -24710,21 +24698,21 @@ enum OrganizerImageCropKind {
 
     var subtitle: String {
         switch self {
-        case .coverHero: "Ritaglio 16:9 per il dettaglio evento"
+        case .coverHero: "Ritaglio 1:1 per il dettaglio evento"
         case .coverHome: "Ritaglio 1:1 mostrato nelle card della home"
         }
     }
 
     var aspectRatio: CGFloat {
         switch self {
-        case .coverHero: 16 / 9
+        case .coverHero: 1
         case .coverHome: 1
         }
     }
 
     var outputSize: CGSize {
         switch self {
-        case .coverHero: CGSize(width: 1200, height: 675)
+        case .coverHero: CGSize(width: 1200, height: 1200)
         case .coverHome: CGSize(width: 1200, height: 1200)
         }
     }
