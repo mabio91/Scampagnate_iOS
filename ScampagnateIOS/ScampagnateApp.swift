@@ -3000,28 +3000,35 @@ struct SupabaseAPI {
     private func replaceMeetingPoints(eventId: String, points: [OrganizerMeetingPointDraft], session: AuthSession) async throws {
         let existing = try await fetchEventMeetingPoints(eventId: eventId, session: session)
         let existingIds = existing.map(\.id)
-        if !existingIds.isEmpty {
+        let validPoints = points.filter { $0.name.nilIfBlank != nil && $0.location.nilIfBlank != nil && $0.time.nilIfBlank != nil }
+        let retainedServerIds = Set(validPoints.compactMap(\.serverId))
+        let removedIds = existingIds.filter { !retainedServerIds.contains($0) }
+
+        if !removedIds.isEmpty {
             let payload: [String: JSONValue] = ["meeting_point_id": .null]
             let data = try JSONEncoder().encode(payload)
-            let ids = existingIds.joined(separator: ",")
+            let ids = removedIds.map(\.urlEncoded).joined(separator: ",")
             let _: EmptyResponse = try await request(path: "/rest/v1/event_registrations?meeting_point_id=in.(\(ids))", method: "PATCH", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
-        }
-        let _: EmptyResponse = try await request(path: "/rest/v1/event_meeting_points?event_id=eq.\(eventId.urlEncoded)", method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
 
-        let validPoints = points.filter { $0.name.nilIfBlank != nil && $0.location.nilIfBlank != nil && $0.time.nilIfBlank != nil }
-        guard !validPoints.isEmpty else { return }
-        let rows = validPoints.enumerated().map { index, point in
-            [
-                "event_id": JSONValue.string(eventId),
+            let _: EmptyResponse = try await request(path: "/rest/v1/event_meeting_points?id=in.(\(ids))&event_id=eq.\(eventId.urlEncoded)", method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
+        }
+
+        for (index, point) in validPoints.enumerated() {
+            let payload: [String: JSONValue] = [
+                "event_id": .string(eventId),
                 "name": .string(point.name),
                 "location": .string(point.location),
                 "time": .string(point.time),
                 "notes": point.notes.nilIfBlank.map { .string($0) } ?? .null,
                 "sort_order": .number(Double(index))
             ]
+            let data = try JSONEncoder().encode(payload)
+            if let serverId = point.serverId?.nilIfBlank {
+                let _: EmptyResponse = try await request(path: "/rest/v1/event_meeting_points?id=eq.\(serverId.urlEncoded)&event_id=eq.\(eventId.urlEncoded)", method: "PATCH", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
+            } else {
+                let _: EmptyResponse = try await request(path: "/rest/v1/event_meeting_points", method: "POST", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
+            }
         }
-        let data = try JSONEncoder().encode(rows)
-        let _: EmptyResponse = try await request(path: "/rest/v1/event_meeting_points", method: "POST", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
     }
 
     private func replacePriceOptions(eventId: String, options: [OrganizerPriceOptionDraft], session: AuthSession) async throws {
@@ -5098,6 +5105,7 @@ struct OrganizerRegistrationUpdate {
 
 struct OrganizerMeetingPointDraft: Identifiable, Equatable {
     var id = UUID()
+    var serverId: String?
     var name = ""
     var location = ""
     var time = ""
@@ -5105,7 +5113,8 @@ struct OrganizerMeetingPointDraft: Identifiable, Equatable {
 
     init() {}
 
-    init(point: MeetingPoint) {
+    init(point: MeetingPoint, duplicate: Bool = false) {
+        serverId = duplicate ? nil : point.id
         name = point.name ?? ""
         location = point.location ?? ""
         time = String((point.time ?? "").prefix(5))
@@ -5442,7 +5451,7 @@ struct OrganizerEventDraft: Equatable {
         ).map { $0.cleanInputString } ?? ""
         exclusivityLabel = event.accessRules?.string(at: "exclusivity_label") ?? ""
         restrictionMessage = event.accessRules?.string(at: "restriction_message") ?? ""
-        self.meetingPoints = meetingPoints.map(OrganizerMeetingPointDraft.init(point:))
+        self.meetingPoints = meetingPoints.map { OrganizerMeetingPointDraft(point: $0, duplicate: duplicate) }
         let mappedPriceOptions = priceOptions.enumerated().map { index, option in
             var draft = OrganizerPriceOptionDraft(option: option)
             if duplicate {
