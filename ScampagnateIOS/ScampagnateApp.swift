@@ -3912,6 +3912,8 @@ struct Event: Codable, Identifiable, Hashable {
     var meetingPoints: [MeetingPoint] { (eventMeetingPoints ?? []).sortedChronologically() }
     var priceOptions: [PriceOption] { (eventPriceOptions ?? []).sorted { ($0.sortOrder ?? 0) < ($1.sortOrder ?? 0) } }
     var gallery: [GalleryImage] { (galleryImages ?? []).sorted { ($0.order ?? 0) < ($1.order ?? 0) } }
+    var homeCardImageUrl: String? { additionalFields?.string(at: "home_card_image_url")?.nilIfBlank }
+    var cardImageUrl: String? { homeCardImageUrl ?? imageUrl ?? gallery.first?.url }
     var equipmentItems: [EquipmentItem] { equipmentList ?? [] }
     var staffMembers: [EventStaffMember] { (eventStaff ?? []).sorted { ($0.sortOrder ?? 0) < ($1.sortOrder ?? 0) } }
     var hasEquipment: Bool { !equipmentItems.isEmpty }
@@ -5340,6 +5342,7 @@ struct OrganizerEventDraft: Equatable {
     var featured = false
     var cancellationPolicy = "flexible_24h"
     var imageUrl = ""
+    var homeCardImageUrl = ""
     var visibility = "public"
     var status = "open"
     var galleryImageURLs: [String] = []
@@ -5392,6 +5395,7 @@ struct OrganizerEventDraft: Equatable {
         featured = duplicate ? false : (event.featured ?? false)
         cancellationPolicy = Self.normalizedCancellationPolicy(event.cancellationPolicy)
         imageUrl = event.imageUrl ?? ""
+        homeCardImageUrl = event.homeCardImageUrl ?? ""
         visibility = duplicate ? "private" : (event.visibility ?? "public")
         status = duplicate ? "open" : Self.editableStatus(event.status)
         galleryImageURLs = event.gallery.compactMap(\.url)
@@ -5574,7 +5578,8 @@ struct OrganizerEventDraft: Equatable {
             "fields": .array(customFieldValues),
             "custom_fields": .array(customFieldValues),
             "ask_car_availability": .bool(askCarAvailability),
-            "waiting_list_enabled": .bool(waitingListEnabled)
+            "waiting_list_enabled": .bool(waitingListEnabled),
+            "home_card_image_url": homeCardImageUrl.nilIfBlank.map { .string($0) } ?? .null
         ]) { _, new in new }
         if preservedAdditionalFields["car_availability_enabled"] != nil {
             additionalObject["car_availability_enabled"] = .bool(askCarAvailability)
@@ -9612,7 +9617,7 @@ struct EventCard: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 ZStack {
-                    RemoteImage(urlString: event.imageUrl)
+                    RemoteImage(urlString: event.cardImageUrl)
                         .frame(width: 86, height: 86)
                         .clipShape(RoundedRectangle(cornerRadius: 14))
                         .saturation(event.isSoldOut ? 0 : 1)
@@ -10335,10 +10340,18 @@ struct EventDetailView: View {
         let heroHeight: CGFloat = 340
         let safeTop = max(topInset, 22)
         let heroOpacity = heroOpacity(heroHeight: heroHeight)
-        let heroScale = 1 + scrollOffset * 0.0005
-        let heroTranslateY = scrollOffset * 0.4
+        let heroScale = 1 + min(scrollOffset, heroHeight) * 0.00012
+        let heroTranslateY = scrollOffset * 0.18
         return ZStack(alignment: .bottomLeading) {
-            RemoteImage(urlString: event.imageUrl)
+            ZStack {
+                RemoteImage(urlString: event.imageUrl)
+                    .frame(width: width, height: heroHeight)
+                    .scaleEffect(1.05)
+                    .blur(radius: 18)
+                    .opacity(event.isSoldOut ? 0.32 : 0.44)
+                RemoteImage(urlString: event.imageUrl, contentMode: .fit)
+                    .frame(width: width, height: heroHeight)
+            }
                 .frame(width: width, height: heroHeight)
                 .saturation(event.isSoldOut ? 0 : 1)
                 .scaleEffect(heroScale)
@@ -10347,8 +10360,8 @@ struct EventDetailView: View {
                 .overlay {
                     LinearGradient(
                         colors: event.isSoldOut
-                            ? [.black.opacity(0.10), .black.opacity(0.74)]
-                            : [.black.opacity(0.18), Brand.primary.opacity(0.96)],
+                            ? [.black.opacity(0.04), .black.opacity(0.52)]
+                            : [.black.opacity(0.06), .black.opacity(0.42)],
                         startPoint: .top,
                         endPoint: .bottom
                     )
@@ -15605,7 +15618,7 @@ struct EventRegistrationCard: View {
                     selectedEvent = event
                 } label: {
                     HStack(spacing: 12) {
-                        RemoteImage(urlString: event.imageUrl)
+                        RemoteImage(urlString: event.cardImageUrl)
                             .frame(width: 76, height: 76)
                             .clipShape(RoundedRectangle(cornerRadius: 14))
                         VStack(alignment: .leading, spacing: 6) {
@@ -15971,7 +15984,7 @@ struct SavedEventCard: View {
                     onOpen(event)
                 } label: {
                     HStack(spacing: 12) {
-                        RemoteImage(urlString: event.imageUrl)
+                        RemoteImage(urlString: event.cardImageUrl)
                             .frame(width: 76, height: 76)
                             .clipShape(RoundedRectangle(cornerRadius: 14))
                             .saturation(event.isPastOrCancelled ? 0.35 : 1)
@@ -18317,7 +18330,7 @@ struct OrganizerEventRow: View {
         HStack(spacing: 12) {
             Button(action: onSelect) {
                 HStack(spacing: 12) {
-                    RemoteImage(urlString: event.imageUrl)
+                    RemoteImage(urlString: event.cardImageUrl)
                         .frame(width: 72, height: 72)
                         .clipShape(RoundedRectangle(cornerRadius: 14))
 
@@ -21673,6 +21686,20 @@ struct OrganizerEventEditorView: View {
                                 RemoteImage(urlString: draft.imageUrl)
                                     .frame(height: 150)
                                     .clipShape(RoundedRectangle(cornerRadius: 14))
+                                HStack(spacing: 12) {
+                                    RemoteImage(urlString: draft.homeCardImageUrl.nilIfBlank ?? draft.imageUrl)
+                                        .frame(width: 86, height: 86)
+                                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Anteprima home")
+                                            .font(.caption.weight(.bold))
+                                            .foregroundStyle(Brand.foreground)
+                                        Text("Riquadro 1:1 usato nelle card evento.")
+                                            .font(.caption2)
+                                            .foregroundStyle(Brand.mutedForeground)
+                                    }
+                                    Spacer()
+                                }
                             }
                             Field("URL immagine", text: $draft.imageUrl, keyboard: .URL)
                                 .textInputAutocapitalization(.never)
@@ -22006,7 +22033,7 @@ struct OrganizerEventEditorView: View {
                 image: crop.image,
                 kind: crop.kind,
                 onSubmit: { result in
-                    Task { await handleImageCrop(result, kind: crop.kind) }
+                    Task { await handleImageCrop(result, crop: crop) }
                 },
                 onCancel: {
                     activeImageCrop = nil
@@ -22119,7 +22146,7 @@ struct OrganizerEventEditorView: View {
         selectedPhoto = nil
         guard let data = try? await item.loadTransferable(type: Data.self),
               let image = UIImage(data: data) else { return }
-        activeImageCrop = OrganizerImageCropDraft(image: image, kind: .cover)
+        activeImageCrop = OrganizerImageCropDraft(image: image, kind: .coverHero)
     }
 
     @MainActor
@@ -22144,16 +22171,20 @@ struct OrganizerEventEditorView: View {
     }
 
     @MainActor
-    private func handleImageCrop(_ result: OrganizerImageCropResult, kind: OrganizerImageCropKind) async {
+    private func handleImageCrop(_ result: OrganizerImageCropResult, crop: OrganizerImageCropDraft) async {
         activeImageCrop = nil
         uploadingImages = true
+        defer { uploadingImages = false }
         if let url = await store.uploadOrganizerEventImage(data: result.data, fileExtension: "jpg") {
-            switch kind {
-            case .cover:
+            switch crop.kind {
+            case .coverHero:
                 draft.imageUrl = url
+                draft.homeCardImageUrl = ""
+                activeImageCrop = OrganizerImageCropDraft(image: crop.image, kind: .coverHome)
+            case .coverHome:
+                draft.homeCardImageUrl = url
             }
         }
-        uploadingImages = false
     }
 
     @MainActor
@@ -24182,29 +24213,34 @@ struct OrganizerGalleryEditor: View {
 }
 
 enum OrganizerImageCropKind {
-    case cover
+    case coverHero
+    case coverHome
 
     var title: String {
         switch self {
-        case .cover: "Immagine evento"
+        case .coverHero: "Immagine evento"
+        case .coverHome: "Anteprima home"
         }
     }
 
     var subtitle: String {
         switch self {
-        case .cover: "Ritaglio 16:9 per copertina e card evento"
+        case .coverHero: "Ritaglio 16:9 per il dettaglio evento"
+        case .coverHome: "Ritaglio 1:1 mostrato nelle card della home"
         }
     }
 
     var aspectRatio: CGFloat {
         switch self {
-        case .cover: 16 / 9
+        case .coverHero: 16 / 9
+        case .coverHome: 1
         }
     }
 
     var outputSize: CGSize {
         switch self {
-        case .cover: CGSize(width: 1200, height: 675)
+        case .coverHero: CGSize(width: 1200, height: 675)
+        case .coverHome: CGSize(width: 1200, height: 1200)
         }
     }
 }
