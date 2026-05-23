@@ -10401,7 +10401,7 @@ struct EventDetailView: View {
             .frame(width: width, height: safeTop + imageHeight)
             .opacity(heroOpacity)
 
-            VStack(alignment: .leading) {
+            VStack(alignment: .leading, spacing: 12) {
                 Spacer()
                 Text(event.title)
                     .font(.system(size: 28, weight: .bold, design: .rounded))
@@ -10409,12 +10409,11 @@ struct EventDetailView: View {
                     .lineLimit(3)
                     .minimumScaleFactor(0.75)
                     .fixedSize(horizontal: false, vertical: true)
-                    .shadow(color: .black.opacity(0.35), radius: 10, x: 0, y: 3)
                     .frame(width: max(width - 36, 0), alignment: .leading)
                     .padding(.horizontal, 18)
-                    .padding(.bottom, 42)
+                    .padding(.bottom, 34)
             }
-            .frame(width: width, height: safeTop + imageHeight, alignment: .bottomLeading)
+            .frame(width: width, height: heroHeight, alignment: .bottomLeading)
             .opacity(heroOpacity)
         }
         .frame(width: width, height: heroHeight)
