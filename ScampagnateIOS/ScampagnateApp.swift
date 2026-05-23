@@ -19138,6 +19138,14 @@ struct OrganizerEventManageView: View {
                 emptyTitle: "Nessuno in waitlist",
                 registrations: waitlistedRegistrations,
                 meetingPoints: meetingPoints,
+                event: event,
+                priceOptions: priceOptions,
+                onToggleCheckIn: toggleCheckIn,
+                onStatus: updateStatus,
+                onPayment: updatePayment,
+                onMeetingPoint: updateMeetingPoint,
+                onPriceOption: updatePriceOption,
+                onOpenProfile: { selectedParticipantProfile = $0 },
                 primaryTitle: "Promuovi",
                 primaryAction: { updateStatus($0, status: "registered") },
                 secondaryTitle: "Cancella",
@@ -19161,6 +19169,14 @@ struct OrganizerEventManageView: View {
                 emptyTitle: "Nessuna approvazione pendente",
                 registrations: pendingRegistrations,
                 meetingPoints: meetingPoints,
+                event: event,
+                priceOptions: priceOptions,
+                onToggleCheckIn: toggleCheckIn,
+                onStatus: updateStatus,
+                onPayment: updatePayment,
+                onMeetingPoint: updateMeetingPoint,
+                onPriceOption: updatePriceOption,
+                onOpenProfile: { selectedParticipantProfile = $0 },
                 primaryTitle: "Approva",
                 primaryAction: { updateStatus($0, status: "registered") },
                 secondaryTitle: "Rifiuta",
@@ -20252,10 +20268,54 @@ struct OrganizerQueueSection: View {
     let emptyTitle: String
     let registrations: [OrganizerRegistration]
     let meetingPoints: [MeetingPoint]
+    let event: Event?
+    let priceOptions: [PriceOption]
+    let onToggleCheckIn: ((OrganizerRegistration) -> Void)?
+    let onStatus: ((OrganizerRegistration, String) -> Void)?
+    let onPayment: ((OrganizerRegistration, String) -> Void)?
+    let onMeetingPoint: ((OrganizerRegistration, String?) -> Void)?
+    let onPriceOption: ((OrganizerRegistration, String?) -> Void)?
+    let onOpenProfile: ((OrganizerRegistration) -> Void)?
     let primaryTitle: String?
     let primaryAction: ((OrganizerRegistration) -> Void)?
     let secondaryTitle: String?
     let secondaryAction: ((OrganizerRegistration) -> Void)?
+
+    init(
+        title: String,
+        emptyTitle: String,
+        registrations: [OrganizerRegistration],
+        meetingPoints: [MeetingPoint],
+        event: Event? = nil,
+        priceOptions: [PriceOption] = [],
+        onToggleCheckIn: ((OrganizerRegistration) -> Void)? = nil,
+        onStatus: ((OrganizerRegistration, String) -> Void)? = nil,
+        onPayment: ((OrganizerRegistration, String) -> Void)? = nil,
+        onMeetingPoint: ((OrganizerRegistration, String?) -> Void)? = nil,
+        onPriceOption: ((OrganizerRegistration, String?) -> Void)? = nil,
+        onOpenProfile: ((OrganizerRegistration) -> Void)? = nil,
+        primaryTitle: String?,
+        primaryAction: ((OrganizerRegistration) -> Void)?,
+        secondaryTitle: String?,
+        secondaryAction: ((OrganizerRegistration) -> Void)?
+    ) {
+        self.title = title
+        self.emptyTitle = emptyTitle
+        self.registrations = registrations
+        self.meetingPoints = meetingPoints
+        self.event = event
+        self.priceOptions = priceOptions
+        self.onToggleCheckIn = onToggleCheckIn
+        self.onStatus = onStatus
+        self.onPayment = onPayment
+        self.onMeetingPoint = onMeetingPoint
+        self.onPriceOption = onPriceOption
+        self.onOpenProfile = onOpenProfile
+        self.primaryTitle = primaryTitle
+        self.primaryAction = primaryAction
+        self.secondaryTitle = secondaryTitle
+        self.secondaryAction = secondaryAction
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -20270,14 +20330,36 @@ struct OrganizerQueueSection: View {
                 }
             } else {
                 ForEach(registrations) { registration in
-                    OrganizerQueueRow(
-                        registration: registration,
-                        meetingPoint: meetingPoints.first { $0.id == registration.meetingPointId },
-                        primaryTitle: primaryTitle,
-                        primaryAction: primaryAction.map { action in { action(registration) } },
-                        secondaryTitle: secondaryTitle,
-                        secondaryAction: secondaryAction.map { action in { action(registration) } }
-                    )
+                    if let event,
+                       let onToggleCheckIn,
+                       let onStatus,
+                       let onPayment,
+                       let onMeetingPoint,
+                       let onPriceOption,
+                       let onOpenProfile {
+                        OrganizerParticipantRow(
+                            registration: registration,
+                            event: event,
+                            meetingPoint: meetingPoints.first { $0.id == registration.meetingPointId },
+                            meetingPoints: meetingPoints,
+                            priceOptions: priceOptions,
+                            onToggleCheckIn: { onToggleCheckIn(registration) },
+                            onStatus: { onStatus(registration, $0) },
+                            onPayment: { onPayment(registration, $0) },
+                            onMeetingPoint: { onMeetingPoint(registration, $0) },
+                            onPriceOption: { onPriceOption(registration, $0) },
+                            onOpenProfile: { onOpenProfile(registration) }
+                        )
+                    } else {
+                        OrganizerQueueRow(
+                            registration: registration,
+                            meetingPoint: meetingPoints.first { $0.id == registration.meetingPointId },
+                            primaryTitle: primaryTitle,
+                            primaryAction: primaryAction.map { action in { action(registration) } },
+                            secondaryTitle: secondaryTitle,
+                            secondaryAction: secondaryAction.map { action in { action(registration) } }
+                        )
+                    }
                 }
             }
         }
@@ -21011,8 +21093,39 @@ struct OrganizerParticipantRow: View {
     let onPriceOption: (String?) -> Void
     let onOpenProfile: () -> Void
 
+    private static let noMeetingPointId = "__no_meeting_point__"
+    private static let noPriceOptionId = "__no_price_option__"
+    private static let enrollmentOptions = ["registered", "waitlist", "pending_approval"]
+    private static let paymentOptions = ["pending", "deposit_paid", "paid", "pay_on_location", "not_required"]
+
     private var canOpenProfile: Bool {
         !registration.isManual && registration.userId?.nilIfBlank != nil
+    }
+
+    private var selectedEnrollmentStatus: String? {
+        switch registration.normalizedStatus {
+        case "waitlist", "pending_approval":
+            return registration.normalizedStatus
+        case "registered", "deposit_paid", "paid", "attended", "pending_payment":
+            return "registered"
+        default:
+            return nil
+        }
+    }
+
+    private var selectedPaymentStatus: String {
+        if let payment = registration.paymentStatus?.nilIfBlank { return payment }
+        if registration.normalizedStatus == "deposit_paid" { return "deposit_paid" }
+        if registration.normalizedStatus == "paid" { return "paid" }
+        return "pending"
+    }
+
+    private var selectedMeetingPointId: String {
+        registration.meetingPointId?.nilIfBlank ?? Self.noMeetingPointId
+    }
+
+    private var selectedPriceOptionId: String {
+        registration.priceOption?.id.nilIfBlank ?? Self.noPriceOptionId
     }
 
     var body: some View {
@@ -21055,39 +21168,74 @@ struct OrganizerParticipantRow: View {
                 VStack(alignment: .trailing, spacing: 8) {
                     BadgeLabel(text: registration.statusLabel, color: registration.statusColor.opacity(0.14), foreground: registration.statusColor)
                     Menu {
-                        if canOpenProfile {
+                        Section("Azioni") {
                             Button {
                                 onOpenProfile()
                             } label: {
-                                Label("Apri profilo", systemImage: "person.crop.circle")
+                                participantMenuLabel("Apri profilo", systemImage: "person.crop.circle")
                             }
-                            Divider()
-                        }
-                        Button {
-                            onToggleCheckIn()
-                        } label: {
-                            Label(registration.checkedIn == true ? "Annulla check-in" : "Check-in", systemImage: registration.checkedIn == true ? "xmark.circle" : "checkmark.circle")
-                        }
-                        Divider()
-                        ForEach(["registered", "deposit_paid", "paid", "attended", "no_show", "pending_payment", "pending_approval", "waitlist", "cancelled"], id: \.self) { status in
-                            Button(status.webRegistrationStatusLabel) { onStatus(status) }
-                        }
-                        Divider()
-                        ForEach(["deposit_paid", "paid", "pending", "pay_on_location", "not_required", "failed"], id: \.self) { status in
-                            Button(status.webPaymentStatusLabel) { onPayment(status) }
-                        }
-                        if !meetingPoints.isEmpty {
-                            Divider()
-                            Button("Nessun ritrovo") { onMeetingPoint(nil) }
-                            ForEach(meetingPoints) { point in
-                                Button(point.name ?? "Ritrovo") { onMeetingPoint(point.id) }
+                            .disabled(!canOpenProfile)
+
+                            Button {
+                                onStatus("no_show")
+                            } label: {
+                                participantMenuLabel("Segna come no-show", systemImage: "person.crop.circle.badge.exclamationmark", selected: registration.normalizedStatus == "no_show")
+                            }
+
+                            Button(role: .destructive) {
+                                onStatus("cancelled")
+                            } label: {
+                                participantMenuLabel("Rimuovi dall'evento", systemImage: "trash")
                             }
                         }
-                        if !priceOptions.isEmpty {
-                            Divider()
-                            Button("Nessuna formula") { onPriceOption(nil) }
+
+                        Section("Iscrizione") {
+                            ForEach(Self.enrollmentOptions, id: \.self) { status in
+                                Button {
+                                    onStatus(status)
+                                } label: {
+                                    participantMenuLabel(enrollmentMenuTitle(status), systemImage: "person.badge.key", selected: selectedEnrollmentStatus == status)
+                                }
+                            }
+                        }
+
+                        Section("Pagamento") {
+                            ForEach(Self.paymentOptions, id: \.self) { status in
+                                Button {
+                                    onPayment(status)
+                                } label: {
+                                    participantMenuLabel(paymentMenuTitle(status), systemImage: "creditcard", selected: selectedPaymentStatus == status)
+                                }
+                            }
+                        }
+
+                        Section("Punto di ritrovo") {
+                            Button {
+                                onMeetingPoint(nil)
+                            } label: {
+                                participantMenuLabel("Nessun ritrovo", systemImage: "mappin.slash", selected: selectedMeetingPointId == Self.noMeetingPointId)
+                            }
+                            ForEach(Array(meetingPoints.enumerated()), id: \.element.id) { index, point in
+                                Button {
+                                    onMeetingPoint(point.id)
+                                } label: {
+                                    participantMenuLabel(meetingPointMenuTitle(point, index: index), systemImage: "mappin.and.ellipse", selected: selectedMeetingPointId == point.id)
+                                }
+                            }
+                        }
+
+                        Section("Formula prezzo") {
+                            Button {
+                                onPriceOption(nil)
+                            } label: {
+                                participantMenuLabel("Nessuna formula", systemImage: "ticket", selected: selectedPriceOptionId == Self.noPriceOptionId)
+                            }
                             ForEach(priceOptions) { option in
-                                Button(option.displayName) { onPriceOption(option.id) }
+                                Button {
+                                    onPriceOption(option.id)
+                                } label: {
+                                    participantMenuLabel(option.displayName, systemImage: "ticket", selected: selectedPriceOptionId == option.id)
+                                }
                             }
                         }
                     } label: {
@@ -21120,6 +21268,39 @@ struct OrganizerParticipantRow: View {
             }
         }
         .accessibilityHint(Text(canOpenProfile ? "Tocca per aprire il profilo partecipante" : ""))
+    }
+
+    @ViewBuilder
+    private func participantMenuLabel(_ title: String, systemImage: String, selected: Bool = false) -> some View {
+        Label {
+            Text(title)
+        } icon: {
+            Image(systemName: selected ? "checkmark.circle.fill" : systemImage)
+        }
+    }
+
+    private func enrollmentMenuTitle(_ status: String) -> String {
+        switch status {
+        case "registered": return "Iscritto"
+        case "waitlist": return "In lista d'attesa"
+        case "pending_approval": return "In attesa di approvazione"
+        default: return status.organizerStatusLabel
+        }
+    }
+
+    private func paymentMenuTitle(_ status: String) -> String {
+        switch status {
+        case "pending": return "In attesa pagamento"
+        case "deposit_paid": return "Acconto effettuato"
+        case "paid": return "Pagamento effettuato"
+        case "pay_on_location": return "Pagamento in loco"
+        case "not_required": return "Pagamento non richiesto"
+        default: return status.paymentStatusLabel
+        }
+    }
+
+    private func meetingPointMenuTitle(_ point: MeetingPoint, index: Int) -> String {
+        "Punto \(index + 1) - \(point.name ?? "Ritrovo")"
     }
 
     private var participantChips: [OrganizerParticipantChipModel] {
