@@ -10361,9 +10361,19 @@ struct EventDetailView: View {
                 .opacity(heroOpacity)
                 .overlay {
                     LinearGradient(
-                        colors: event.isSoldOut
-                            ? [.black.opacity(0.08), .clear, .black.opacity(0.52)]
-                            : [.black.opacity(0.06), .clear, .black.opacity(0.42)],
+                        stops: event.isSoldOut
+                            ? [
+                                .init(color: .black.opacity(0.08), location: 0),
+                                .init(color: .clear, location: 0.38),
+                                .init(color: .black.opacity(0.38), location: 0.68),
+                                .init(color: .black.opacity(0.78), location: 1)
+                            ]
+                            : [
+                                .init(color: .black.opacity(0.04), location: 0),
+                                .init(color: .clear, location: 0.38),
+                                .init(color: .black.opacity(0.32), location: 0.68),
+                                .init(color: .black.opacity(0.72), location: 1)
+                            ],
                         startPoint: .top,
                         endPoint: .bottom
                     )
