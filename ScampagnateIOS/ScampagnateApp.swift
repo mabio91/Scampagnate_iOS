@@ -31086,7 +31086,7 @@ struct ProfileEditSheet: View {
                 .layoutPriority(1)
 
                 ProfileSheetSexField(sex: $input.sex)
-                    .frame(width: 118)
+                    .frame(width: 106)
             }
             HStack(alignment: .top, spacing: 14) {
                 ProfileSheetField(
@@ -32960,7 +32960,11 @@ struct OnboardingBirthDateField: View {
                     Text(displayText)
                         .font(.body)
                         .foregroundStyle(dateString.isEmpty ? Brand.inputMutedForeground : Brand.inputForeground)
-                    Spacer(minLength: 8)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                        .allowsTightening(true)
+                        .layoutPriority(1)
+                    Spacer(minLength: 4)
                     Image(systemName: "calendar")
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(Brand.primary)
@@ -34754,17 +34758,22 @@ struct BirthDatePickerField: View {
                 .font(labelFont)
                 .foregroundStyle(Brand.foreground)
 
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Button {
                     syncPickerDate()
                     isPickerPresented = true
                 } label: {
-                    HStack(spacing: 10) {
+                    HStack(spacing: 8) {
                         Text(displayText)
                             .font(.body)
                             .foregroundStyle(dateString.isEmpty ? Brand.inputMutedForeground : Brand.inputForeground)
-                        Spacer(minLength: 8)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.82)
+                            .allowsTightening(true)
+                            .layoutPriority(1)
+                        Spacer(minLength: 4)
                         Image(systemName: "calendar")
+                            .font(.system(size: 16, weight: .semibold))
                             .foregroundStyle(Brand.primary)
                     }
                     .contentShape(Rectangle())
@@ -34779,7 +34788,7 @@ struct BirthDatePickerField: View {
                         pickerDate = Self.defaultBirthDate
                     } label: {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 18, weight: .semibold))
+                            .font(.system(size: 16, weight: .semibold))
                             .foregroundStyle(Brand.mutedForeground)
                     }
                     .buttonStyle(.plain)
