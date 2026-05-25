@@ -22156,18 +22156,11 @@ struct OrganizerEventEditorView: View {
 
                         OrganizerEditorSection(title: "Immagini") {
                             if draft.imageUrl.nilIfBlank != nil {
-                                VStack(spacing: 8) {
-                                    OrganizerImagePreviewRow(
-                                        title: "Copertina evento",
-                                        subtitle: "Riquadro 1:1 usato nel dettaglio evento.",
-                                        urlString: draft.imageUrl
-                                    )
-                                    OrganizerImagePreviewRow(
-                                        title: "Anteprima home",
-                                        subtitle: "Riquadro 1:1 usato nelle card evento.",
-                                        urlString: draft.homeCardImageUrl.nilIfBlank ?? draft.imageUrl
-                                    )
-                                }
+                                OrganizerImagePreviewRow(
+                                    title: "Copertina evento",
+                                    subtitle: "Usata nel dettaglio evento e nelle card.",
+                                    urlString: draft.imageUrl
+                                )
                             }
                             PhotosPicker(selection: $selectedPhoto, matching: .images) {
                                 Label("Carica immagine evento", systemImage: "photo.badge.plus")
@@ -22646,9 +22639,6 @@ struct OrganizerEventEditorView: View {
             case .coverHero:
                 draft.imageUrl = url
                 draft.homeCardImageUrl = ""
-                activeImageCrop = OrganizerImageCropDraft(image: crop.image, kind: .coverHome)
-            case .coverHome:
-                draft.homeCardImageUrl = url
             }
         }
     }
@@ -24719,33 +24709,28 @@ struct OrganizerGalleryEditor: View {
 
 enum OrganizerImageCropKind {
     case coverHero
-    case coverHome
 
     var title: String {
         switch self {
         case .coverHero: "Immagine evento"
-        case .coverHome: "Anteprima home"
         }
     }
 
     var subtitle: String {
         switch self {
-        case .coverHero: "Ritaglio 1:1 per il dettaglio evento"
-        case .coverHome: "Ritaglio 1:1 mostrato nelle card della home"
+        case .coverHero: "Ritaglio 1:1 mostrato nell'evento e nelle card"
         }
     }
 
     var aspectRatio: CGFloat {
         switch self {
         case .coverHero: 1
-        case .coverHome: 1
         }
     }
 
     var outputSize: CGSize {
         switch self {
         case .coverHero: CGSize(width: 1200, height: 1200)
-        case .coverHome: CGSize(width: 1200, height: 1200)
         }
     }
 }
