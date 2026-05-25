@@ -6718,6 +6718,10 @@ private extension MissionCardModel {
         min(max(progress ?? 0, 0), targetValue)
     }
 
+    var completionRatio: Double {
+        Double(clampedProgress) / Double(targetValue)
+    }
+
     var displayTitle: String {
         missions?.title?.nilIfBlank ?? "Missione"
     }
@@ -27123,10 +27127,36 @@ struct MissionsSection: View {
     let missions: [MissionCardModel]
     @Binding var routedMission: MissionNavigationTarget?
     @State private var selectedMission: MissionCardModel?
+    @State private var showAdditionalActiveMissions = false
     @State private var showCompletedMissions = false
 
+    private static let visibleActiveMissionLimit = 3
+
     private var activeMissions: [MissionCardModel] {
-        missions.filter { !$0.isCompleted }
+        missions.enumerated()
+            .filter { !$0.element.isCompleted }
+            .sorted { lhs, rhs in
+                let lhsRatio = lhs.element.completionRatio
+                let rhsRatio = rhs.element.completionRatio
+                if lhsRatio != rhsRatio {
+                    return lhsRatio > rhsRatio
+                }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
+    }
+
+    private var visibleActiveMissions: [MissionCardModel] {
+        Array(activeMissions.prefix(Self.visibleActiveMissionLimit))
+    }
+
+    private var additionalActiveMissions: [MissionCardModel] {
+        Array(activeMissions.dropFirst(Self.visibleActiveMissionLimit))
+    }
+
+    private var additionalActiveMissionTriggerText: String {
+        let count = additionalActiveMissions.count
+        return count == 1 ? "Mostra 1 altra missione" : "Mostra altre \(count) missioni"
     }
 
     private var completedMissions: [MissionCardModel] {
@@ -27154,9 +27184,39 @@ struct MissionsSection: View {
                         .background(Brand.card, in: RoundedRectangle(cornerRadius: 12))
                         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Brand.muted, lineWidth: 1))
                 } else {
-                    ForEach(activeMissions) { mission in
+                    ForEach(visibleActiveMissions) { mission in
                         MissionRow(mission: mission) {
                             selectedMission = mission
+                        }
+                    }
+
+                    if !additionalActiveMissions.isEmpty {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                showAdditionalActiveMissions.toggle()
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Text(showAdditionalActiveMissions ? "Nascondi missioni" : additionalActiveMissionTriggerText)
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(Brand.foreground)
+                                Spacer()
+                                Image(systemName: showAdditionalActiveMissions ? "chevron.up" : "chevron.down")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(Brand.mutedForeground)
+                            }
+                            .padding(.horizontal, 12)
+                            .frame(height: 42)
+                            .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                        }
+                        .buttonStyle(.plain)
+
+                        if showAdditionalActiveMissions {
+                            ForEach(additionalActiveMissions) { mission in
+                                MissionRow(mission: mission) {
+                                    selectedMission = mission
+                                }
+                            }
                         }
                     }
                 }
@@ -27231,6 +27291,8 @@ struct MissionsSection: View {
         guard let mission else { return }
         if mission.isCompleted {
             showCompletedMissions = true
+        } else if additionalActiveMissions.contains(where: { $0.id == mission.id }) {
+            showAdditionalActiveMissions = true
         }
         selectedMission = mission
         routedMission = nil
