@@ -10441,7 +10441,10 @@ struct EventDetailView: View {
     }
 
     var attendeeParticipants: [EventParticipant] {
-        participants.filter(\.isParticipant)
+        participants.filter { participant in
+            guard let organizerId = event?.organizerId else { return participant.isParticipant }
+            return participant.isParticipant && participant.userId != organizerId
+        }
     }
 
     var organizerProfile: PublicProfile? {
@@ -12381,12 +12384,11 @@ struct ParticipantsSheet: View {
             ?? store.myEvents.compactMap(\.event).first { $0.id == eventId }
     }
 
-    private var organizer: EventParticipant {
-        participants.first(where: \.isOrganizer) ?? EventParticipant(id: "organizer-placeholder-\(eventId)", userId: nil, firstName: "Organizzatore", lastNameInitial: nil, avatarUrl: nil, role: "organizer")
-    }
-
     private var attendeeParticipants: [EventParticipant] {
-        participants.filter(\.isParticipant)
+        participants.filter { participant in
+            guard let organizerId = event?.organizerId else { return participant.isParticipant }
+            return participant.isParticipant && participant.userId != organizerId
+        }
     }
 
     private var attendeeCount: Int {
@@ -12424,46 +12426,40 @@ struct ParticipantsSheet: View {
             VStack(alignment: .leading, spacing: 24) {
                 header
 
-                ParticipantsSection(title: "ORGANIZZATORE") {
-                    ParticipantPersonRow(participant: organizer, levels: store.communityLevels, mode: canViewDetails ? .details : .publicOrganizer)
-                }
-
-                ParticipantsSection(title: "CHI CI SARÀ") {
-                    if canViewDetails {
-                        if attendeeParticipants.isEmpty {
-                            ParticipantsEmptyState(
-                                title: attendeeCount == 0 ? "Ancora nessun partecipante" : "\(attendeeCount) persone stanno partecipando",
-                                message: attendeeCount == 0 ? "Quando qualcuno si iscriverà, lo vedrai qui." : "Stiamo aggiornando la lista dei partecipanti."
-                            )
-                        } else {
-                            VStack(alignment: .leading, spacing: 18) {
-                                ForEach(attendeeParticipants) { participant in
-                                    if canViewOrganizerDetails, let event {
-                                        OrganizerPublicParticipantDetailRow(
-                                            participant: participant,
-                                            registration: organizerRegistration(for: participant),
-                                            event: event,
-                                            levels: store.communityLevels,
-                                            history: history(for: participant),
-                                            onOpenProfile: {
-                                                if let registration = organizerRegistration(for: participant), !registration.isManual {
-                                                    selectedParticipantProfile = registration
-                                                }
+                if canViewDetails {
+                    if attendeeParticipants.isEmpty {
+                        ParticipantsEmptyState(
+                            title: attendeeCount == 0 ? "Ancora nessun partecipante" : "\(attendeeCount) persone stanno partecipando",
+                            message: attendeeCount == 0 ? "Quando qualcuno si iscriverà, lo vedrai qui." : "Stiamo aggiornando la lista dei partecipanti."
+                        )
+                    } else {
+                        VStack(alignment: .leading, spacing: 18) {
+                            ForEach(attendeeParticipants) { participant in
+                                if canViewOrganizerDetails, let event {
+                                    OrganizerPublicParticipantDetailRow(
+                                        participant: participant,
+                                        registration: organizerRegistration(for: participant),
+                                        event: event,
+                                        levels: store.communityLevels,
+                                        history: history(for: participant),
+                                        onOpenProfile: {
+                                            if let registration = organizerRegistration(for: participant), !registration.isManual {
+                                                selectedParticipantProfile = registration
                                             }
-                                        )
-                                    } else {
-                                        ParticipantPersonRow(participant: participant, levels: store.communityLevels, mode: .details)
-                                    }
+                                        }
+                                    )
+                                } else {
+                                    ParticipantPersonRow(participant: participant, levels: store.communityLevels, mode: .details)
                                 }
                             }
                         }
-                    } else if attendeeCount == 0 {
-                        ParticipantsEmptyState(title: "Ancora nessun partecipante", message: "Quando qualcuno si iscriverà, lo vedrai qui.")
-                    } else {
-                        VStack(alignment: .leading, spacing: 18) {
-                            ForEach(Array(previewParticipants.enumerated()), id: \.offset) { _, participant in
-                                ParticipantPrivacyPreviewRow(participant: participant)
-                            }
+                    }
+                } else if attendeeCount == 0 {
+                    ParticipantsEmptyState(title: "Ancora nessun partecipante", message: "Quando qualcuno si iscriverà, lo vedrai qui.")
+                } else {
+                    VStack(alignment: .leading, spacing: 18) {
+                        ForEach(Array(previewParticipants.enumerated()), id: \.offset) { _, participant in
+                            ParticipantPrivacyPreviewRow(participant: participant)
                         }
                     }
                 }
