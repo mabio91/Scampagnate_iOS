@@ -23226,6 +23226,7 @@ private struct OrganizerEventDraftPreviewSheet: View {
     let draft: OrganizerEventDraft
     let categories: [EventCategory]
     let directURL: URL?
+    @State private var descriptionExpanded = false
 
     private var category: EventCategory? {
         categories.first { $0.id == draft.categoryId }
@@ -23246,30 +23247,66 @@ private struct OrganizerEventDraftPreviewSheet: View {
     }
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    hero
-                    quickFacts
-                    previewDescription
-                    meetingPoints
-                    equipment
-                    pricing
-                    registrationFields
-                }
-                .padding(16)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .background(Brand.background)
-            .navigationTitle("Anteprima evento")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(alignment: .center, spacing: 12) {
+                    Text("Anteprima evento")
+                        .font(.system(.title3, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                    Spacer(minLength: 12)
                     Button("Chiudi") {
                         dismiss()
                     }
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Brand.primary)
                 }
+
+                hero
+                quickFacts
+                previewDescription
+                meetingPoints
+                equipment
+                pricing
+                registrationFields
             }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(Brand.background)
+    }
+
+    @ViewBuilder
+    private var titleBlock: some View {
+        let title = draft.title.nilIfBlank ?? "Titolo evento"
+        if let directURL {
+            Button {
+                UIApplication.shared.open(directURL)
+            } label: {
+                HStack(alignment: .top, spacing: 8) {
+                    Text(title)
+                        .font(.system(.title3, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Image(systemName: "arrow.up.forward")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.primary)
+                        .padding(.top, 5)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Apri link diretto evento")
+        } else {
+            Text(title)
+                .font(.system(.title3, design: .rounded, weight: .bold))
+                .foregroundStyle(Brand.foreground)
+                .lineLimit(3)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -23277,8 +23314,8 @@ private struct OrganizerEventDraftPreviewSheet: View {
         VStack(alignment: .leading, spacing: 12) {
             RemoteImage(urlString: draft.imageUrl)
                 .frame(maxWidth: .infinity)
-                .frame(height: 220)
-                .clipShape(RoundedRectangle(cornerRadius: 22))
+                .frame(height: 190)
+                .clipShape(RoundedRectangle(cornerRadius: 20))
                 .overlay(alignment: .topLeading) {
                     HStack(spacing: 6) {
                         BadgeLabel(text: statusLabel, color: statusColor.opacity(0.16), foreground: statusColor)
@@ -23288,27 +23325,7 @@ private struct OrganizerEventDraftPreviewSheet: View {
                 }
 
             VStack(alignment: .leading, spacing: 8) {
-                if let directURL {
-                    Button {
-                        UIApplication.shared.open(directURL)
-                    } label: {
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text(draft.title.nilIfBlank ?? "Titolo evento")
-                                .font(.system(.title2, design: .rounded, weight: .bold))
-                                .foregroundStyle(Brand.foreground)
-                                .multilineTextAlignment(.leading)
-                            Image(systemName: "arrow.up.forward")
-                                .font(.caption.weight(.bold))
-                                .foregroundStyle(Brand.primary)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Apri link diretto evento")
-                } else {
-                    Text(draft.title.nilIfBlank ?? "Titolo evento")
-                        .font(.system(.title2, design: .rounded, weight: .bold))
-                        .foregroundStyle(Brand.foreground)
-                }
+                titleBlock
 
                 VStack(alignment: .leading, spacing: 6) {
                     Label("\(formatLongDate(draft.date)) · \(draft.time.nilIfBlank ?? "Ora da definire")", systemImage: "calendar")
@@ -23317,6 +23334,8 @@ private struct OrganizerEventDraftPreviewSheet: View {
                 }
                 .font(.subheadline)
                 .foregroundStyle(Brand.mutedForeground)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
 
                 if !allBadgeLabels.isEmpty {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 6)], alignment: .leading, spacing: 6) {
@@ -23346,6 +23365,7 @@ private struct OrganizerEventDraftPreviewSheet: View {
                 OrganizerDraftPreviewFact(icon: "arrow.up.right", title: "Dislivello", value: elevation.lowercased().contains("m") ? elevation : "\(elevation) m")
             }
         }
+        .frame(maxWidth: .infinity)
     }
 
     private var previewDescription: some View {
@@ -23354,7 +23374,17 @@ private struct OrganizerEventDraftPreviewSheet: View {
             Text(descriptionPreviewText)
                 .font(.subheadline)
                 .foregroundStyle(Brand.mutedForeground)
+                .lineLimit(descriptionExpanded ? nil : 10)
                 .fixedSize(horizontal: false, vertical: true)
+            if descriptionPreviewText.count > 700 {
+                Button(descriptionExpanded ? "Mostra meno" : "Leggi tutto") {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        descriptionExpanded.toggle()
+                    }
+                }
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(Brand.primary)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(14)
