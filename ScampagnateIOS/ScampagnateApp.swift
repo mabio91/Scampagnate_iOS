@@ -22,6 +22,10 @@ enum IssueMediaLimits {
     static let maxFileSize = 50 * 1024 * 1024
 }
 
+enum EventAvailabilityRules {
+    static let lastSpotsFillRatio = 0.70
+}
+
 enum Brand {
     static let background = adaptive(light: (0.979, 0.973, 0.961), dark: (0.055, 0.082, 0.071))
     static let card = adaptive(light: (0.963, 0.954, 0.938), dark: (0.090, 0.129, 0.110))
@@ -4022,6 +4026,17 @@ struct Event: Codable, Identifiable, Hashable {
     }
     var availableSpots: Int { max(0, (spotsTotal ?? 0) - attendeeSpotsTaken) }
     var bookableSpots: Int { max(0, (spotsTotal ?? 0) - (spotsTaken ?? 0)) }
+    var capacityFillRatio: Double {
+        let total = spotsTotal ?? 0
+        guard total > 0 else { return 0 }
+        return min(1, max(0, Double(attendeeSpotsTaken) / Double(total)))
+    }
+    var hasLastSpots: Bool {
+        (spotsTotal ?? 0) > 0
+            && capacityFillRatio >= EventAvailabilityRules.lastSpotsFillRatio
+            && bookableSpots > 0
+            && !isSoldOut
+    }
     var hasBookableParticipationOption: Bool {
         guard acceptsRegistrations, !isSoldOut else { return false }
         guard !priceOptions.isEmpty else { return bookableSpots > 0 }
@@ -9532,9 +9547,7 @@ enum QuickFilter: String, CaseIterable, Identifiable, Sendable {
     func matches(_ event: Event) -> Bool {
         switch self {
         case .lastSpots:
-            let total = event.spotsTotal ?? 0
-            let taken = event.attendeeSpotsTaken
-            return event.acceptsRegistrations && total > 0 && Double(taken) / Double(total) > 0.8 && !event.isFull
+            return event.acceptsRegistrations && event.hasLastSpots
         case .weekendAway:
             return event.isLongerThan24Hours
         case .easy:
@@ -9686,9 +9699,7 @@ struct EventCard: View {
     }
     var status: EventStatusStyle { event.cardStatusStyle(registration: registration) }
     var fillPercent: Double {
-        let total = event.spotsTotal ?? 0
-        guard total > 0 else { return 0 }
-        return min(1, Double(event.attendeeSpotsTaken) / Double(total))
+        event.capacityFillRatio
     }
 
     var body: some View {
@@ -9762,21 +9773,24 @@ struct EventCard: View {
                 .foregroundStyle(Brand.mutedForeground)
                 Spacer()
                 if event.shouldShowPublicCapacity {
-                    HStack {
+                    VStack(alignment: .trailing, spacing: 4) {
                         Label("\(event.attendeeSpotsTaken)/\(event.spotsTotal ?? 0) posti", systemImage: "person.2")
-                    }
-                    .font(.caption)
-                    .foregroundStyle(Brand.mutedForeground)
-                    .overlay(alignment: .bottom) {
+                            .font(.caption)
+                            .foregroundStyle(Brand.mutedForeground)
                         GeometryReader { proxy in
                             ZStack(alignment: .leading) {
                                 Capsule().fill(Brand.muted)
-                                Capsule().fill(event.isSoldOut ? Brand.destructive : Brand.success)
+                                Capsule().fill(event.isSoldOut ? Brand.destructive : (event.hasLastSpots ? Brand.destructive : Brand.success))
                                     .frame(width: proxy.size.width * fillPercent)
                             }
                         }
-                        .frame(height: 4)
-                        .offset(y: 9)
+                        .frame(width: 86, height: 4)
+                        if event.hasLastSpots {
+                            Text("Ultimi posti!")
+                                .font(.system(size: 10, weight: .bold, design: .rounded))
+                                .foregroundStyle(Brand.destructive)
+                                .lineLimit(1)
+                        }
                     }
                 }
             }
@@ -9822,6 +9836,19 @@ struct EventCardPillLabel: View {
             .padding(.vertical, 4)
             .background(color, in: Capsule())
             .foregroundStyle(foreground)
+    }
+}
+
+struct LastSpotsCTABadge: View {
+    var body: some View {
+        Text("Ultimi posti!")
+            .font(.system(size: 13, weight: .bold, design: .rounded))
+            .foregroundStyle(.black)
+            .lineLimit(1)
+            .padding(.horizontal, 13)
+            .padding(.vertical, 6)
+            .background(.white, in: Capsule())
+            .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
     }
 }
 
@@ -10836,17 +10863,23 @@ struct EventDetailView: View {
                         .frame(height: 50)
                         .background(event.statusStyle.background, in: RoundedRectangle(cornerRadius: 18))
                 } else {
-                    Button(check.isBlocking ? "Requisiti" : (event.isFull ? "Entra in lista d'attesa" : "Partecipa")) {
-                        if !store.isAuthenticated {
-                            showAuth = true
-                        } else if check.isBlocking || check.hasWarnings {
-                            showAccessWarning = true
-                        } else {
-                            requestApprovalOverride = false
-                            showCheckout = true
+                    VStack(spacing: -8) {
+                        if event.hasLastSpots {
+                            LastSpotsCTABadge()
+                                .zIndex(1)
                         }
+                        Button(check.isBlocking ? "Requisiti" : (event.isFull ? "Entra in lista d'attesa" : "Partecipa")) {
+                            if !store.isAuthenticated {
+                                showAuth = true
+                            } else if check.isBlocking || check.hasWarnings {
+                                showAccessWarning = true
+                            } else {
+                                requestApprovalOverride = false
+                                showCheckout = true
+                            }
+                        }
+                        .buttonStyle(PrimaryButtonStyle(width: 170))
                     }
-                    .buttonStyle(PrimaryButtonStyle(width: 170))
                 }
             }
             .padding(.horizontal, 18)
@@ -11108,6 +11141,10 @@ struct EventPillsRow: View {
         HStack(spacing: 8) {
             if shouldShowStatusPill {
                 CompactEventPill(text: event.statusStyle.label, color: event.statusStyle.background, foreground: event.statusStyle.foreground)
+            }
+
+            if event.hasLastSpots {
+                CompactEventPill(text: "🔥 Ultimi posti", color: Brand.destructive.opacity(0.14), foreground: Brand.destructive)
             }
 
             if let difficulty = event.difficultyLabel {
@@ -35111,7 +35148,7 @@ private extension Event {
             let noun = spotsLeft == 1 ? "posto" : "posti"
             return ("Solo \(spotsLeft) \(noun) rimasti", "info.circle.fill", Brand.destructive)
         }
-        if Double(taken) / Double(total) >= 0.8 {
+        if capacityFillRatio >= EventAvailabilityRules.lastSpotsFillRatio {
             return ("Quasi pieno", "flame.fill", Brand.warning)
         }
         return nil
