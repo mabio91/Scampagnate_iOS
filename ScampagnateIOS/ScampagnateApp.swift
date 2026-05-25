@@ -31103,7 +31103,7 @@ struct ProfileEditSheet: View {
                 .foregroundStyle(Brand.mutedForeground)
                 .fixedSize(horizontal: false, vertical: true)
 
-            HStack(alignment: .top, spacing: 12) {
+            HStack(alignment: .top, spacing: 14) {
                 BirthDatePickerField(
                     "Data di nascita",
                     dateString: $input.birthDate,
@@ -31112,10 +31112,10 @@ struct ProfileEditSheet: View {
                     borderWidth: ProfileSheetFieldStyle.inputBorderWidth,
                     help: "Inserisci la tua data di nascita"
                 )
-                .frame(width: 150)
+                .frame(maxWidth: .infinity)
 
                 ProfileSheetSexField(sex: $input.sex, highlighted: highlightedFocus == .membershipSex)
-                    .frame(width: 106)
+                    .frame(maxWidth: .infinity)
                     .id(ProfileEditInitialFocus.membershipSex)
             }
             HStack(alignment: .top, spacing: 14) {
