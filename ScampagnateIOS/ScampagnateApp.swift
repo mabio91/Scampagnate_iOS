@@ -31078,12 +31078,12 @@ struct ProfileEditSheet: View {
                 BirthDatePickerField(
                     "Data di nascita",
                     dateString: $input.birthDate,
-                    showsClearButton: true,
                     labelFont: ProfileSheetFieldStyle.labelFont,
                     labelSpacing: ProfileSheetFieldStyle.labelSpacing,
-                    borderWidth: ProfileSheetFieldStyle.inputBorderWidth
+                    borderWidth: ProfileSheetFieldStyle.inputBorderWidth,
+                    help: "Inserisci la tua data di nascita"
                 )
-                .layoutPriority(1)
+                .frame(width: 150)
 
                 ProfileSheetSexField(sex: $input.sex)
                     .frame(width: 106)
@@ -34731,6 +34731,7 @@ struct BirthDatePickerField: View {
     let labelFont: Font
     let labelSpacing: CGFloat
     let borderWidth: CGFloat
+    let help: String?
     @State private var pickerDate = defaultBirthDate
     @State private var isPickerPresented = false
 
@@ -34741,7 +34742,8 @@ struct BirthDatePickerField: View {
         showsClearButton: Bool = false,
         labelFont: Font = .subheadline.weight(.semibold),
         labelSpacing: CGFloat = 6,
-        borderWidth: CGFloat = 1
+        borderWidth: CGFloat = 1,
+        help: String? = nil
     ) {
         self.title = title
         self._dateString = dateString
@@ -34750,13 +34752,20 @@ struct BirthDatePickerField: View {
         self.labelFont = labelFont
         self.labelSpacing = labelSpacing
         self.borderWidth = borderWidth
+        self.help = help
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: labelSpacing) {
-            Text(title)
-                .font(labelFont)
-                .foregroundStyle(Brand.foreground)
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(labelFont)
+                    .foregroundStyle(Brand.foreground)
+                    .lineLimit(1)
+                if let help {
+                    InfoTooltipButton(text: help)
+                }
+            }
 
             HStack(spacing: 8) {
                 Button {
