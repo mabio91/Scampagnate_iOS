@@ -1681,12 +1681,9 @@ struct HomeDiscoveryRequest: Identifiable, Equatable, Sendable {
     init(mission: MissionCardModel) {
         let missionCategory = mission.missions?.category?.nilIfBlank
         let action = (mission.missions?.targetAction ?? "").lowercased()
-        let type = (mission.missions?.type ?? "").lowercased()
         let quickFilter: QuickFilter?
         if action == "limited_spots" {
             quickFilter = .lastSpots
-        } else if type == "weekly" {
-            quickFilter = .thisWeek
         } else {
             quickFilter = nil
         }
@@ -9506,46 +9503,46 @@ struct CategoryStrip: View {
 }
 
 enum QuickFilter: String, CaseIterable, Identifiable, Sendable {
-    case featured
     case lastSpots
-    case thisWeek
-    case nextWeek
-    case weekend
+    case weekendAway
+    case easy
+    case intermediate
+    case challenging
 
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .featured: "In evidenza"
         case .lastSpots: "Ultimi posti"
-        case .thisWeek: "Questa settimana"
-        case .nextWeek: "Prossima settimana"
-        case .weekend: "Weekend"
+        case .weekendAway: "Weekend fuori"
+        case .easy: "Facile"
+        case .intermediate: "Intermedio"
+        case .challenging: "Impegnativo"
         }
     }
-    var icon: String {
+    var emoji: String {
         switch self {
-        case .featured: "star"
-        case .lastSpots: "flame"
-        case .thisWeek: "calendar.badge.clock"
-        case .nextWeek: "calendar.badge.plus"
-        case .weekend: "beach.umbrella"
+        case .lastSpots: "🔥"
+        case .weekendAway: "🎒"
+        case .easy: "🌱"
+        case .intermediate: "⛰️"
+        case .challenging: "🧗"
         }
     }
 
     func matches(_ event: Event) -> Bool {
         switch self {
-        case .featured:
-            return event.featured == true
         case .lastSpots:
             let total = event.spotsTotal ?? 0
             let taken = event.attendeeSpotsTaken
             return event.acceptsRegistrations && total > 0 && Double(taken) / Double(total) > 0.8 && !event.isFull
-        case .thisWeek:
-            return event.isThisWeek
-        case .nextWeek:
-            return event.isNextWeek
-        case .weekend:
-            return event.isWeekend
+        case .weekendAway:
+            return event.isLongerThan24Hours
+        case .easy:
+            return event.difficultyLevel.map { $0 == 1 || $0 == 2 } ?? false
+        case .intermediate:
+            return event.difficultyLevel == 3
+        case .challenging:
+            return event.difficultyLevel.map { $0 == 4 || $0 == 5 } ?? false
         }
     }
 }
@@ -9566,8 +9563,8 @@ struct QuickFilterStrip: View {
                         }
                     } label: {
                         HStack(spacing: 4) {
-                            Image(systemName: filter.icon)
-                                .font(.system(size: 13, weight: .semibold))
+                            Text(filter.emoji)
+                                .font(.system(size: 13))
                             Text(filter.title)
                                 .lineLimit(1)
                         }
@@ -35221,6 +35218,36 @@ private extension Event {
         }
     }
 
+    var difficultyLevel: Int? {
+        guard let raw = difficulty?.nilIfBlank?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return nil }
+        if let numeric = Int(raw), (1...5).contains(numeric) {
+            return numeric
+        }
+        if let numericText = raw.firstRegexCapture(#"\b([1-5])(?:\s*/\s*5)?\b"#),
+           let numeric = Int(numericText) {
+            return numeric
+        }
+        return [
+            "beginner": 1,
+            "easy": 1,
+            "facile": 1,
+            "introduzione": 1,
+            "esploratore": 2,
+            "intermedio": 3,
+            "escursionista": 3,
+            "impegnativo": 4,
+            "intrepido": 4,
+            "advanced": 5,
+            "hard": 5,
+            "expert": 5,
+            "avanzato": 5
+        ][raw]
+    }
+
+    var isLongerThan24Hours: Bool {
+        (durationHours ?? 0) > 24
+    }
+
     var isThisWeek: Bool {
         guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return false }
         let calendar = Self.quickFilterCalendar
@@ -35265,8 +35292,8 @@ private extension Event {
 
     var isDemanding: Bool {
         guard let raw = difficulty?.nilIfBlank?.lowercased() else { return false }
-        if let numeric = Int(raw) {
-            return numeric >= 4
+        if let difficultyLevel {
+            return difficultyLevel >= 4
         }
         return ["advanced", "hard", "expert", "difficult"].contains(raw)
     }
@@ -35289,11 +35316,26 @@ private extension Event {
     }
 
     private var durationMinutes: Int? {
-        guard let duration else { return nil }
-        let hours = duration.firstRegexCapture(#"(\d+)\s*h"#).flatMap(Int.init) ?? 0
-        let minutes = duration.firstRegexCapture(#"(\d+)\s*m"#).flatMap(Int.init) ?? 0
-        let total = hours * 60 + minutes
+        guard let durationHours else { return nil }
+        let total = Int((durationHours * 60).rounded())
         return total > 0 ? total : nil
+    }
+
+    private var durationHours: Double? {
+        guard let duration = duration?.nilIfBlank?.lowercased() else { return nil }
+        let days = durationComponent(in: duration, matching: #"(\d+(?:[,.]\d+)?)\s*(?:giorn(?:o|i)?|gg|g|days?|d)\b"#)
+        let hours = durationComponent(in: duration, matching: #"(\d+(?:[,.]\d+)?)\s*(?:h|ore?|hours?)\b"#)
+        let minutes = durationComponent(in: duration, matching: #"(\d+(?:[,.]\d+)?)\s*(?:m|min|mins|minuti?)\b"#)
+        let total = days * 24 + hours + minutes / 60
+        return total > 0 ? total : nil
+    }
+
+    private func durationComponent(in duration: String, matching pattern: String) -> Double {
+        duration
+            .firstRegexCapture(pattern)?
+            .replacingOccurrences(of: ",", with: ".")
+            .nilIfBlank
+            .flatMap(Double.init) ?? 0
     }
 
     private static let managedEventBadgeIds: Set<String> = [
