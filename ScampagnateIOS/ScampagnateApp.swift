@@ -2806,6 +2806,7 @@ struct SupabaseAPI {
         var payload: [String: JSONValue] = [
             "phone": .string(input.phone),
             "birth_date": input.birthDate.isEmpty ? .null : .string(input.birthDate),
+            "sex": input.sex.isEmpty ? .null : .string(input.sex),
             "instagram_handle": normalizedInstagramHandle.map { .string($0) } ?? .null,
             "trekking_experience": .string(input.trekkingExperience),
             "activity_frequency": .string(input.activityFrequency),
@@ -2855,6 +2856,7 @@ struct SupabaseAPI {
             "instagram_handle": normalizedInstagramHandle.map { .string($0) } ?? .null,
             "bio": input.bio.isEmpty ? .null : .string(input.bio),
             "birth_date": input.birthDate.isEmpty ? .null : .string(input.birthDate),
+            "sex": input.sex.isEmpty ? .null : .string(input.sex),
             "birth_place": input.birthPlace.isEmpty ? .null : .string(input.birthPlace),
             "province_of_birth": input.provinceOfBirth.isEmpty ? .null : .string(input.provinceOfBirth.uppercased()),
             "residential_address": input.residentialAddress.isEmpty ? .null : .string(input.residentialAddress),
@@ -3894,6 +3896,7 @@ struct Profile: Codable, Identifiable {
     var healthSafetyHelpNotes: String?
     var healthSafetyUpdatedAt: String?
     var birthDate: String?
+    var sex: String?
     var birthPlace: String?
     var provinceOfBirth: String?
     var residentialAddress: String?
@@ -3928,6 +3931,7 @@ struct Profile: Codable, Identifiable {
     var missingMembershipFieldLabels: [String] {
         var labels: [String] = []
         if birthDate?.nilIfBlank == nil { labels.append("Data di nascita") }
+        if sex != "M" && sex != "F" { labels.append("Sesso anagrafico") }
         if birthPlace?.nilIfBlank == nil { labels.append("Luogo di nascita") }
         if provinceOfBirth?.nilIfBlank == nil { labels.append("Provincia di nascita") }
         if residentialAddress?.nilIfBlank == nil { labels.append("Indirizzo di residenza") }
@@ -6983,6 +6987,7 @@ struct UserConsentRow: Decodable {
 struct OnboardingInput {
     var phone = ""
     var birthDate = ""
+    var sex = ""
     var instagramHandle = ""
     var trekkingExperience = ""
     var selfLevel = ""
@@ -7072,6 +7077,7 @@ struct ProfileEditInput {
     var phone = ""
     var instagramHandle = ""
     var birthDate = ""
+    var sex = ""
     var birthPlace = ""
     var provinceOfBirth = ""
     var residentialAddress = ""
@@ -26384,6 +26390,11 @@ struct ProfileView: View {
                                         ProfileCompletenessCard(profile: profile) {
                                             showEdit = true
                                         }
+                                        if !profile.hasCompleteMembershipProfile {
+                                            MembershipProfileCallout {
+                                                showEdit = true
+                                            }
+                                        }
                                         if profile.healthSafetyStatus != "none" && profile.healthSafetyStatus != "has_info" {
                                             HealthSafetyProfileCallout {
                                                 showHealthSafetyEdit = true
@@ -26660,6 +26671,41 @@ struct HealthSafetyProfileCallout: View {
         .padding(14)
         .background(Brand.secondary.opacity(0.055), in: RoundedRectangle(cornerRadius: 16))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.secondary.opacity(0.18), lineWidth: 1))
+    }
+}
+
+struct MembershipProfileCallout: View {
+    let action: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "person.text.rectangle.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Brand.primary)
+                    .frame(width: 34, height: 34)
+                    .background(Brand.primary.opacity(0.12), in: Circle())
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Completa dati tessera e assicurazione")
+                        .font(.system(.subheadline, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                    Text("Per attivare tessera e copertura assicurativa servono anche sesso anagrafico, nascita e residenza.")
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Button(action: action) {
+                Label("Completa ora", systemImage: "chevron.right")
+                    .labelStyle(.titleAndIcon)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(SecondaryButtonStyle())
+        }
+        .padding(14)
+        .background(Brand.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.primary.opacity(0.18), lineWidth: 1))
     }
 }
 
@@ -30558,6 +30604,7 @@ struct ProfileEditSheet: View {
                 labelSpacing: ProfileSheetFieldStyle.labelSpacing,
                 borderWidth: ProfileSheetFieldStyle.inputBorderWidth
             )
+            ProfileSheetSexField(sex: $input.sex)
             HStack(alignment: .top, spacing: 14) {
                 ProfileSheetField(
                     "Luogo di nascita",
@@ -30648,6 +30695,7 @@ struct ProfileEditSheet: View {
         input.phone != profile.phone ||
         input.instagramHandle != (profile.instagramHandle ?? "") ||
         input.birthDate != (profile.birthDate ?? "") ||
+        input.sex != (profile.sex ?? "") ||
         input.birthPlace != (profile.birthPlace ?? "") ||
         input.provinceOfBirth != (profile.provinceOfBirth ?? "") ||
         input.residentialAddress != (profile.residentialAddress ?? "") ||
@@ -30663,6 +30711,7 @@ struct ProfileEditSheet: View {
             phone: profile.phone,
             instagramHandle: profile.instagramHandle ?? "",
             birthDate: profile.birthDate ?? "",
+            sex: profile.sex ?? "",
             birthPlace: profile.birthPlace ?? "",
             provinceOfBirth: profile.provinceOfBirth ?? "",
             residentialAddress: profile.residentialAddress ?? "",
@@ -30688,6 +30737,11 @@ struct ProfileEditSheet: View {
         let hasBirthData = !input.birthDate.isEmpty || !input.birthPlace.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !input.provinceOfBirth.isEmpty
         if hasBirthData, input.provinceOfBirth.count != 2 {
             store.errorMessage = "Inserisci la provincia di nascita con due lettere maiuscole."
+            return false
+        }
+
+        if !input.sex.isEmpty && input.sex != "M" && input.sex != "F" {
+            store.errorMessage = "Seleziona M o F per il sesso anagrafico."
             return false
         }
 
@@ -31422,6 +31476,39 @@ struct ProfileSheetField: View {
     }
 }
 
+struct ProfileSheetSexField: View {
+    @Binding var sex: String
+    private let options = ["M", "F"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: ProfileSheetFieldStyle.labelSpacing) {
+            HStack(spacing: 6) {
+                ProfileSheetInputLabel("Sesso anagrafico")
+                InfoTooltipButton(text: "Richiesto come valore M/F per tessera associativa e copertura assicurativa.")
+            }
+            HStack(spacing: 8) {
+                ForEach(options, id: \.self) { option in
+                    Button {
+                        sex = option
+                    } label: {
+                        Text(option)
+                            .font(.body.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: ProfileSheetFieldStyle.inputHeight)
+                            .background(sex == option ? Brand.primary : Brand.inputBackground, in: RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius))
+                            .foregroundStyle(sex == option ? .white : Brand.inputForeground)
+                            .overlay(RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius).stroke(sex == option ? Brand.primary : Brand.inputBorder, lineWidth: ProfileSheetFieldStyle.inputBorderWidth))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Sesso \(option)")
+                    .accessibilityAddTraits(sex == option ? .isSelected : [])
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 struct ProfileSheetTextArea: View {
     let title: String
     let placeholder: String
@@ -31824,9 +31911,11 @@ struct OnboardingView: View {
                     dateString: $input.birthDate
                 )
 
+                OnboardingSexField(sex: $input.sex)
+
                 OnboardingInfoBox(
                     title: "Usiamo questi dati solo quando serve",
-                    text: "Il numero di telefono serve solo per comunicazioni legate agli eventi. La data di nascita è visibile solo agli organizzatori per motivi di sicurezza e assicurazione."
+                    text: "Telefono, data di nascita e sesso anagrafico sono visibili solo allo staff quando servono per eventi, tessera e assicurazione."
                 )
             }
         }
@@ -31992,7 +32081,7 @@ struct OnboardingView: View {
 
     private var canContinue: Bool {
         switch step {
-        case 1: return Self.isValidPhone(input.phone) && !input.birthDate.isEmpty && OnboardingInput.isValidInstagramHandle(input.normalizedInstagramHandle)
+        case 1: return Self.isValidPhone(input.phone) && !input.birthDate.isEmpty && (input.sex == "M" || input.sex == "F") && OnboardingInput.isValidInstagramHandle(input.normalizedInstagramHandle)
         case 2: return !input.trekkingExperience.isEmpty && !input.selfLevel.isEmpty && !input.activityFrequency.isEmpty
         case 3: return input.healthSafetyIsValid
         default: return (2...4).contains(input.interests.count) && !input.motivation.isEmpty
@@ -32139,6 +32228,7 @@ struct OnboardingView: View {
         guard !didPrefill, let profile = store.profile else { return }
         input.phone = profile.phone
         input.birthDate = profile.birthDate ?? ""
+        input.sex = profile.sex ?? ""
         input.instagramHandle = profile.instagramHandle ?? ""
         input.trekkingExperience = profile.trekkingExperience ?? ""
         input.selfLevel = profile.selfLevel ?? ""
@@ -32451,6 +32541,35 @@ struct OnboardingBirthDateField: View {
 
     private static var defaultBirthDate: Date {
         Calendar(identifier: .gregorian).date(byAdding: .year, value: -25, to: Date()) ?? Date()
+    }
+}
+
+struct OnboardingSexField: View {
+    @Binding var sex: String
+    private let options = ["M", "F"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            OnboardingFieldLabel(title: "Sesso anagrafico", required: true)
+            HStack(spacing: 8) {
+                ForEach(options, id: \.self) { option in
+                    Button {
+                        sex = option
+                    } label: {
+                        Text(option)
+                            .font(.body.weight(.semibold))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 54)
+                            .background(sex == option ? Brand.primary : Brand.inputBackground, in: RoundedRectangle(cornerRadius: 14))
+                            .foregroundStyle(sex == option ? .white : Brand.inputForeground)
+                            .overlay(RoundedRectangle(cornerRadius: 14).stroke(sex == option ? Brand.primary : Brand.inputBorder, lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Sesso \(option)")
+                    .accessibilityAddTraits(sex == option ? .isSelected : [])
+                }
+            }
+        }
     }
 }
 
