@@ -92,6 +92,9 @@
 					010000000000000000000011 = {
 						CreatedOnToolsVersion = 26.4.1;
 						SystemCapabilities = {
+							com.apple.SafariKeychain = {
+								enabled = 1;
+							};
 							com.apple.Push = {
 								enabled = 1;
 							};
