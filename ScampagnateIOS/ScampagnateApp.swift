@@ -23061,6 +23061,16 @@ struct OrganizerEventTimePickerField: View {
 
 private struct OrganizerRichTextEditor: View {
     @Binding var html: String
+    @State private var showingEditor = false
+    @State private var previewHeight: CGFloat = 1
+
+    private var cleanHTML: String {
+        EventDescriptionHTML.cleanStoredHTML(from: html)
+    }
+
+    private var hasContent: Bool {
+        cleanHTML.htmlPlainText.nilIfBlank != nil || cleanHTML.contains("<img")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -23068,25 +23078,615 @@ private struct OrganizerRichTextEditor: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(Brand.foreground)
 
-            ZStack(alignment: .topLeading) {
-                OrganizerRichTextTextView(html: $html)
-                    .frame(maxWidth: .infinity, minHeight: 230, alignment: .leading)
-                    .padding(10)
+            Button {
+                dismissKeyboard()
+                showingEditor = true
+            } label: {
+                VStack(alignment: .leading, spacing: 12) {
+                    if hasContent {
+                        ZStack(alignment: .bottom) {
+                            EventDescriptionHTMLView(html: cleanHTML, height: $previewHeight)
+                                .frame(height: min(max(previewHeight, 92), 240))
+                                .clipped()
+                                .allowsHitTesting(false)
 
-                if html.htmlPlainText.nilIfBlank == nil {
-                    Text("Inizia a scrivere...")
-                        .font(.body)
-                        .foregroundStyle(Brand.inputMutedForeground)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 10)
-                        .allowsHitTesting(false)
+                            if previewHeight > 240 {
+                                LinearGradient(
+                                    colors: [Brand.inputBackground.opacity(0), Brand.inputBackground],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                                .frame(height: 44)
+                            }
+                        }
+                    } else {
+                        Text("Inizia a scrivere...")
+                            .font(.body)
+                            .foregroundStyle(Brand.inputMutedForeground)
+                            .frame(maxWidth: .infinity, minHeight: 112, alignment: .topLeading)
+                    }
+
+                    HStack(spacing: 8) {
+                        Image(systemName: "textformat")
+                            .font(.subheadline.weight(.semibold))
+                        Text(hasContent ? "Modifica descrizione formattata" : "Aggiungi descrizione formattata")
+                            .font(.subheadline.weight(.bold))
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.bold))
+                    }
+                    .foregroundStyle(Brand.primary)
                 }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .buttonStyle(.plain)
             .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 14))
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.inputBorder, lineWidth: 1))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .fullScreenCover(isPresented: $showingEditor) {
+            OrganizerRichTextEditorSheet(html: $html)
+        }
+    }
+}
+
+private struct OrganizerRichTextEditorSheet: View {
+    @Binding var html: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var draftHTML: String
+
+    init(html: Binding<String>) {
+        self._html = html
+        self._draftHTML = State(initialValue: EventDescriptionHTML.cleanStoredHTML(from: html.wrappedValue))
+    }
+
+    var body: some View {
+        NavigationStack {
+            OrganizerWebRichTextEditor(html: $draftHTML)
+                .background(Brand.inputBackground)
+                .navigationTitle("Descrizione")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Annulla") {
+                            dismiss()
+                        }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Fine") {
+                            html = EventDescriptionHTML.cleanStoredHTML(from: draftHTML)
+                            dismiss()
+                        }
+                        .fontWeight(.semibold)
+                    }
+                }
+        }
+        .presentationBackground(Brand.background)
+    }
+}
+
+private struct OrganizerWebRichTextEditor: UIViewRepresentable {
+    @Binding var html: String
+
+    func makeUIView(context: Context) -> WKWebView {
+        let userContentController = WKUserContentController()
+        userContentController.add(context.coordinator, name: "editorBridge")
+
+        let configuration = WKWebViewConfiguration()
+        configuration.userContentController = userContentController
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
+        webView.isOpaque = false
+        webView.backgroundColor = .clear
+        webView.scrollView.backgroundColor = .clear
+        webView.scrollView.keyboardDismissMode = .interactive
+        webView.scrollView.alwaysBounceVertical = true
+        context.coordinator.webView = webView
+        context.coordinator.latestHTML = EventDescriptionHTML.cleanStoredHTML(from: html)
+        webView.loadHTMLString(Self.editorDocument(initialHTML: context.coordinator.latestHTML), baseURL: nil)
+        return webView
+    }
+
+    func updateUIView(_ webView: WKWebView, context: Context) {
+        let cleanHTML = EventDescriptionHTML.cleanStoredHTML(from: html)
+        guard !context.coordinator.isUpdatingFromWeb,
+              cleanHTML != context.coordinator.latestHTML else {
+            return
+        }
+        context.coordinator.latestHTML = cleanHTML
+        context.coordinator.setHTML(cleanHTML)
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(html: $html)
+    }
+
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
+        uiView.configuration.userContentController.removeScriptMessageHandler(forName: "editorBridge")
+        coordinator.webView = nil
+    }
+
+    private static func editorDocument(initialHTML: String) -> String {
+        let initialHTMLBase64 = Data(initialHTML.utf8).base64EncodedString()
+        return #"""
+        <!doctype html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+        <style>
+        :root { color-scheme: light dark; }
+        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        html, body {
+          margin: 0;
+          padding: 0;
+          min-height: 100%;
+          background: transparent;
+          color: #15281F;
+          font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+          -webkit-font-smoothing: antialiased;
+        }
+        body { overflow: hidden; }
+        .shell {
+          display: flex;
+          flex-direction: column;
+          min-height: 100vh;
+          background: #FFFFFF;
+        }
+        .toolbar {
+          position: sticky;
+          top: 0;
+          z-index: 5;
+          display: flex;
+          gap: 6px;
+          flex-wrap: wrap;
+          padding: 10px 12px;
+          background: rgba(246, 244, 239, 0.98);
+          border-bottom: 1px solid #DAD5C9;
+          backdrop-filter: blur(16px);
+          -webkit-backdrop-filter: blur(16px);
+        }
+        .tool {
+          appearance: none;
+          border: 1px solid #DAD5C9;
+          border-radius: 10px;
+          min-width: 34px;
+          height: 34px;
+          padding: 0 9px;
+          color: #15281F;
+          background: #FFFFFF;
+          font: 700 14px/1 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+        }
+        .tool.icon {
+          width: 34px;
+          padding: 0;
+          font-size: 15px;
+        }
+        .tool.active {
+          color: #224E38;
+          border-color: rgba(34, 78, 56, 0.42);
+          background: rgba(34, 78, 56, 0.13);
+        }
+        .divider {
+          width: 1px;
+          height: 34px;
+          margin: 0 2px;
+          background: #DAD5C9;
+        }
+        .editor-wrap {
+          flex: 1;
+          overflow: auto;
+          -webkit-overflow-scrolling: touch;
+        }
+        #editor {
+          min-height: calc(100vh - 58px);
+          padding: 18px 18px 48vh;
+          outline: none;
+          color: #15281F;
+          font-size: 16px;
+          line-height: 1.55;
+          overflow-wrap: anywhere;
+        }
+        #editor[data-empty="true"]::before {
+          content: attr(data-placeholder);
+          color: #657064;
+          pointer-events: none;
+          position: absolute;
+        }
+        h1 {
+          font-size: 26px;
+          font-weight: 800;
+          line-height: 1.16;
+          margin: 28px 0 14px;
+        }
+        h2 {
+          font-size: 22px;
+          font-weight: 800;
+          line-height: 1.22;
+          margin: 26px 0 12px;
+        }
+        h3 {
+          font-size: 18px;
+          font-weight: 760;
+          line-height: 1.32;
+          margin: 22px 0 8px;
+        }
+        p {
+          margin: 0 0 14px;
+          line-height: 1.55;
+        }
+        ul, ol {
+          margin: 8px 0 18px;
+          padding-left: 24px;
+        }
+        li {
+          margin: 0 0 8px;
+          padding-left: 2px;
+        }
+        blockquote {
+          margin: 18px 0;
+          padding: 4px 0 4px 16px;
+          border-left: 3px solid #DAD5C9;
+          color: #657064;
+        }
+        strong, b { font-weight: 800; }
+        em, i { font-style: italic; }
+        a {
+          color: #224E38;
+          font-weight: 700;
+          text-decoration-thickness: 1px;
+          text-underline-offset: 3px;
+        }
+        img {
+          display: block;
+          max-width: 100%;
+          height: auto;
+          border-radius: 16px;
+          margin: 18px 0;
+        }
+        h1:first-child, h2:first-child, h3:first-child, p:first-child, ul:first-child, ol:first-child, blockquote:first-child, img:first-child { margin-top: 0; }
+        @media (prefers-color-scheme: dark) {
+          .shell { background: #1E2823; }
+          body, #editor, .tool { color: #EBE7E0; }
+          .toolbar { background: rgba(26, 36, 31, 0.98); border-bottom-color: #39473F; }
+          .tool { background: #24312A; border-color: #39473F; }
+          .tool.active { color: #64B48C; border-color: rgba(100, 180, 140, 0.46); background: rgba(100, 180, 140, 0.16); }
+          .divider { background: #39473F; }
+          a { color: #64B48C; }
+          blockquote { color: #B8B0A4; border-left-color: #47443F; }
+          #editor[data-empty="true"]::before { color: #B8B0A4; }
+        }
+        </style>
+        </head>
+        <body>
+          <div class="shell">
+            <div class="toolbar" id="toolbar" aria-label="Toolbar editor">
+              <button type="button" class="tool icon" data-command="bold" title="Grassetto"><b>B</b></button>
+              <button type="button" class="tool icon" data-command="italic" title="Corsivo"><i>I</i></button>
+              <button type="button" class="tool icon" data-command="underline" title="Sottolineato"><u>U</u></button>
+              <button type="button" class="tool icon" data-command="strikeThrough" title="Barrato"><s>S</s></button>
+              <span class="divider"></span>
+              <button type="button" class="tool" data-command="formatBlock" data-value="p" title="Paragrafo">P</button>
+              <button type="button" class="tool" data-command="formatBlock" data-value="h1" title="Titolo 1">H1</button>
+              <button type="button" class="tool" data-command="formatBlock" data-value="h2" title="Titolo 2">H2</button>
+              <button type="button" class="tool" data-command="formatBlock" data-value="h3" title="Titolo 3">H3</button>
+              <span class="divider"></span>
+              <button type="button" class="tool icon" data-command="insertUnorderedList" title="Elenco puntato">•</button>
+              <button type="button" class="tool icon" data-command="insertOrderedList" title="Elenco numerato">1.</button>
+              <span class="divider"></span>
+              <button type="button" class="tool icon" data-command="createLink" title="Inserisci link">↗</button>
+              <button type="button" class="tool icon" data-command="insertImage" title="Inserisci immagine">▧</button>
+              <span class="divider"></span>
+              <button type="button" class="tool icon" data-command="undo" title="Annulla">↶</button>
+              <button type="button" class="tool icon" data-command="redo" title="Ripristina">↷</button>
+            </div>
+            <div class="editor-wrap">
+              <main id="editor" contenteditable="true" spellcheck="true" autocapitalize="sentences" data-placeholder="Inizia a scrivere..."></main>
+            </div>
+          </div>
+        <script>
+        (() => {
+          const bridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.editorBridge;
+          const editor = document.getElementById('editor');
+          const toolbar = document.getElementById('toolbar');
+          const initialHTMLBase64 = "\#(initialHTMLBase64)";
+          let lastRange = null;
+          let suppressPost = false;
+          let touchClickGuardMs = 450;
+          let formatBlocks = ['p', 'h1', 'h2', 'h3'];
+          let handledTouchEvents = new WeakMap();
+
+          function decodeBase64(value) {
+            if (!value) return '';
+            const binary = atob(value);
+            const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+            return new TextDecoder('utf-8').decode(bytes);
+          }
+
+          function post(message) {
+            if (bridge) bridge.postMessage(message);
+          }
+
+          function selectionInsideEditor() {
+            const selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0) return false;
+            const node = selection.anchorNode;
+            return !!node && (node === editor || editor.contains(node));
+          }
+
+          function saveSelection() {
+            const selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0 || !selectionInsideEditor()) return;
+            lastRange = selection.getRangeAt(0).cloneRange();
+            updateToolbarState();
+          }
+
+          function restoreSelection() {
+            editor.focus({ preventScroll: true });
+            if (!lastRange) return;
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(lastRange);
+          }
+
+          function normalizeURL(raw, imageOnly = false) {
+            let value = (raw || '').trim();
+            if (!value) return '';
+            if (!/^(https?:\/\/|mailto:)/i.test(value)) {
+              value = imageOnly ? `https://${value}` : `https://${value}`;
+            }
+            if (imageOnly && !/^https?:\/\//i.test(value)) return '';
+            return value;
+          }
+
+          function escapeAttribute(value) {
+            return value
+              .replaceAll('&', '&amp;')
+              .replaceAll('"', '&quot;')
+              .replaceAll('<', '&lt;')
+              .replaceAll('>', '&gt;');
+          }
+
+          function selectedText() {
+            const selection = window.getSelection();
+            return selection ? selection.toString().trim() : '';
+          }
+
+          function runCommand(command, value) {
+            restoreSelection();
+            if (command === 'createLink') {
+              const url = normalizeURL(window.prompt("Inserisci l'URL", 'https://'));
+              if (!url) return;
+              if (!selectedText()) {
+                const label = window.prompt('Testo del link', url.replace(/^https?:\/\//i, '')) || url;
+                document.execCommand('insertHTML', false, `<a href="${escapeAttribute(url)}">${escapeAttribute(label)}</a>`);
+              } else {
+                document.execCommand('createLink', false, url);
+              }
+            } else if (command === 'insertImage') {
+              const url = normalizeURL(window.prompt("Inserisci l'URL dell'immagine", 'https://'), true);
+              if (!url) return;
+              document.execCommand('insertHTML', false, `<p><img src="${escapeAttribute(url)}"></p><p><br></p>`);
+            } else if (command === 'formatBlock') {
+              document.execCommand('formatBlock', false, formatBlocks.includes(value) ? value : 'p');
+            } else {
+              document.execCommand(command, false, value || null);
+            }
+            saveSelection();
+            postContent();
+          }
+
+          function setHTML(html) {
+            suppressPost = true;
+            editor.innerHTML = html || '';
+            togglePlaceholder();
+            suppressPost = false;
+            updateToolbarState();
+          }
+
+          function getBlockTag() {
+            const selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0) return 'p';
+            let node = selection.anchorNode;
+            if (node && node.nodeType === Node.TEXT_NODE) node = node.parentElement;
+            while (node && node !== editor) {
+              const tag = node.tagName ? node.tagName.toLowerCase() : '';
+              if (['p', 'h1', 'h2', 'h3', 'li', 'blockquote'].includes(tag)) return tag;
+              node = node.parentElement;
+            }
+            return 'p';
+          }
+
+          function setActive(command, active, value) {
+            const selector = value ? `[data-command="${command}"][data-value="${value}"]` : `[data-command="${command}"]`;
+            const button = toolbar.querySelector(selector);
+            if (button) button.classList.toggle('active', !!active);
+          }
+
+          function updateToolbarState() {
+            setActive('bold', document.queryCommandState('bold'));
+            setActive('italic', document.queryCommandState('italic'));
+            setActive('underline', document.queryCommandState('underline'));
+            setActive('strikeThrough', document.queryCommandState('strikeThrough'));
+            setActive('insertUnorderedList', document.queryCommandState('insertUnorderedList'));
+            setActive('insertOrderedList', document.queryCommandState('insertOrderedList'));
+            const block = getBlockTag();
+            ['p', 'h1', 'h2', 'h3'].forEach(tag => setActive('formatBlock', block === tag, tag));
+          }
+
+          function togglePlaceholder() {
+            const text = editor.innerText.replace(/\u00a0/g, ' ').trim();
+            const hasImage = !!editor.querySelector('img');
+            editor.dataset.empty = (!text && !hasImage) ? 'true' : 'false';
+          }
+
+          function postContent() {
+            if (suppressPost) return;
+            togglePlaceholder();
+            updateToolbarState();
+            post({ type: 'content', html: editor.innerHTML });
+          }
+
+          function handleToolbarAction(button, event) {
+            event.preventDefault();
+            const now = Date.now();
+            if (event.type === 'touchend') {
+              handledTouchEvents.set(button, now);
+            } else if (event.type === 'click' && now - (handledTouchEvents.get(button) || 0) < touchClickGuardMs) {
+              return;
+            }
+            runCommand(button.dataset.command, button.dataset.value || null);
+          }
+
+          document.execCommand('defaultParagraphSeparator', false, 'p');
+          setHTML(decodeBase64(initialHTMLBase64));
+          togglePlaceholder();
+
+          editor.addEventListener('input', postContent);
+          editor.addEventListener('keyup', () => { saveSelection(); postContent(); });
+          editor.addEventListener('mouseup', saveSelection);
+          editor.addEventListener('touchend', () => setTimeout(saveSelection, 0));
+          editor.addEventListener('focus', saveSelection);
+          document.addEventListener('selectionchange', saveSelection);
+
+          toolbar.querySelectorAll('button[data-command]').forEach(button => {
+            button.addEventListener('mousedown', event => event.preventDefault());
+            button.addEventListener('touchstart', event => event.preventDefault(), { passive: false });
+            button.addEventListener('touchend', event => handleToolbarAction(button, event), { passive: false });
+            button.addEventListener('click', event => handleToolbarAction(button, event));
+          });
+
+          window.ScampagnateRichTextEditor = {
+            setHTML,
+            focus: () => editor.focus()
+          };
+
+          post({ type: 'ready', html: editor.innerHTML });
+          setTimeout(() => editor.focus(), 120);
+        })();
+        </script>
+        </body>
+        </html>
+        """#
+    }
+
+    private static func javaScriptArgument(_ value: String) -> String {
+        guard let data = try? JSONEncoder().encode(value),
+              let string = String(data: data, encoding: .utf8) else {
+            return "\"\""
+        }
+        return string
+    }
+
+    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
+        @Binding private var html: String
+        weak var webView: WKWebView?
+        var latestHTML = ""
+        var isUpdatingFromWeb = false
+        private var ready = false
+        private var pendingHTML: String?
+
+        init(html: Binding<String>) {
+            self._html = html
+        }
+
+        func setHTML(_ html: String) {
+            guard ready, let webView else {
+                pendingHTML = html
+                return
+            }
+            let argument = OrganizerWebRichTextEditor.javaScriptArgument(html)
+            webView.evaluateJavaScript("window.ScampagnateRichTextEditor && window.ScampagnateRichTextEditor.setHTML(\(argument));")
+        }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            DispatchQueue.main.async { [weak self] in
+                self?.handleMessage(message.body)
+            }
+        }
+
+        private func handleMessage(_ body: Any) {
+            guard let payload = body as? [String: Any],
+                  let type = payload["type"] as? String else {
+                return
+            }
+
+            if type == "ready" {
+                ready = true
+                if let rawHTML = payload["html"] as? String {
+                    latestHTML = EventDescriptionHTML.cleanStoredHTML(from: rawHTML)
+                }
+                if let pendingHTML {
+                    self.pendingHTML = nil
+                    setHTML(pendingHTML)
+                }
+                return
+            }
+
+            guard type == "content", let rawHTML = payload["html"] as? String else {
+                return
+            }
+
+            let cleanHTML = EventDescriptionHTML.cleanStoredHTML(from: rawHTML)
+            latestHTML = cleanHTML
+            guard html != cleanHTML else { return }
+            isUpdatingFromWeb = true
+            html = cleanHTML
+            DispatchQueue.main.async { [weak self] in
+                self?.isUpdatingFromWeb = false
+            }
+        }
+
+        @MainActor
+        func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping @MainActor @Sendable (String?) -> Void) {
+            guard let presenter = UIApplication.shared.scampagnateTopViewController else {
+                completionHandler(nil)
+                return
+            }
+
+            let alert = UIAlertController(title: prompt, message: nil, preferredStyle: .alert)
+            alert.addTextField { textField in
+                textField.text = defaultText
+                textField.keyboardType = .URL
+                textField.autocapitalizationType = .none
+                textField.autocorrectionType = .no
+            }
+            alert.addAction(UIAlertAction(title: "Annulla", style: .cancel) { _ in
+                Task { @MainActor in
+                    completionHandler(nil)
+                }
+            })
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+                Task { @MainActor in
+                    completionHandler(alert.textFields?.first?.text)
+                }
+            })
+            presenter.present(alert, animated: true)
+        }
+    }
+}
+
+private extension UIApplication {
+    var scampagnateTopViewController: UIViewController? {
+        let keyWindow = connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .first { $0.isKeyWindow }
+        var controller = keyWindow?.rootViewController
+        while let presented = controller?.presentedViewController {
+            controller = presented
+        }
+        if let navigation = controller as? UINavigationController {
+            return navigation.visibleViewController ?? navigation
+        }
+        if let tab = controller as? UITabBarController {
+            return tab.selectedViewController ?? tab
+        }
+        return controller
     }
 }
 
