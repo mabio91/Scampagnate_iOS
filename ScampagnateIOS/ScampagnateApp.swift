@@ -23143,7 +23143,7 @@ private struct OrganizerRichTextEditorSheet: View {
 
     var body: some View {
         NavigationStack {
-            OrganizerWebRichTextEditor(html: $draftHTML)
+            OrganizerRichTextTextView(html: $draftHTML)
                 .background(Brand.inputBackground)
                 .navigationTitle("Descrizione")
                 .navigationBarTitleDisplayMode(.inline)
@@ -23705,13 +23705,126 @@ private extension UIApplication {
     }
 }
 
-private struct OrganizerRichTextTextView: UIViewRepresentable {
-    @Binding var html: String
+private enum OrganizerRichTextNativeCommand: String, CaseIterable {
+    case bold
+    case italic
+    case underline
+    case strikethrough
+    case paragraph
+    case heading1
+    case heading2
+    case heading3
+    case bulletList
+    case orderedList
+    case link
+    case undo
+    case redo
 
-    func makeUIView(context: Context) -> UITextView {
-        let textView = UITextView()
-        textView.delegate = context.coordinator
-        textView.backgroundColor = .clear
+    var accessibilityLabel: String {
+        switch self {
+        case .bold: "Grassetto"
+        case .italic: "Corsivo"
+        case .underline: "Sottolineato"
+        case .strikethrough: "Barrato"
+        case .paragraph: "Paragrafo"
+        case .heading1: "Titolo 1"
+        case .heading2: "Titolo 2"
+        case .heading3: "Titolo 3"
+        case .bulletList: "Elenco puntato"
+        case .orderedList: "Elenco numerato"
+        case .link: "Inserisci link"
+        case .undo: "Annulla"
+        case .redo: "Ripristina"
+        }
+    }
+}
+
+private final class OrganizerRichTextUIKitEditorView: UIView {
+    let textView = UITextView()
+
+    private let toolbarScrollView = UIScrollView()
+    private let toolbarStack = UIStackView()
+    private var buttons: [OrganizerRichTextNativeCommand: UIButton] = [:]
+    private var activeCommands: Set<OrganizerRichTextNativeCommand> = []
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        setup()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+
+    func configureToolbar(target: Any, action: Selector) {
+        guard toolbarStack.arrangedSubviews.isEmpty else { return }
+        addButton(title: "B", command: .bold, target: target, action: action)
+        addButton(title: "I", command: .italic, target: target, action: action)
+        addButton(title: "U", command: .underline, target: target, action: action)
+        addButton(title: "S", command: .strikethrough, target: target, action: action)
+        addDivider()
+        addButton(title: "P", command: .paragraph, target: target, action: action)
+        addButton(title: "H1", command: .heading1, target: target, action: action)
+        addButton(title: "H2", command: .heading2, target: target, action: action)
+        addButton(title: "H3", command: .heading3, target: target, action: action)
+        addDivider()
+        addButton(title: "•", command: .bulletList, target: target, action: action)
+        addButton(title: "1.", command: .orderedList, target: target, action: action)
+        addDivider()
+        addButton(systemImage: "link", command: .link, target: target, action: action)
+        addDivider()
+        addButton(systemImage: "arrow.uturn.backward", command: .undo, target: target, action: action)
+        addButton(systemImage: "arrow.uturn.forward", command: .redo, target: target, action: action)
+        applyPalette()
+    }
+
+    func setActive(_ active: Bool, for command: OrganizerRichTextNativeCommand) {
+        if active {
+            activeCommands.insert(command)
+        } else {
+            activeCommands.remove(command)
+        }
+        style(buttons[command], active: active)
+    }
+
+    func setEnabled(_ enabled: Bool, for command: OrganizerRichTextNativeCommand) {
+        buttons[command]?.isEnabled = enabled
+        buttons[command]?.alpha = enabled ? 1 : 0.42
+    }
+
+    func applyPalette() {
+        backgroundColor = UIColor(Brand.inputBackground)
+        toolbarScrollView.backgroundColor = UIColor(Brand.background)
+        textView.backgroundColor = UIColor(Brand.inputBackground)
+        textView.textColor = UIColor(Brand.inputForeground)
+        textView.tintColor = UIColor(Brand.primary)
+        textView.linkTextAttributes = [
+            .foregroundColor: UIColor(Brand.primary),
+            .underlineStyle: NSUnderlineStyle.single.rawValue
+        ]
+        for (command, button) in buttons {
+            style(button, active: activeCommands.contains(command))
+        }
+    }
+
+    private func setup() {
+        autoresizingMask = [.flexibleWidth, .flexibleHeight]
+
+        toolbarScrollView.translatesAutoresizingMaskIntoConstraints = false
+        toolbarScrollView.alwaysBounceHorizontal = true
+        toolbarScrollView.showsHorizontalScrollIndicator = false
+        toolbarScrollView.backgroundColor = UIColor(Brand.background)
+
+        toolbarStack.translatesAutoresizingMaskIntoConstraints = false
+        toolbarStack.axis = .horizontal
+        toolbarStack.alignment = .center
+        toolbarStack.spacing = 6
+        toolbarStack.isLayoutMarginsRelativeArrangement = true
+        toolbarStack.directionalLayoutMargins = NSDirectionalEdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12)
+
+        textView.translatesAutoresizingMaskIntoConstraints = false
+        textView.backgroundColor = UIColor(Brand.inputBackground)
         textView.isOpaque = false
         textView.isEditable = true
         textView.isSelectable = true
@@ -23719,27 +23832,112 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
         textView.keyboardDismissMode = .interactive
         textView.alwaysBounceVertical = true
         textView.showsHorizontalScrollIndicator = false
-        textView.contentInset = .zero
-        textView.textContainerInset = .zero
+        textView.contentInsetAdjustmentBehavior = .automatic
+        textView.textContainerInset = UIEdgeInsets(top: 18, left: 18, bottom: 280, right: 18)
         textView.textContainer.lineFragmentPadding = 0
         textView.font = .systemFont(ofSize: 16)
         textView.textColor = UIColor(Brand.inputForeground)
         textView.tintColor = UIColor(Brand.primary)
         textView.typingAttributes = EventDescriptionHTML.editorTypingAttributes()
-        context.coordinator.apply(html, to: textView)
-        return textView
+        textView.autocapitalizationType = .sentences
+        textView.autocorrectionType = .default
+        textView.smartDashesType = .default
+        textView.smartQuotesType = .default
+
+        addSubview(toolbarScrollView)
+        toolbarScrollView.addSubview(toolbarStack)
+        addSubview(textView)
+
+        NSLayoutConstraint.activate([
+            toolbarScrollView.topAnchor.constraint(equalTo: topAnchor),
+            toolbarScrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            toolbarScrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            toolbarScrollView.heightAnchor.constraint(equalToConstant: 58),
+
+            toolbarStack.topAnchor.constraint(equalTo: toolbarScrollView.contentLayoutGuide.topAnchor),
+            toolbarStack.leadingAnchor.constraint(equalTo: toolbarScrollView.contentLayoutGuide.leadingAnchor),
+            toolbarStack.trailingAnchor.constraint(equalTo: toolbarScrollView.contentLayoutGuide.trailingAnchor),
+            toolbarStack.bottomAnchor.constraint(equalTo: toolbarScrollView.contentLayoutGuide.bottomAnchor),
+            toolbarStack.heightAnchor.constraint(equalTo: toolbarScrollView.frameLayoutGuide.heightAnchor),
+
+            textView.topAnchor.constraint(equalTo: toolbarScrollView.bottomAnchor),
+            textView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            textView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            textView.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+
+        applyPalette()
     }
 
-    func updateUIView(_ textView: UITextView, context: Context) {
+    private func addButton(title: String? = nil, systemImage: String? = nil, command: OrganizerRichTextNativeCommand, target: Any, action: Selector) {
+        let button = UIButton(type: .system)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.accessibilityIdentifier = command.rawValue
+        button.accessibilityLabel = command.accessibilityLabel
+        button.layer.cornerRadius = 10
+        button.layer.borderWidth = 1
+        button.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
+        if let title {
+            button.setTitle(title, for: .normal)
+        } else if let systemImage {
+            let configuration = UIImage.SymbolConfiguration(pointSize: 15, weight: .bold)
+            button.setImage(UIImage(systemName: systemImage, withConfiguration: configuration), for: .normal)
+        }
+        button.addTarget(target, action: action, for: .touchUpInside)
+        NSLayoutConstraint.activate([
+            button.heightAnchor.constraint(equalToConstant: 34),
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: 34)
+        ])
+        buttons[command] = button
+        toolbarStack.addArrangedSubview(button)
+    }
+
+    private func addDivider() {
+        let divider = UIView()
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        divider.backgroundColor = UIColor(Brand.inputBorder)
+        NSLayoutConstraint.activate([
+            divider.widthAnchor.constraint(equalToConstant: 1),
+            divider.heightAnchor.constraint(equalToConstant: 32)
+        ])
+        toolbarStack.addArrangedSubview(divider)
+    }
+
+    private func style(_ button: UIButton?, active: Bool) {
+        guard let button else { return }
+        button.layer.borderColor = active ? UIColor(Brand.primary).withAlphaComponent(0.42).cgColor : UIColor(Brand.inputBorder).cgColor
+        button.backgroundColor = active ? UIColor(Brand.primary).withAlphaComponent(0.13) : UIColor(Brand.inputBackground)
+        button.tintColor = active ? UIColor(Brand.primary) : UIColor(Brand.inputForeground)
+        button.setTitleColor(active ? UIColor(Brand.primary) : UIColor(Brand.inputForeground), for: .normal)
+    }
+}
+
+private struct OrganizerRichTextTextView: UIViewRepresentable {
+    @Binding var html: String
+
+    func makeUIView(context: Context) -> OrganizerRichTextUIKitEditorView {
+        let editorView = OrganizerRichTextUIKitEditorView()
+        editorView.configureToolbar(target: context.coordinator, action: #selector(Coordinator.toolbarButtonTapped(_:)))
+        editorView.textView.delegate = context.coordinator
+        context.coordinator.editorView = editorView
+        context.coordinator.apply(html, to: editorView.textView)
+        return editorView
+    }
+
+    func updateUIView(_ editorView: OrganizerRichTextUIKitEditorView, context: Context) {
         let cleanHTML = EventDescriptionHTML.cleanStoredHTML(from: html)
-        textView.textColor = UIColor(Brand.inputForeground)
-        textView.tintColor = UIColor(Brand.primary)
-        textView.typingAttributes = EventDescriptionHTML.editorTypingAttributes()
+        editorView.applyPalette()
         guard !context.coordinator.isUpdatingFromTextView,
               context.coordinator.lastSyncedHTML != cleanHTML else {
+            context.coordinator.updateToolbarState(editorView.textView)
             return
         }
-        context.coordinator.apply(cleanHTML, to: textView)
+        context.coordinator.apply(cleanHTML, to: editorView.textView)
+    }
+
+    static func dismantleUIView(_ uiView: OrganizerRichTextUIKitEditorView, coordinator: Coordinator) {
+        uiView.textView.delegate = nil
+        coordinator.editorView = nil
     }
 
     func makeCoordinator() -> Coordinator {
@@ -23748,6 +23946,7 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
 
     final class Coordinator: NSObject, UITextViewDelegate {
         @Binding private var html: String
+        weak var editorView: OrganizerRichTextUIKitEditorView?
         var lastSyncedHTML = ""
         var isUpdatingFromTextView = false
 
@@ -23755,11 +23954,55 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             self._html = html
         }
 
+        @objc func toolbarButtonTapped(_ sender: UIButton) {
+            guard let identifier = sender.accessibilityIdentifier,
+                  let command = OrganizerRichTextNativeCommand(rawValue: identifier),
+                  let textView = editorView?.textView else {
+                return
+            }
+
+            textView.becomeFirstResponder()
+            switch command {
+            case .bold:
+                toggleFontTrait(.traitBold, in: textView)
+            case .italic:
+                toggleFontTrait(.traitItalic, in: textView)
+            case .underline:
+                toggleTextAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, in: textView)
+            case .strikethrough:
+                toggleTextAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, in: textView)
+            case .paragraph:
+                applyBlockStyle(pointSize: 16, bold: false, in: textView)
+            case .heading1:
+                applyBlockStyle(pointSize: 24, bold: true, in: textView)
+            case .heading2:
+                applyBlockStyle(pointSize: 21, bold: true, in: textView)
+            case .heading3:
+                applyBlockStyle(pointSize: 17, bold: true, in: textView)
+            case .bulletList:
+                toggleList(kind: .unordered, in: textView)
+            case .orderedList:
+                toggleList(kind: .ordered, in: textView)
+            case .link:
+                promptForLink(in: textView)
+            case .undo:
+                textView.undoManager?.undo()
+                syncHTML(from: textView)
+            case .redo:
+                textView.undoManager?.redo()
+                syncHTML(from: textView)
+            }
+            updateToolbarState(textView)
+        }
+
         func apply(_ rawHTML: String, to textView: UITextView) {
             let cleanHTML = EventDescriptionHTML.cleanStoredHTML(from: rawHTML)
             lastSyncedHTML = cleanHTML
             let selectedRange = textView.selectedRange
-            textView.attributedText = EventDescriptionHTML.attributedStringForEditing(from: cleanHTML)
+            let attributed = cleanHTML.isEmpty
+                ? NSMutableAttributedString(string: "", attributes: EventDescriptionHTML.editorTypingAttributes())
+                : EventDescriptionHTML.attributedStringForEditing(from: cleanHTML)
+            textView.attributedText = attributed
             textView.typingAttributes = EventDescriptionHTML.editorTypingAttributes()
             if selectedRange.location <= textView.attributedText.length {
                 textView.selectedRange = NSRange(
@@ -23767,9 +24010,36 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
                     length: min(selectedRange.length, textView.attributedText.length - selectedRange.location)
                 )
             }
+            updateToolbarState(textView)
         }
 
         func textViewDidChange(_ textView: UITextView) {
+            syncHTML(from: textView)
+        }
+
+        func textViewDidChangeSelection(_ textView: UITextView) {
+            updateToolbarState(textView)
+        }
+
+        func updateToolbarState(_ textView: UITextView) {
+            guard let editorView else { return }
+            editorView.setActive(fontTraitActive(.traitBold, in: textView), for: .bold)
+            editorView.setActive(fontTraitActive(.traitItalic, in: textView), for: .italic)
+            editorView.setActive(textAttributeActive(.underlineStyle, in: textView), for: .underline)
+            editorView.setActive(textAttributeActive(.strikethroughStyle, in: textView), for: .strikethrough)
+
+            let block = currentBlockCommand(in: textView)
+            editorView.setActive(block == .paragraph, for: .paragraph)
+            editorView.setActive(block == .heading1, for: .heading1)
+            editorView.setActive(block == .heading2, for: .heading2)
+            editorView.setActive(block == .heading3, for: .heading3)
+            editorView.setActive(currentParagraphHasListPrefix(.unordered, in: textView), for: .bulletList)
+            editorView.setActive(currentParagraphHasListPrefix(.ordered, in: textView), for: .orderedList)
+            editorView.setEnabled(textView.undoManager?.canUndo ?? false, for: .undo)
+            editorView.setEnabled(textView.undoManager?.canRedo ?? false, for: .redo)
+        }
+
+        private func syncHTML(from textView: UITextView) {
             let cleanHTML = EventDescriptionHTML.cleanHTML(from: textView.attributedText)
             lastSyncedHTML = cleanHTML
             guard html != cleanHTML else { return }
@@ -23778,6 +24048,318 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             DispatchQueue.main.async { [weak self] in
                 self?.isUpdatingFromTextView = false
             }
+        }
+
+        private func toggleFontTrait(_ trait: UIFontDescriptor.SymbolicTraits, in textView: UITextView) {
+            let shouldEnable = !fontTraitActive(trait, in: textView)
+            let selectedRange = clampedSelection(in: textView)
+            if selectedRange.length == 0 {
+                var attributes = effectiveTypingAttributes(in: textView)
+                let currentFont = attributes[.font] as? UIFont ?? UIFont.systemFont(ofSize: 16)
+                attributes[.font] = font(currentFont, setting: trait, enabled: shouldEnable)
+                textView.typingAttributes = attributes
+                return
+            }
+
+            let storage = textView.textStorage
+            var replacements: [(NSRange, UIFont)] = []
+            storage.enumerateAttribute(.font, in: selectedRange) { value, range, _ in
+                let currentFont = value as? UIFont ?? UIFont.systemFont(ofSize: 16)
+                replacements.append((range, font(currentFont, setting: trait, enabled: shouldEnable)))
+            }
+            storage.beginEditing()
+            for replacement in replacements {
+                storage.addAttribute(.font, value: replacement.1, range: replacement.0)
+            }
+            storage.endEditing()
+            syncHTML(from: textView)
+        }
+
+        private func toggleTextAttribute(_ key: NSAttributedString.Key, value: Any, in textView: UITextView) {
+            let shouldEnable = !textAttributeActive(key, in: textView)
+            let selectedRange = clampedSelection(in: textView)
+            if selectedRange.length == 0 {
+                var attributes = effectiveTypingAttributes(in: textView)
+                if shouldEnable {
+                    attributes[key] = value
+                } else {
+                    attributes.removeValue(forKey: key)
+                }
+                textView.typingAttributes = attributes
+                return
+            }
+
+            if shouldEnable {
+                textView.textStorage.addAttribute(key, value: value, range: selectedRange)
+            } else {
+                textView.textStorage.removeAttribute(key, range: selectedRange)
+            }
+            syncHTML(from: textView)
+        }
+
+        private func applyBlockStyle(pointSize: CGFloat, bold: Bool, in textView: UITextView) {
+            let paragraphRange = selectedParagraphRange(in: textView)
+            var typingAttributes = effectiveTypingAttributes(in: textView)
+            typingAttributes[.font] = blockFont(from: typingAttributes[.font] as? UIFont, pointSize: pointSize, bold: bold)
+            typingAttributes[.paragraphStyle] = EventDescriptionHTML.editorTypingAttributes()[.paragraphStyle]
+            textView.typingAttributes = typingAttributes
+            guard paragraphRange.length > 0 else { return }
+
+            let storage = textView.textStorage
+            var replacements: [(NSRange, UIFont)] = []
+            storage.enumerateAttribute(.font, in: paragraphRange) { value, range, _ in
+                replacements.append((range, blockFont(from: value as? UIFont, pointSize: pointSize, bold: bold)))
+            }
+            storage.beginEditing()
+            for replacement in replacements {
+                storage.addAttribute(.font, value: replacement.1, range: replacement.0)
+            }
+            if let paragraphStyle = EventDescriptionHTML.editorTypingAttributes()[.paragraphStyle] {
+                storage.addAttribute(.paragraphStyle, value: paragraphStyle, range: paragraphRange)
+            }
+            storage.endEditing()
+            syncHTML(from: textView)
+        }
+
+        private enum ListKind {
+            case unordered
+            case ordered
+        }
+
+        private func toggleList(kind: ListKind, in textView: UITextView) {
+            let attributed = NSMutableAttributedString(attributedString: textView.attributedText)
+            let originalSelection = textView.selectedRange
+            let paragraphRanges = selectedParagraphRanges(in: textView)
+            guard !paragraphRanges.isEmpty else { return }
+
+            let shouldRemove = paragraphRanges.allSatisfy { listPrefixRange(kind: kind, paragraphRange: $0, text: attributed.string as NSString) != nil }
+            var selectionDelta = 0
+            var orderedIndex = paragraphRanges.count
+
+            for paragraphRange in paragraphRanges.reversed() {
+                let nsText = attributed.string as NSString
+                if let prefixRange = listPrefixRange(kind: kind, paragraphRange: paragraphRange, text: nsText), shouldRemove {
+                    attributed.deleteCharacters(in: prefixRange)
+                    if prefixRange.location <= originalSelection.location {
+                        selectionDelta -= prefixRange.length
+                    }
+                } else if !shouldRemove {
+                    let prefix = kind == .unordered ? "• " : "\(orderedIndex). "
+                    let attributes = attributesForInsertion(at: paragraphRange.location, in: textView)
+                    attributed.insert(NSAttributedString(string: prefix, attributes: attributes), at: paragraphRange.location)
+                    if paragraphRange.location <= originalSelection.location {
+                        selectionDelta += (prefix as NSString).length
+                    }
+                }
+                orderedIndex -= 1
+            }
+
+            textView.attributedText = attributed
+            textView.selectedRange = NSRange(
+                location: min(max(originalSelection.location + selectionDelta, 0), attributed.length),
+                length: min(originalSelection.length, max(attributed.length - min(max(originalSelection.location + selectionDelta, 0), attributed.length), 0))
+            )
+            textView.typingAttributes = effectiveTypingAttributes(in: textView)
+            syncHTML(from: textView)
+        }
+
+        private func promptForLink(in textView: UITextView) {
+            guard let presenter = UIApplication.shared.scampagnateTopViewController else { return }
+            let alert = UIAlertController(title: "Inserisci link", message: nil, preferredStyle: .alert)
+            alert.addTextField { textField in
+                textField.placeholder = "https://"
+                textField.text = "https://"
+                textField.keyboardType = .URL
+                textField.autocapitalizationType = .none
+                textField.autocorrectionType = .no
+            }
+            alert.addAction(UIAlertAction(title: "Annulla", style: .cancel))
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { [weak self, weak textView] _ in
+                guard let self,
+                      let textView,
+                      let rawURL = alert.textFields?.first?.text,
+                      let url = normalizedURL(rawURL) else {
+                    return
+                }
+                applyLink(url, in: textView)
+            })
+            presenter.present(alert, animated: true)
+        }
+
+        private func applyLink(_ url: URL, in textView: UITextView) {
+            let selectedRange = clampedSelection(in: textView)
+            if selectedRange.length > 0 {
+                textView.textStorage.addAttributes([
+                    .link: url,
+                    .underlineStyle: NSUnderlineStyle.single.rawValue
+                ], range: selectedRange)
+                syncHTML(from: textView)
+                return
+            }
+
+            let label = url.host?.nilIfBlank ?? url.absoluteString
+            var attributes = effectiveTypingAttributes(in: textView)
+            attributes[.link] = url
+            attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            textView.textStorage.insert(NSAttributedString(string: label, attributes: attributes), at: selectedRange.location)
+            textView.selectedRange = NSRange(location: selectedRange.location + (label as NSString).length, length: 0)
+            syncHTML(from: textView)
+        }
+
+        private func normalizedURL(_ rawValue: String) -> URL? {
+            var value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { return nil }
+            if !value.lowercased().hasPrefix("http://"),
+               !value.lowercased().hasPrefix("https://"),
+               !value.lowercased().hasPrefix("mailto:") {
+                value = "https://\(value)"
+            }
+            return URL(string: value)
+        }
+
+        private func fontTraitActive(_ trait: UIFontDescriptor.SymbolicTraits, in textView: UITextView) -> Bool {
+            let range = activeAttributeRange(in: textView)
+            guard range.length > 0 else {
+                let font = effectiveTypingAttributes(in: textView)[.font] as? UIFont
+                return font?.fontDescriptor.symbolicTraits.contains(trait) ?? false
+            }
+            var isActive = true
+            textView.attributedText.enumerateAttribute(.font, in: range) { value, _, stop in
+                let font = value as? UIFont ?? UIFont.systemFont(ofSize: 16)
+                if !font.fontDescriptor.symbolicTraits.contains(trait) {
+                    isActive = false
+                    stop.pointee = true
+                }
+            }
+            return isActive
+        }
+
+        private func textAttributeActive(_ key: NSAttributedString.Key, in textView: UITextView) -> Bool {
+            let range = activeAttributeRange(in: textView)
+            guard range.length > 0 else {
+                return effectiveTypingAttributes(in: textView)[key] != nil
+            }
+            var isActive = true
+            textView.attributedText.enumerateAttribute(key, in: range) { value, _, stop in
+                if value == nil {
+                    isActive = false
+                    stop.pointee = true
+                }
+            }
+            return isActive
+        }
+
+        private func currentBlockCommand(in textView: UITextView) -> OrganizerRichTextNativeCommand {
+            let attributes = effectiveTypingAttributes(in: textView)
+            guard let font = attributes[.font] as? UIFont else { return .paragraph }
+            let isBold = font.fontDescriptor.symbolicTraits.contains(.traitBold)
+            if font.pointSize >= 23 { return .heading1 }
+            if font.pointSize >= 20 { return .heading2 }
+            if font.pointSize >= 17, isBold { return .heading3 }
+            return .paragraph
+        }
+
+        private func currentParagraphHasListPrefix(_ kind: ListKind, in textView: UITextView) -> Bool {
+            let paragraphRange = selectedParagraphRange(in: textView)
+            guard paragraphRange.length > 0 else { return false }
+            return listPrefixRange(kind: kind, paragraphRange: paragraphRange, text: textView.text as NSString) != nil
+        }
+
+        private func effectiveTypingAttributes(in textView: UITextView) -> [NSAttributedString.Key: Any] {
+            var attributes = EventDescriptionHTML.editorTypingAttributes()
+            let range = activeAttributeRange(in: textView)
+            if range.length > 0, range.location < textView.attributedText.length {
+                attributes.merge(textView.attributedText.attributes(at: range.location, effectiveRange: nil)) { _, new in new }
+            }
+            if textView.selectedRange.length == 0 {
+                attributes.merge(textView.typingAttributes) { _, new in new }
+            }
+            return attributes
+        }
+
+        private func attributesForInsertion(at location: Int, in textView: UITextView) -> [NSAttributedString.Key: Any] {
+            var attributes = EventDescriptionHTML.editorTypingAttributes()
+            let length = textView.attributedText.length
+            if length > 0 {
+                let index = min(max(location, 0), length - 1)
+                attributes.merge(textView.attributedText.attributes(at: index, effectiveRange: nil)) { _, new in new }
+            }
+            return attributes
+        }
+
+        private func activeAttributeRange(in textView: UITextView) -> NSRange {
+            let length = textView.attributedText.length
+            guard length > 0 else { return NSRange(location: 0, length: 0) }
+            let selectedRange = clampedSelection(in: textView)
+            if selectedRange.length > 0 { return selectedRange }
+            return NSRange(location: min(max(selectedRange.location - 1, 0), length - 1), length: 1)
+        }
+
+        private func clampedSelection(in textView: UITextView) -> NSRange {
+            let length = textView.attributedText.length
+            let location = min(max(textView.selectedRange.location, 0), length)
+            let rangeLength = min(textView.selectedRange.length, max(length - location, 0))
+            return NSRange(location: location, length: rangeLength)
+        }
+
+        private func selectedParagraphRange(in textView: UITextView) -> NSRange {
+            let nsText = textView.text as NSString
+            guard nsText.length > 0 else { return NSRange(location: 0, length: 0) }
+            let selectedRange = clampedSelection(in: textView)
+            let location = min(max(selectedRange.location, 0), nsText.length - 1)
+            let length = selectedRange.length == 0 ? 1 : min(selectedRange.length, nsText.length - location)
+            return nsText.paragraphRange(for: NSRange(location: location, length: length))
+        }
+
+        private func selectedParagraphRanges(in textView: UITextView) -> [NSRange] {
+            let fullRange = selectedParagraphRange(in: textView)
+            guard fullRange.length > 0 else { return [] }
+            let nsText = textView.text as NSString
+            var ranges: [NSRange] = []
+            var location = fullRange.location
+            let upperBound = NSMaxRange(fullRange)
+            while location < upperBound {
+                let paragraphRange = nsText.paragraphRange(for: NSRange(location: min(location, max(nsText.length - 1, 0)), length: 0))
+                ranges.append(paragraphRange)
+                let nextLocation = NSMaxRange(paragraphRange)
+                guard nextLocation > location else { break }
+                location = nextLocation
+            }
+            return ranges
+        }
+
+        private func listPrefixRange(kind: ListKind, paragraphRange: NSRange, text: NSString) -> NSRange? {
+            guard paragraphRange.location < text.length else { return nil }
+            let paragraph = text.substring(with: NSRange(location: paragraphRange.location, length: min(paragraphRange.length, text.length - paragraphRange.location)))
+            let pattern = kind == .unordered ? #"^\s*(?:•|-|\*)\s+"# : #"^\s*\d+[\.)]\s+"#
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(in: paragraph, range: NSRange(location: 0, length: (paragraph as NSString).length)) else {
+                return nil
+            }
+            return NSRange(location: paragraphRange.location + match.range.location, length: match.range.length)
+        }
+
+        private func font(_ source: UIFont, setting trait: UIFontDescriptor.SymbolicTraits, enabled: Bool) -> UIFont {
+            var traits = source.fontDescriptor.symbolicTraits
+            if enabled {
+                traits.insert(trait)
+            } else {
+                traits.remove(trait)
+            }
+            let descriptor = source.fontDescriptor.withSymbolicTraits(traits) ?? source.fontDescriptor
+            return UIFont(descriptor: descriptor, size: source.pointSize)
+        }
+
+        private func blockFont(from source: UIFont?, pointSize: CGFloat, bold: Bool) -> UIFont {
+            let source = source ?? UIFont.systemFont(ofSize: pointSize)
+            var traits = UIFontDescriptor.SymbolicTraits()
+            if bold { traits.insert(.traitBold) }
+            if source.fontDescriptor.symbolicTraits.contains(.traitItalic) {
+                traits.insert(.traitItalic)
+            }
+            let base = UIFont.systemFont(ofSize: pointSize, weight: bold ? .bold : .regular)
+            let descriptor = base.fontDescriptor.withSymbolicTraits(traits) ?? base.fontDescriptor
+            return UIFont(descriptor: descriptor, size: pointSize)
         }
     }
 }
