@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import SafariServices
 import PhotosUI
 import UIKit
@@ -24,6 +25,148 @@ enum IssueMediaLimits {
 
 enum EventAvailabilityRules {
     static let lastSpotsFillRatio = 0.70
+}
+
+enum PromoBoundary {
+    case start
+    case end
+}
+
+enum PromoWindowStatus {
+    case active
+    case upcoming
+    case expired
+}
+
+enum PromoPricing {
+    static let timeZone = TimeZone(identifier: "Europe/Rome")!
+
+    private static let dateOnlyPattern = #"^\d{4}-\d{2}-\d{2}$"#
+    private static let localDateTimePattern = #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$"#
+    private static let legacyUTCMidnightPattern = #"^(\d{4}-\d{2}-\d{2})[T ]00:00(?::00(?:\.0+)?)?(?:Z|[+-]00(?::?00)?)?$"#
+
+    private static let calendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        return calendar
+    }()
+
+    private static func dateInputFormatter() -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.locale = Locale(identifier: "it_IT")
+        formatter.timeZone = timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }
+
+    private static func storageFormatter() -> ISO8601DateFormatter {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)!
+        return formatter
+    }
+
+    private static func localDateTimeFormatter(format: String) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.locale = Locale(identifier: "it_IT")
+        formatter.timeZone = timeZone
+        formatter.dateFormat = format
+        return formatter
+    }
+
+    private static func dateOnlyValue(from value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.range(of: dateOnlyPattern, options: .regularExpression) != nil {
+            return trimmed
+        }
+        return trimmed.firstRegexCapture(legacyUTCMidnightPattern)
+    }
+
+    private static func dayBoundary(for date: Date, boundary: PromoBoundary) -> Date? {
+        var components = calendar.dateComponents([.year, .month, .day], from: date)
+        components.hour = boundary == .start ? 0 : 23
+        components.minute = boundary == .start ? 0 : 59
+        components.second = boundary == .start ? 0 : 59
+        components.nanosecond = boundary == .start ? 0 : 999_000_000
+        return calendar.date(from: components)
+    }
+
+    static func boundaryDate(from value: String?, boundary: PromoBoundary) -> Date? {
+        guard let rawValue = value?.trimmingCharacters(in: .whitespacesAndNewlines), !rawValue.isEmpty else {
+            return nil
+        }
+
+        if let dateOnly = dateOnlyValue(from: rawValue),
+           let date = dateInputFormatter().date(from: dateOnly) {
+            return dayBoundary(for: date, boundary: boundary)
+        }
+
+        if rawValue.range(of: localDateTimePattern, options: .regularExpression) != nil {
+            for format in ["yyyy-MM-dd'T'HH:mm:ss.SSS", "yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd'T'HH:mm"] {
+                if let date = localDateTimeFormatter(format: format).date(from: rawValue) {
+                    return date
+                }
+            }
+        }
+
+        return rawValue.iso8601Date
+    }
+
+    static func storageString(from input: String?, boundary: PromoBoundary) -> String? {
+        guard let date = boundaryDate(from: input, boundary: boundary) else { return nil }
+        return storageFormatter().string(from: date)
+    }
+
+    static func dateInputString(from value: String?) -> String {
+        guard let rawValue = value?.trimmingCharacters(in: .whitespacesAndNewlines), !rawValue.isEmpty else {
+            return ""
+        }
+        if let dateOnly = dateOnlyValue(from: rawValue) {
+            return dateOnly
+        }
+        guard let date = boundaryDate(from: rawValue, boundary: .start) else {
+            return ""
+        }
+        return dateInputFormatter().string(from: date)
+    }
+
+    static func windowStatus(start: String?, end: String?, now: Date = Date()) -> PromoWindowStatus {
+        if let startsAt = boundaryDate(from: start, boundary: .start), startsAt > now {
+            return .upcoming
+        }
+        if let endsAt = boundaryDate(from: end, boundary: .end), endsAt < now {
+            return .expired
+        }
+        return .active
+    }
+
+    static func countdownLabel(end: String?, now: Date = Date()) -> String? {
+        guard let endsAt = boundaryDate(from: end, boundary: .end) else { return nil }
+        let diff = endsAt.timeIntervalSince(now)
+        guard diff > 0 else { return "Promo scaduta" }
+
+        let totalMinutes = max(1, Int(ceil(diff / 60)))
+        if totalMinutes >= 1_440 {
+            let days = totalMinutes / 1_440
+            let hours = (totalMinutes % 1_440) / 60
+            return hours > 0 ? "scade tra \(days)g \(hours)h" : "scade tra \(days)g"
+        }
+
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        if hours > 0 {
+            return minutes > 0 ? "scade tra \(hours)h \(minutes)m" : "scade tra \(hours)h"
+        }
+
+        return "scade tra \(totalMinutes)m"
+    }
+
+    static func badgeLabel(end: String?, now: Date = Date()) -> String {
+        guard let countdown = countdownLabel(end: end, now: now) else { return "Promo" }
+        return countdown == "Promo scaduta" ? countdown : "Promo · \(countdown)"
+    }
 }
 
 enum Brand {
@@ -3101,8 +3244,8 @@ struct SupabaseAPI {
                 "eligible_group": .string(eligibleGroup),
                 "original_price": option.originalPrice.map { .number($0) } ?? .null,
                 "is_promotional": .bool(option.isPromotional),
-                "promo_start": option.promoStart.nilIfBlank.map { .string($0) } ?? .null,
-                "promo_end": option.promoEnd.nilIfBlank.map { .string($0) } ?? .null,
+                "promo_start": option.promoStart.nilIfBlank.flatMap { PromoPricing.storageString(from: $0, boundary: .start) }.map { .string($0) } ?? .null,
+                "promo_end": option.promoEnd.nilIfBlank.flatMap { PromoPricing.storageString(from: $0, boundary: .end) }.map { .string($0) } ?? .null,
                 "payment_type": .string(option.paymentType),
                 "deposit_amount": option.paymentType == "deposit" ? .number(option.depositAmount) : .null,
                 "balance_amount": option.paymentType == "deposit" ? .number(resolvedBalance) : .null,
@@ -4561,7 +4704,7 @@ struct PriceOption: Codable, Identifiable, Hashable {
             parts.append(eligibleLabel)
         }
         if isPromotional == true {
-            parts.append("Promo")
+            parts.append(promoBadgeText())
         }
         return parts.joined(separator: " · ")
     }
@@ -4581,8 +4724,23 @@ struct PriceOption: Codable, Identifiable, Hashable {
         price ?? 0
     }
 
-    var showsPromoBadge: Bool {
-        isPromotional == true
+    func promoStatus(now: Date = Date()) -> PromoWindowStatus {
+        guard isPromotional == true else { return .active }
+        return PromoPricing.windowStatus(start: promoStart, end: promoEnd, now: now)
+    }
+
+    func showsPromoBadge(now: Date = Date()) -> Bool {
+        guard isPromotional == true else { return false }
+        let status = promoStatus(now: now)
+        return status == .active || status == .expired
+    }
+
+    func hasActivePromo(now: Date = Date()) -> Bool {
+        isPromotional == true && promoStatus(now: now) == .active
+    }
+
+    func promoBadgeText(now: Date = Date()) -> String {
+        PromoPricing.badgeLabel(end: promoEnd, now: now)
     }
 
     var usesDedicatedSpots: Bool {
@@ -4631,22 +4789,33 @@ struct PriceOption: Codable, Identifiable, Hashable {
         return min(eventRemaining, dedicatedRemaining)
     }
 
-    func isBookable(in event: Event) -> Bool {
-        guard event.acceptsRegistrations, !event.isSoldOut else { return false }
+    func isBookable(in event: Event, now: Date = Date()) -> Bool {
+        guard isCurrentlyAvailable(now: now), event.acceptsRegistrations, !event.isSoldOut else { return false }
         return realRemainingSpots(in: event) > 0
     }
 
-    func canJoinWaitlist(in event: Event) -> Bool {
-        guard event.acceptsRegistrations, event.isSoldOut || realRemainingSpots(in: event) <= 0 else { return false }
-        return !isBookable(in: event) && event.waitingListEnabled
+    func canJoinWaitlist(in event: Event, now: Date = Date()) -> Bool {
+        guard isCurrentlyAvailable(now: now), event.acceptsRegistrations, event.isSoldOut || realRemainingSpots(in: event) <= 0 else { return false }
+        return !isBookable(in: event, now: now) && event.waitingListEnabled
     }
 
-    func availabilityText(in event: Event) -> String {
-        if isBookable(in: event) {
+    func availabilityText(in event: Event, now: Date = Date()) -> String {
+        if isPromotional == true {
+            switch promoStatus(now: now) {
+            case .upcoming:
+                return "Promozione non ancora attiva"
+            case .expired:
+                return "Promozione scaduta"
+            case .active:
+                break
+            }
+        }
+
+        if isBookable(in: event, now: now) {
             let remaining = realRemainingSpots(in: event)
             return remaining == 1 ? "1 posto disponibile" : "\(remaining) posti disponibili"
         }
-        return canJoinWaitlist(in: event) ? "Lista d'attesa disponibile" : "Sold out"
+        return canJoinWaitlist(in: event, now: now) ? "Lista d'attesa disponibile" : "Sold out"
     }
 
     func paymentSummary(in event: Event) -> String {
@@ -4672,24 +4841,13 @@ struct PriceOption: Codable, Identifiable, Hashable {
             : "Partecipazione evento"
     }
 
-    var isCurrentlyAvailable: Bool {
+    func isCurrentlyAvailable(now: Date = Date()) -> Bool {
         guard isPromotional == true else { return true }
-        let today = Calendar.current.startOfDay(for: Date())
-        if let start = promoStart?.prefix(10).description,
-           let startDate = DateFormatter.eventDate.date(from: start),
-           startDate > today {
-            return false
-        }
-        if let end = promoEnd?.prefix(10).description,
-           let endDate = DateFormatter.eventDate.date(from: end),
-           endDate < today {
-            return false
-        }
-        return true
+        return promoStatus(now: now) == .active
     }
 
     func isEligible(for context: PriceEligibilityContext) -> Bool {
-        guard isCurrentlyAvailable else { return false }
+        guard isCurrentlyAvailable() else { return false }
         guard let rawGroup = eligibleGroup?.nilIfBlank?.lowercased() else { return true }
         if rawGroup == "all" { return true }
         guard let profile = context.profile else { return false }
@@ -5307,8 +5465,8 @@ struct OrganizerPriceOptionDraft: Identifiable, Equatable {
         }
         originalPrice = option.originalPrice
         isPromotional = option.isPromotional ?? false
-        promoStart = option.promoStart?.prefix(10).description ?? ""
-        promoEnd = option.promoEnd?.prefix(10).description ?? ""
+        promoStart = PromoPricing.dateInputString(from: option.promoStart)
+        promoEnd = PromoPricing.dateInputString(from: option.promoEnd)
     }
 }
 
@@ -14527,6 +14685,7 @@ struct RegistrationCheckoutSheet: View {
     @State private var submitting = false
     @State private var attemptedSubmit = false
     @State private var showMembershipProfileEditor = false
+    @State private var promoNow = Date()
 
     var priceEligibilityContext: PriceEligibilityContext {
         PriceEligibilityContext(profile: store.profile, badges: store.badges, registrations: store.myEvents)
@@ -14731,7 +14890,11 @@ struct RegistrationCheckoutSheet: View {
                 }
             }
             .onAppear {
+                promoNow = Date()
                 selectDefaultPriceOptionIfNeeded()
+            }
+            .onReceive(Timer.publish(every: 60, on: .main, in: .common).autoconnect()) { now in
+                promoNow = now
             }
             .sheet(isPresented: $showMembershipProfileEditor) {
                 if let profile = store.profile {
@@ -14886,7 +15049,7 @@ struct RegistrationCheckoutSheet: View {
             CheckoutSectionTitle("Prezzo e tessera")
 
             if let singlePriceOption {
-                CheckoutSinglePriceOptionRow(option: singlePriceOption, event: event)
+                CheckoutSinglePriceOptionRow(option: singlePriceOption, event: event, now: promoNow)
             } else if !eligiblePriceOptions.isEmpty {
                 Text("Scegli la formula *")
                     .font(.headline.weight(.bold))
@@ -14897,9 +15060,10 @@ struct RegistrationCheckoutSheet: View {
                         CheckoutPriceOptionRow(
                             option: option,
                             selected: selectedPriceOptionId == option.id,
-                            event: event
+                            event: event,
+                            now: promoNow
                         ) {
-                            guard option.isBookable(in: event) || option.canJoinWaitlist(in: event) else { return }
+                            guard option.isBookable(in: event, now: promoNow) || option.canJoinWaitlist(in: event, now: promoNow) else { return }
                             selectedPriceOptionId = option.id
                             appliedDiscount = nil
                             discountMessage = nil
@@ -15338,6 +15502,7 @@ struct CheckoutPriceOptionRow: View {
     let option: PriceOption
     let selected: Bool
     let event: Event
+    let now: Date
     let action: () -> Void
 
     private var price: Double {
@@ -15353,7 +15518,15 @@ struct CheckoutPriceOptionRow: View {
     }
 
     private var isDisabled: Bool {
-        !option.isBookable(in: event) && !option.canJoinWaitlist(in: event)
+        !option.isBookable(in: event, now: now) && !option.canJoinWaitlist(in: event, now: now)
+    }
+
+    private var showsPromoBadge: Bool {
+        option.showsPromoBadge(now: now)
+    }
+
+    private var promoIsActive: Bool {
+        option.hasActivePromo(now: now)
     }
 
     var body: some View {
@@ -15369,16 +15542,16 @@ struct CheckoutPriceOptionRow: View {
                             .font(.subheadline.weight(.bold))
                             .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.foreground)
                             .lineLimit(2)
-                        if option.showsPromoBadge {
-                            Text("Promo")
+                        if showsPromoBadge {
+                            Text(option.promoBadgeText(now: now))
                                 .font(.system(size: 10, weight: .bold, design: .rounded))
-                                .foregroundStyle(Brand.destructive)
+                                .foregroundStyle(promoIsActive ? Brand.destructive : Brand.mutedForeground)
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 4)
-                                .background(Brand.destructive.opacity(0.10), in: Capsule())
+                                .background((promoIsActive ? Brand.destructive : Brand.mutedForeground).opacity(0.10), in: Capsule())
                         }
                     }
-                    if !option.detailText.isEmpty, !option.showsPromoBadge {
+                    if !option.detailText.isEmpty, !showsPromoBadge {
                         Text(option.detailText)
                             .font(.caption.weight(.medium))
                             .foregroundStyle(Brand.mutedForeground)
@@ -15388,9 +15561,9 @@ struct CheckoutPriceOptionRow: View {
                             .font(.caption.weight(.medium))
                             .foregroundStyle(Brand.mutedForeground)
                     }
-                    Label(option.availabilityText(in: event), systemImage: option.isBookable(in: event) ? "person.2" : (option.canJoinWaitlist(in: event) ? "list.bullet" : "xmark.circle"))
+                    Label(option.availabilityText(in: event, now: now), systemImage: option.isBookable(in: event, now: now) ? "person.2" : (option.canJoinWaitlist(in: event, now: now) ? "list.bullet" : "xmark.circle"))
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(option.isBookable(in: event) ? Brand.success : (option.canJoinWaitlist(in: event) ? Brand.warning : Brand.destructive))
+                        .foregroundStyle(option.isBookable(in: event, now: now) ? Brand.success : (option.canJoinWaitlist(in: event, now: now) ? Brand.warning : Brand.destructive))
                 }
 
                 Spacer(minLength: 8)
@@ -15404,7 +15577,7 @@ struct CheckoutPriceOptionRow: View {
                     }
                     Text(priceLabel)
                         .font(.headline.weight(.bold))
-                        .foregroundStyle(isDisabled ? Brand.mutedForeground : (option.showsPromoBadge ? Brand.success : Brand.primary))
+                        .foregroundStyle(isDisabled ? Brand.mutedForeground : (promoIsActive ? Brand.success : Brand.primary))
                 }
             }
             .padding()
@@ -15419,6 +15592,7 @@ struct CheckoutPriceOptionRow: View {
 struct CheckoutSinglePriceOptionRow: View {
     let option: PriceOption
     let event: Event
+    let now: Date
 
     private var price: Double {
         option.totalPrice(fallback: event)
@@ -15433,11 +15607,19 @@ struct CheckoutSinglePriceOptionRow: View {
     }
 
     private var isDisabled: Bool {
-        !option.isBookable(in: event) && !option.canJoinWaitlist(in: event)
+        !option.isBookable(in: event, now: now) && !option.canJoinWaitlist(in: event, now: now)
     }
 
     private var title: String {
         option.checkoutSingleOptionTitle()
+    }
+
+    private var showsPromoBadge: Bool {
+        option.showsPromoBadge(now: now)
+    }
+
+    private var promoIsActive: Bool {
+        option.hasActivePromo(now: now)
     }
 
     var body: some View {
@@ -15448,9 +15630,20 @@ struct CheckoutSinglePriceOptionRow: View {
                 .frame(width: 28)
 
             VStack(alignment: .leading, spacing: 5) {
-                Text(title)
-                    .font(.subheadline.weight(.bold))
-                    .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.foreground)
+                HStack(spacing: 8) {
+                    Text(title)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.foreground)
+
+                    if showsPromoBadge {
+                        Text(option.promoBadgeText(now: now))
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .foregroundStyle(promoIsActive ? Brand.destructive : Brand.mutedForeground)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 4)
+                            .background((promoIsActive ? Brand.destructive : Brand.mutedForeground).opacity(0.10), in: Capsule())
+                    }
+                }
 
                 if !isFree {
                     Text(option.paymentSummary(in: event))
@@ -15458,9 +15651,9 @@ struct CheckoutSinglePriceOptionRow: View {
                         .foregroundStyle(Brand.mutedForeground)
                 }
 
-                Label(option.availabilityText(in: event), systemImage: option.isBookable(in: event) ? "person.2" : (option.canJoinWaitlist(in: event) ? "list.bullet" : "xmark.circle"))
+                Label(option.availabilityText(in: event, now: now), systemImage: option.isBookable(in: event, now: now) ? "person.2" : (option.canJoinWaitlist(in: event, now: now) ? "list.bullet" : "xmark.circle"))
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(option.isBookable(in: event) ? Brand.success : (option.canJoinWaitlist(in: event) ? Brand.warning : Brand.destructive))
+                    .foregroundStyle(option.isBookable(in: event, now: now) ? Brand.success : (option.canJoinWaitlist(in: event, now: now) ? Brand.warning : Brand.destructive))
             }
 
             Spacer(minLength: 8)
@@ -15474,7 +15667,7 @@ struct CheckoutSinglePriceOptionRow: View {
                 }
                 Text(priceLabel)
                     .font(.headline.weight(.bold))
-                    .foregroundStyle(isDisabled ? Brand.mutedForeground : (option.showsPromoBadge ? Brand.success : Brand.primary))
+                    .foregroundStyle(isDisabled ? Brand.mutedForeground : (promoIsActive ? Brand.success : Brand.primary))
             }
         }
         .padding()
