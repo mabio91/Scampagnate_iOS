@@ -5669,7 +5669,7 @@ struct OrganizerEventDraft: Equatable {
         cancellationPolicy = Self.normalizedCancellationPolicy(event.cancellationPolicy)
         imageUrl = event.imageUrl ?? ""
         homeCardImageUrl = event.homeCardImageUrl ?? ""
-        visibility = duplicate ? "private" : (event.visibility ?? "public")
+        visibility = duplicate ? "private" : Self.editableVisibility(event.visibility)
         status = duplicate ? "open" : Self.editableStatus(event.status)
         galleryImageURLs = event.gallery.compactMap(\.url)
         let manualBadgeIds = Set(OrganizerEventDraft.manualBadgeOptions.map(\.id))
@@ -5759,6 +5759,10 @@ struct OrganizerEventDraft: Equatable {
         default:
             return "open"
         }
+    }
+
+    static func editableVisibility(_ visibility: String?) -> String {
+        visibility == "private" ? "private" : "public"
     }
 
     static let manualBadgeOptions: [(id: String, label: String)] = [
@@ -5908,7 +5912,7 @@ struct OrganizerEventDraft: Equatable {
             "featured": .bool(featured),
             "cancellation_policy": .string(Self.normalizedCancellationPolicy(cancellationPolicy)),
             "image_url": image.map { .string($0) } ?? .null,
-            "visibility": .string(visibility),
+            "visibility": .string(Self.editableVisibility(visibility)),
             "gallery_images": .array(gallery),
             "equipment_list": .array(equipmentItems.filter { $0.name.nilIfBlank != nil }.map(\.jsonValue)),
             "additional_fields": .object(additionalObject),
@@ -25118,8 +25122,7 @@ struct OrganizerVisibilityPickerField: View {
 
     private static let options = [
         OrganizerVisibilityOption(id: "public", label: "🌍 Pubblico — Visibile a tutti", description: "Tutti possono trovare e visualizzare questo evento."),
-        OrganizerVisibilityOption(id: "private", label: "🔗 Privato — Solo link diretto", description: "Non visibile nella scoperta. Accessibile solo tramite link diretto o invito."),
-        OrganizerVisibilityOption(id: "hidden", label: "👁️ Nascosto — Solo organizzatori e admin", description: "Visibile solo agli organizzatori e agli admin.")
+        OrganizerVisibilityOption(id: "private", label: "🔗 Privato — Solo link diretto", description: "Non visibile nella scoperta. Accessibile solo tramite link diretto o invito.")
     ]
 
     var body: some View {
@@ -25178,7 +25181,6 @@ struct OrganizerRegistrationRulesSummary: View {
         switch visibility {
         case "public": return "Visibile a tutti"
         case "private": return "Solo link diretto"
-        case "hidden": return "Nascosto"
         default: return "Visibilità personalizzata"
         }
     }
