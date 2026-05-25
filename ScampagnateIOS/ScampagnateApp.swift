@@ -990,6 +990,15 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func fetchPublicProfiles(userIds: [String], reportingErrors: Bool = true) async -> [String: PublicProfile] {
+        do {
+            return try await api.fetchPublicProfiles(userIds: userIds, session: session)
+        } catch {
+            report(error, when: reportingErrors)
+            return [:]
+        }
+    }
+
     func fetchOrganizerEventStaff(eventId: String, reportingErrors: Bool = true) async -> [EventStaffMember] {
         do {
             let authSession = try await authenticatedSession()
@@ -2790,7 +2799,7 @@ struct SupabaseAPI {
         )
     }
 
-    private func fetchPublicProfiles(userIds: [String], session: AuthSession?) async throws -> [String: PublicProfile] {
+    func fetchPublicProfiles(userIds: [String], session: AuthSession?) async throws -> [String: PublicProfile] {
         guard !userIds.isEmpty else { return [:] }
         let body: [String: JSONValue] = ["profile_ids": .array(userIds.map { .string($0) })]
         let profiles: [PublicProfile] = try await request(path: "/rest/v1/rpc/get_public_profiles", method: "POST", body: body, auth: session, decode: [PublicProfile].self)
@@ -10573,7 +10582,7 @@ struct EventDetailView: View {
                             .presentationDetents([.medium, .large])
                     }
                     .sheet(isPresented: $showStaff) {
-                        EventStaffSheet(event: event, staffMembers: staffMembers, organizerProfile: organizerProfile)
+                        EventStaffSheet(event: event, staffMembers: staffMembers, organizerProfile: organizerProfile, showAuth: $showAuth)
                             .presentationDetents([.medium, .large])
                     }
                     .fullScreenCover(isPresented: $showGallery) {
@@ -11488,12 +11497,35 @@ struct EventStaffAvatarStack: View {
 
 struct EventStaffSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var store: AppStore
     let event: Event
     let staffMembers: [EventStaffMember]
     let organizerProfile: PublicProfile?
+    @Binding var showAuth: Bool
+    @State private var selectedContact: StaffContactSelection?
+    @State private var profileContact: StaffContactSelection?
+    @State private var staffProfiles: [String: PublicProfile] = [:]
 
     private var organizerName: String {
         organizerProfile?.firstName.nilIfBlank ?? event.organizerName ?? "Organizzatore"
+    }
+
+    private var staffProfileIds: [String] {
+        staffMembers.compactMap { member in
+            member.profileId?.nilIfBlank
+        }
+        .removingDuplicates()
+    }
+
+    private var organizerContact: StaffContactSelection {
+        StaffContactSelection(
+            id: event.organizerId ?? "organizer-\(event.id)",
+            name: organizerName,
+            role: "Organizzatore",
+            avatarUrl: organizerProfile?.avatarUrl,
+            profileId: event.organizerId,
+            phone: organizerProfile?.phone
+        )
     }
 
     var body: some View {
@@ -11525,30 +11557,28 @@ struct EventStaffSheet: View {
                     Text("ORGANIZZATORE")
                         .font(.caption.weight(.bold))
                         .foregroundStyle(Brand.primary)
-                    HStack(spacing: 14) {
-                        OrganizerAvatar(name: organizerName, avatarUrl: organizerProfile?.avatarUrl, size: 52)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(organizerName)
-                                .font(.system(.body, design: .rounded, weight: .semibold))
-                                .foregroundStyle(Brand.foreground)
-                            Text("Organizzatore")
-                                .font(.system(.caption, design: .rounded))
+                    Button {
+                        selectedContact = organizerContact
+                    } label: {
+                        HStack(spacing: 14) {
+                            OrganizerAvatar(name: organizerName, avatarUrl: organizerProfile?.avatarUrl, size: 52)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(organizerName)
+                                    .font(.system(.body, design: .rounded, weight: .semibold))
+                                    .foregroundStyle(Brand.foreground)
+                                Text("Organizzatore")
+                                    .font(.system(.caption, design: .rounded))
+                                    .foregroundStyle(Brand.mutedForeground)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 14, weight: .bold))
                                 .foregroundStyle(Brand.mutedForeground)
                         }
-                        Spacer()
-                        if let phone = organizerProfile?.phone?.nilIfBlank {
-                            Button {
-                                openOrganizerWhatsApp(phone: phone, event: event)
-                            } label: {
-                                Image(systemName: "message.fill")
-                                    .font(.subheadline.weight(.bold))
-                                    .foregroundStyle(.white)
-                                    .frame(width: 36, height: 36)
-                                    .background(Brand.primary, in: Circle())
-                            }
-                            .buttonStyle(.plain)
-                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
                 }
 
                 if !staffMembers.isEmpty {
@@ -11557,25 +11587,182 @@ struct EventStaffSheet: View {
                             .font(.caption.weight(.bold))
                             .foregroundStyle(Brand.primary)
                         ForEach(staffMembers) { member in
-                            HStack(spacing: 14) {
-                                OrganizerAvatar(name: member.name, avatarUrl: member.avatarUrl, size: 52)
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(member.name)
-                                        .font(.system(.body, design: .rounded, weight: .semibold))
-                                        .foregroundStyle(Brand.foreground)
-                                    Text(member.role)
-                                        .font(.system(.caption, design: .rounded))
+                            let contact = staffContact(for: member)
+                            Button {
+                                selectedContact = contact
+                            } label: {
+                                HStack(spacing: 14) {
+                                    OrganizerAvatar(name: contact.name, avatarUrl: contact.avatarUrl, size: 52)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(contact.name)
+                                            .font(.system(.body, design: .rounded, weight: .semibold))
+                                            .foregroundStyle(Brand.foreground)
+                                        Text(contact.role)
+                                            .font(.system(.caption, design: .rounded))
+                                            .foregroundStyle(Brand.mutedForeground)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 14, weight: .bold))
                                         .foregroundStyle(Brand.mutedForeground)
                                 }
-                                Spacer()
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
                             }
                             .padding(.vertical, 4)
+                            .buttonStyle(.plain)
                         }
                     }
                 }
             }
             .padding(22)
         }
+        .background(Brand.background)
+        .task(id: staffProfileIds.joined(separator: ",")) {
+            await loadStaffProfiles()
+        }
+        .sheet(item: $selectedContact) { contact in
+            StaffContactActionSheet(contact: contact, event: event) {
+                selectedContact = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+                    profileContact = contact
+                }
+            }
+            .presentationDetents([.height(contact.actionSheetHeight), .medium])
+        }
+        .fullScreenCover(item: $profileContact) { contact in
+            OrganizerProfileView(
+                organizerId: contact.profileId,
+                fallbackName: contact.name,
+                profile: profile(for: contact),
+                showAuth: $showAuth
+            )
+            .environmentObject(store)
+        }
+    }
+
+    private func loadStaffProfiles() async {
+        let profiles = await store.fetchPublicProfiles(userIds: staffProfileIds, reportingErrors: false)
+        staffProfiles = profiles
+    }
+
+    private func staffContact(for member: EventStaffMember) -> StaffContactSelection {
+        let profile = normalizedProfileId(member.profileId).flatMap { staffProfiles[$0] }
+        return StaffContactSelection(
+            id: member.id,
+            name: profile?.firstName.nilIfBlank ?? member.name,
+            role: member.role,
+            avatarUrl: profile?.avatarUrl ?? member.avatarUrl,
+            profileId: normalizedProfileId(member.profileId),
+            phone: profile?.phone
+        )
+    }
+
+    private func profile(for contact: StaffContactSelection) -> PublicProfile? {
+        if contact.id == organizerContact.id {
+            return organizerProfile
+        }
+        return normalizedProfileId(contact.profileId).flatMap { staffProfiles[$0] }
+    }
+
+    private func normalizedProfileId(_ value: String?) -> String? {
+        value?.nilIfBlank
+    }
+}
+
+struct StaffContactSelection: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let role: String
+    let avatarUrl: String?
+    let profileId: String?
+    let phone: String?
+
+    var actionSheetHeight: CGFloat {
+        let actionCount = (profileId?.nilIfBlank == nil ? 0 : 1) + (phone?.nilIfBlank == nil ? 0 : 2)
+        switch actionCount {
+        case 3:
+            return 500
+        case 2:
+            return 430
+        case 1:
+            return 340
+        default:
+            return 320
+        }
+    }
+}
+
+struct StaffContactActionSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let contact: StaffContactSelection
+    let event: Event
+    let onProfile: () -> Void
+
+    private var phone: String? {
+        contact.phone?.nilIfBlank
+    }
+
+    private var hasProfile: Bool {
+        contact.profileId?.nilIfBlank != nil
+    }
+
+    var body: some View {
+        VStack(spacing: 22) {
+            Capsule()
+                .fill(Brand.muted.opacity(0.65))
+                .frame(width: 44, height: 5)
+                .padding(.bottom, 2)
+
+            VStack(spacing: 12) {
+                OrganizerAvatar(name: contact.name, avatarUrl: contact.avatarUrl, size: 92)
+
+                VStack(spacing: 5) {
+                    Text(contact.name)
+                        .font(.system(.title2, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                        .multilineTextAlignment(.center)
+
+                    Text(contact.role)
+                        .font(.system(.caption, design: .rounded, weight: .bold))
+                        .tracking(0.6)
+                        .foregroundStyle(Brand.mutedForeground)
+                        .textCase(.uppercase)
+                }
+            }
+
+            VStack(spacing: 12) {
+                if hasProfile {
+                    ContactActionButton(icon: "person", title: "Profilo", action: onProfile)
+                }
+
+                if let phone {
+                    ContactActionButton(icon: "message", title: "WhatsApp") {
+                        dismiss()
+                        openOrganizerWhatsApp(phone: phone, event: event)
+                    }
+
+                    ContactActionButton(icon: "phone", title: "Telefona") {
+                        dismiss()
+                        if let url = URL(string: "tel:\(phone.filter { $0.isNumber || $0 == "+" })") {
+                            UIApplication.shared.open(url)
+                        }
+                    }
+                }
+
+                if !hasProfile && phone == nil {
+                    Label("Nessuna azione disponibile", systemImage: "info.circle")
+                        .font(.system(.footnote, design: .rounded, weight: .semibold))
+                        .foregroundStyle(Brand.mutedForeground)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 16)
+                        .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.top, 18)
+        .padding(.bottom, 26)
         .background(Brand.background)
     }
 }
