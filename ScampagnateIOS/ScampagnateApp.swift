@@ -13578,6 +13578,15 @@ private enum EventDescriptionHTML {
             openList = nil
         }
 
+        func hasNonBlankText(after location: Int) -> Bool {
+            guard location < fullText.length else { return false }
+            let remainingRange = NSRange(location: location, length: fullText.length - location)
+            return fullText
+                .substring(with: remainingRange)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank != nil
+        }
+
         while position < fullText.length {
             let paragraphRange = fullText.paragraphRange(for: NSRange(location: position, length: 0))
             defer { position = paragraphRange.location + paragraphRange.length }
@@ -13585,6 +13594,9 @@ private enum EventDescriptionHTML {
             let plain = paragraph.string.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !plain.isEmpty else {
                 closeList()
+                if !parts.isEmpty, hasNonBlankText(after: NSMaxRange(paragraphRange)) {
+                    parts.append("<p><br></p>")
+                }
                 continue
             }
 
@@ -13599,10 +13611,7 @@ private enum EventDescriptionHTML {
             }
 
             closeList()
-            let tag = headingTag(for: paragraph)
-            let suppressBold = tag != "p"
-            let suppressFontSize = tag != "p"
-            parts.append("<\(tag)>\(inlineHTML(from: paragraph, suppressBold: suppressBold, suppressFontSize: suppressFontSize))</\(tag)>")
+            parts.append("<p>\(inlineHTML(from: paragraph))</p>")
         }
 
         closeList()
@@ -13803,9 +13812,6 @@ private enum EventDescriptionHTML {
     }
 
     private static func normalizedFontSize(_ value: CGFloat) -> CGFloat {
-        if abs(value - heading1FontSize) < 0.75 { return heading1FontSize }
-        if abs(value - heading2FontSize) < 0.75 { return heading2FontSize }
-        if abs(value - heading3FontSize) < 0.75 { return heading3FontSize }
         if abs(value - bodyFontSize) < 0.75 { return bodyFontSize }
         return min(max((value * 2).rounded() / 2, minFontSize), maxFontSize)
     }
@@ -13836,7 +13842,7 @@ private enum EventDescriptionHTML {
             result.replaceSubrange(range, with: replacement)
         }
 
-        result = result.replacingOccurrences(of: #"(?is)<p>\s*</p>"#, with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: #"(?is)<p>\s*</p>"#, with: "<p><br></p>", options: .regularExpression)
             .replacingOccurrences(of: #"(?is)(<br>\s*){3,}"#, with: "<br><br>", options: .regularExpression)
             .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -13951,11 +13957,21 @@ private enum EventDescriptionHTML {
             paragraphLines.removeAll()
         }
 
-        for rawLine in lines {
+        func hasNonBlankLine(after index: Int) -> Bool {
+            guard index + 1 < lines.count else { return false }
+            return lines[(index + 1)...].contains { line in
+                line.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank != nil
+            }
+        }
+
+        for (index, rawLine) in lines.enumerated() {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             guard !line.isEmpty else {
                 flushParagraph()
                 closeList()
+                if !parts.isEmpty, hasNonBlankLine(after: index) {
+                    parts.append("<p><br></p>")
+                }
                 continue
             }
 
@@ -14005,43 +14021,6 @@ private enum EventDescriptionHTML {
             .replacingOccurrences(of: #"(?s)\*\*(.+?)\*\*"#, with: "<strong>$1</strong>", options: .regularExpression)
             .replacingOccurrences(of: #"(?s)__(.+?)__"#, with: "<strong>$1</strong>", options: .regularExpression)
             .replacingOccurrences(of: #"(?s)(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)"#, with: "<em>$1</em>", options: .regularExpression)
-    }
-
-    private static func headingTag(for attributed: NSAttributedString) -> String {
-        let range = NSRange(location: 0, length: attributed.length)
-        var candidateTag: String?
-        var sawContent = false
-        var invalidHeading = false
-        attributed.enumerateAttribute(.font, in: range) { value, currentRange, stop in
-            let text = (attributed.string as NSString).substring(with: currentRange)
-            guard text.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank != nil else { return }
-            sawContent = true
-            let font = value as? UIFont ?? UIFont.systemFont(ofSize: bodyFontSize)
-            let pointSize = normalizedFontSize(font.pointSize)
-            let isBold = font.fontDescriptor.symbolicTraits.contains(.traitBold)
-            let tag: String?
-            if abs(pointSize - heading1FontSize) < 0.25 {
-                tag = "h1"
-            } else if abs(pointSize - heading2FontSize) < 0.25 {
-                tag = "h2"
-            } else if abs(pointSize - heading3FontSize) < 0.25 {
-                tag = "h3"
-            } else {
-                tag = nil
-            }
-            guard isBold, let tag else {
-                invalidHeading = true
-                stop.pointee = true
-                return
-            }
-            if let candidateTag, candidateTag != tag {
-                invalidHeading = true
-                stop.pointee = true
-                return
-            }
-            candidateTag = tag
-        }
-        return sawContent && !invalidHeading ? (candidateTag ?? "p") : "p"
     }
 
     private static func listInfo(for attributed: NSAttributedString) -> (tag: String, content: NSAttributedString)? {
@@ -24221,9 +24200,6 @@ private enum OrganizerRichTextNativeCommand: String, CaseIterable {
     case underline
     case strikethrough
     case paragraph
-    case heading1
-    case heading2
-    case heading3
     case decreaseFontSize
     case increaseFontSize
     case bulletList
@@ -24239,9 +24215,6 @@ private enum OrganizerRichTextNativeCommand: String, CaseIterable {
         case .underline: "Sottolineato"
         case .strikethrough: "Barrato"
         case .paragraph: "Paragrafo"
-        case .heading1: "Titolo 1"
-        case .heading2: "Titolo 2"
-        case .heading3: "Titolo 3"
         case .decreaseFontSize: "Riduci dimensione testo"
         case .increaseFontSize: "Aumenta dimensione testo"
         case .bulletList: "Elenco puntato"
@@ -24253,8 +24226,19 @@ private enum OrganizerRichTextNativeCommand: String, CaseIterable {
     }
 }
 
+private final class OrganizerRichTextUITextView: UITextView {
+    var customPasteHandler: ((UITextView) -> Bool)?
+
+    override func paste(_ sender: Any?) {
+        if customPasteHandler?(self) == true {
+            return
+        }
+        super.paste(sender)
+    }
+}
+
 private final class OrganizerRichTextUIKitEditorView: UIView {
-    let textView = UITextView()
+    let textView = OrganizerRichTextUITextView()
 
     private let toolbarScrollView = UIScrollView()
     private let toolbarStack = UIStackView()
@@ -24279,9 +24263,6 @@ private final class OrganizerRichTextUIKitEditorView: UIView {
         addButton(title: "S", command: .strikethrough, target: target, action: action)
         addDivider()
         addButton(title: "P", command: .paragraph, target: target, action: action)
-        addButton(title: "H1", command: .heading1, target: target, action: action)
-        addButton(title: "H2", command: .heading2, target: target, action: action)
-        addButton(title: "H3", command: .heading3, target: target, action: action)
         addButton(title: "A-", command: .decreaseFontSize, target: target, action: action)
         addButton(title: "A+", command: .increaseFontSize, target: target, action: action)
         addDivider()
@@ -24435,6 +24416,10 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
         let editorView = OrganizerRichTextUIKitEditorView()
         editorView.configureToolbar(target: context.coordinator, action: #selector(Coordinator.toolbarButtonTapped(_:)))
         editorView.textView.delegate = context.coordinator
+        let coordinator = context.coordinator
+        editorView.textView.customPasteHandler = { [weak coordinator] textView in
+            coordinator?.pasteFromClipboard(in: textView) ?? false
+        }
         context.coordinator.editorView = editorView
         context.coordinator.apply(html, to: editorView.textView)
         return editorView
@@ -24453,6 +24438,7 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
 
     static func dismantleUIView(_ uiView: OrganizerRichTextUIKitEditorView, coordinator: Coordinator) {
         uiView.textView.delegate = nil
+        uiView.textView.customPasteHandler = nil
         coordinator.editorView = nil
     }
 
@@ -24489,12 +24475,6 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
                 toggleTextAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, in: textView)
             case .paragraph:
                 applyBlockStyle(pointSize: EventDescriptionHTML.bodyFontSize, bold: false, in: textView)
-            case .heading1:
-                applyBlockStyle(pointSize: EventDescriptionHTML.heading1FontSize, bold: true, in: textView)
-            case .heading2:
-                applyBlockStyle(pointSize: EventDescriptionHTML.heading2FontSize, bold: true, in: textView)
-            case .heading3:
-                applyBlockStyle(pointSize: EventDescriptionHTML.heading3FontSize, bold: true, in: textView)
             case .decreaseFontSize:
                 adjustFontSize(by: -EventDescriptionHTML.fontSizeStep, in: textView)
             case .increaseFontSize:
@@ -24548,18 +24528,24 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             editorView.setActive(textAttributeActive(.underlineStyle, in: textView), for: .underline)
             editorView.setActive(textAttributeActive(.strikethroughStyle, in: textView), for: .strikethrough)
 
-            let block = currentBlockCommand(in: textView)
-            editorView.setActive(block == .paragraph, for: .paragraph)
-            editorView.setActive(block == .heading1, for: .heading1)
-            editorView.setActive(block == .heading2, for: .heading2)
-            editorView.setActive(block == .heading3, for: .heading3)
             let currentSize = currentFontSize(in: textView)
+            editorView.setActive(abs(currentSize - EventDescriptionHTML.bodyFontSize) < 0.75, for: .paragraph)
             editorView.setEnabled(currentSize > EventDescriptionHTML.minFontSize + 0.25, for: .decreaseFontSize)
             editorView.setEnabled(currentSize < EventDescriptionHTML.maxFontSize - 0.25, for: .increaseFontSize)
             editorView.setActive(currentParagraphHasListPrefix(.unordered, in: textView), for: .bulletList)
             editorView.setActive(currentParagraphHasListPrefix(.ordered, in: textView), for: .orderedList)
             editorView.setEnabled(textView.undoManager?.canUndo ?? false, for: .undo)
             editorView.setEnabled(textView.undoManager?.canRedo ?? false, for: .redo)
+        }
+
+        func pasteFromClipboard(in textView: UITextView) -> Bool {
+            guard let cleanHTML = EventDescriptionHTML.cleanHTMLFromPasteboard(.general) else {
+                return false
+            }
+            let attributed = EventDescriptionHTML.attributedStringForEditing(from: cleanHTML)
+            guard attributed.length > 0 else { return false }
+            insert(attributed, in: textView)
+            return true
         }
 
         private func syncHTML(from textView: UITextView) {
@@ -24618,6 +24604,18 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
                 textView.textStorage.removeAttribute(key, range: selectedRange)
             }
             syncHTML(from: textView)
+        }
+
+        private func insert(_ attributed: NSAttributedString, in textView: UITextView) {
+            let selectedRange = clampedSelection(in: textView)
+            let storage = textView.textStorage
+            storage.beginEditing()
+            storage.replaceCharacters(in: selectedRange, with: attributed)
+            storage.endEditing()
+            textView.selectedRange = NSRange(location: selectedRange.location + attributed.length, length: 0)
+            textView.typingAttributes = effectiveTypingAttributes(in: textView)
+            syncHTML(from: textView)
+            updateToolbarState(textView)
         }
 
         private func adjustFontSize(by delta: CGFloat, in textView: UITextView) {
@@ -24794,17 +24792,6 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
                 }
             }
             return isActive
-        }
-
-        private func currentBlockCommand(in textView: UITextView) -> OrganizerRichTextNativeCommand {
-            let attributes = effectiveTypingAttributes(in: textView)
-            guard let font = attributes[.font] as? UIFont else { return .paragraph }
-            let isBold = font.fontDescriptor.symbolicTraits.contains(.traitBold)
-            guard isBold else { return .paragraph }
-            if abs(font.pointSize - EventDescriptionHTML.heading1FontSize) < 0.75 { return .heading1 }
-            if abs(font.pointSize - EventDescriptionHTML.heading2FontSize) < 0.75 { return .heading2 }
-            if abs(font.pointSize - EventDescriptionHTML.heading3FontSize) < 0.75 { return .heading3 }
-            return .paragraph
         }
 
         private func currentFontSize(in textView: UITextView) -> CGFloat {
