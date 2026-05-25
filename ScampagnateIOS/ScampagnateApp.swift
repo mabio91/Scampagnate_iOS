@@ -23832,8 +23832,8 @@ private final class OrganizerRichTextUIKitEditorView: UIView {
         textView.keyboardDismissMode = .interactive
         textView.alwaysBounceVertical = true
         textView.showsHorizontalScrollIndicator = false
-        textView.contentInsetAdjustmentBehavior = .automatic
-        textView.textContainerInset = UIEdgeInsets(top: 18, left: 18, bottom: 280, right: 18)
+        textView.contentInsetAdjustmentBehavior = .never
+        textView.textContainerInset = UIEdgeInsets(top: 18, left: 18, bottom: 36, right: 18)
         textView.textContainer.lineFragmentPadding = 0
         textView.font = .systemFont(ofSize: 16)
         textView.textColor = UIColor(Brand.inputForeground)
@@ -23863,7 +23863,7 @@ private final class OrganizerRichTextUIKitEditorView: UIView {
             textView.topAnchor.constraint(equalTo: toolbarScrollView.bottomAnchor),
             textView.leadingAnchor.constraint(equalTo: leadingAnchor),
             textView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            textView.bottomAnchor.constraint(equalTo: bottomAnchor)
+            textView.bottomAnchor.constraint(equalTo: keyboardLayoutGuide.topAnchor)
         ])
 
         applyPalette()
