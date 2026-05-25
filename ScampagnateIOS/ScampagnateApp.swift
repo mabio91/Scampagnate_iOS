@@ -13117,6 +13117,14 @@ private struct EventDescriptionHTMLView: UIViewRepresentable {
 }
 
 private enum EventDescriptionHTML {
+    static let bodyFontSize: CGFloat = 16
+    static let heading1FontSize: CGFloat = bodyFontSize * 1.5
+    static let heading2FontSize: CGFloat = bodyFontSize * 1.25
+    static let heading3FontSize: CGFloat = bodyFontSize * 1.1
+    static let minFontSize: CGFloat = 12
+    static let maxFontSize: CGFloat = 30
+    static let fontSizeStep: CGFloat = 1
+
     static func cleanStoredHTML(from source: String) -> String {
         let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -13189,7 +13197,8 @@ private enum EventDescriptionHTML {
             closeList()
             let tag = headingTag(for: paragraph)
             let suppressBold = tag != "p"
-            parts.append("<\(tag)>\(inlineHTML(from: paragraph, suppressBold: suppressBold))</\(tag)>")
+            let suppressFontSize = tag != "p"
+            parts.append("<\(tag)>\(inlineHTML(from: paragraph, suppressBold: suppressBold, suppressFontSize: suppressFontSize))</\(tag)>")
         }
 
         closeList()
@@ -13235,10 +13244,18 @@ private enum EventDescriptionHTML {
         paragraphStyle.lineSpacing = 5
         paragraphStyle.paragraphSpacing = 14
         return [
-            .font: UIFont.systemFont(ofSize: 16, weight: .regular),
+            .font: UIFont.systemFont(ofSize: bodyFontSize, weight: .regular),
             .foregroundColor: UIColor(Brand.inputForeground),
             .paragraphStyle: paragraphStyle
         ]
+    }
+
+    static func cssPixels(_ value: CGFloat) -> String {
+        let rounded = (Double(value) * 10).rounded() / 10
+        if rounded.rounded() == rounded {
+            return "\(Int(rounded))px"
+        }
+        return "\(rounded)px"
     }
 
     static func renderDocument(for html: String) -> String {
@@ -13255,31 +13272,31 @@ private enum EventDescriptionHTML {
         body {
           color: #15281F;
           font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-          font-size: 16px;
+          font-size: \(Self.cssPixels(bodyFontSize));
           line-height: 1.55;
           -webkit-font-smoothing: antialiased;
           overflow-wrap: anywhere;
         }
         h1 {
-          font-size: 24px;
+          font-size: \(Self.cssPixels(heading1FontSize));
           font-weight: 800;
           line-height: 1.2;
-          margin: 32px 0 16px;
+          margin: 0.8em 0 0.4em;
         }
         h2 {
-          font-size: 21px;
+          font-size: \(Self.cssPixels(heading2FontSize));
           font-weight: 800;
           line-height: 1.25;
-          margin: 30px 0 12px;
+          margin: 0.7em 0 0.3em;
         }
         h3 {
-          font-size: 17px;
+          font-size: \(Self.cssPixels(heading3FontSize));
           font-weight: 700;
           line-height: 1.35;
-          margin: 22px 0 8px;
+          margin: 0.6em 0 0.2em;
         }
         p {
-          margin: 0 0 14px;
+          margin: 0.5em 0;
           line-height: 1.55;
         }
         ul, ol {
@@ -13340,15 +13357,15 @@ private enum EventDescriptionHTML {
         <style>
         body {
           font-family: -apple-system;
-          font-size: 16px;
+          font-size: \(Self.cssPixels(bodyFontSize));
           line-height: 1.45;
           margin: 0;
           color: #15281F;
         }
-        h1 { font-size: 24px; font-weight: 800; line-height: 1.2; margin: 24px 0 12px; }
-        h2 { font-size: 21px; font-weight: 800; line-height: 1.25; margin: 22px 0 10px; }
-        h3 { font-size: 17px; font-weight: 700; line-height: 1.35; margin: 18px 0 8px; }
-        p { margin: 0 0 12px; }
+        h1 { font-size: \(Self.cssPixels(heading1FontSize)); font-weight: 800; line-height: 1.2; margin: 0.8em 0 0.4em; }
+        h2 { font-size: \(Self.cssPixels(heading2FontSize)); font-weight: 800; line-height: 1.25; margin: 0.7em 0 0.3em; }
+        h3 { font-size: \(Self.cssPixels(heading3FontSize)); font-weight: 700; line-height: 1.35; margin: 0.6em 0 0.2em; }
+        p { margin: 0.5em 0; }
         ul, ol { margin: 8px 0 14px 20px; padding: 0; }
         li { margin: 0 0 6px; }
         </style>
@@ -13361,21 +13378,11 @@ private enum EventDescriptionHTML {
     private static func normalizeForEditing(_ attributed: NSMutableAttributedString) {
         let fullRange = NSRange(location: 0, length: attributed.length)
         guard fullRange.length > 0 else { return }
-        let bodySize: CGFloat = 16
         attributed.enumerateAttribute(.font, in: fullRange) { value, range, _ in
-            let currentFont = value as? UIFont ?? UIFont.systemFont(ofSize: bodySize)
-            let pointSize: CGFloat
-            if currentFont.pointSize >= 23 {
-                pointSize = 24
-            } else if currentFont.pointSize >= 20 {
-                pointSize = 21
-            } else if currentFont.pointSize >= 17 {
-                pointSize = 17
-            } else {
-                pointSize = bodySize
-            }
+            let currentFont = value as? UIFont ?? UIFont.systemFont(ofSize: bodyFontSize)
+            let pointSize = normalizedFontSize(currentFont.pointSize)
             var traits = UIFontDescriptor.SymbolicTraits()
-            if currentFont.fontDescriptor.symbolicTraits.contains(.traitBold) || pointSize > bodySize {
+            if currentFont.fontDescriptor.symbolicTraits.contains(.traitBold) {
                 traits.insert(.traitBold)
             }
             if currentFont.fontDescriptor.symbolicTraits.contains(.traitItalic) {
@@ -13389,6 +13396,14 @@ private enum EventDescriptionHTML {
         attributed.removeAttribute(.foregroundColor, range: fullRange)
         attributed.removeAttribute(.backgroundColor, range: fullRange)
         attributed.addAttribute(.foregroundColor, value: UIColor(Brand.inputForeground), range: fullRange)
+    }
+
+    private static func normalizedFontSize(_ value: CGFloat) -> CGFloat {
+        if abs(value - heading1FontSize) < 0.75 { return heading1FontSize }
+        if abs(value - heading2FontSize) < 0.75 { return heading2FontSize }
+        if abs(value - heading3FontSize) < 0.75 { return heading3FontSize }
+        if abs(value - bodyFontSize) < 0.75 { return bodyFontSize }
+        return min(max((value * 2).rounded() / 2, minFontSize), maxFontSize)
     }
 
     private static func sanitizeRawHTML(_ source: String) -> String {
@@ -13442,7 +13457,7 @@ private enum EventDescriptionHTML {
             mappedTag = "s"
         case "div":
             mappedTag = "p"
-        case "h1", "h2", "h3", "p", "strong", "em", "u", "s", "ul", "ol", "li", "br", "a", "blockquote", "hr":
+        case "h1", "h2", "h3", "p", "strong", "em", "u", "s", "span", "ul", "ol", "li", "br", "a", "blockquote", "hr":
             mappedTag = rawTag
         case "h4", "h5", "h6":
             mappedTag = "h3"
@@ -13460,6 +13475,10 @@ private enum EventDescriptionHTML {
 
         if mappedTag == "a", let href = hrefValue(from: attributes) {
             return "<a href=\"\(escapeAttribute(href))\">"
+        }
+
+        if mappedTag == "span", let style = fontSizeStyle(from: attributes) {
+            return "<span style=\"\(style)\">"
         }
 
         return "<\(mappedTag)>"
@@ -13483,6 +13502,30 @@ private enum EventDescriptionHTML {
         let value = nsAttributes.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
         guard value.hasPrefix("http://") || value.hasPrefix("https://") else { return nil }
         return value
+    }
+
+    private static func fontSizeStyle(from attributes: String) -> String? {
+        guard let styleRegex = try? NSRegularExpression(pattern: #"(?i)style\s*=\s*["']([^"']+)["']"#),
+              let sizeRegex = try? NSRegularExpression(pattern: #"(?i)(?:^|;)\s*font-size\s*:\s*([0-9]+(?:\.[0-9]+)?)(px|pt|em|rem)?"#) else {
+            return nil
+        }
+        let nsAttributes = attributes as NSString
+        guard let styleMatch = styleRegex.firstMatch(in: attributes, range: NSRange(location: 0, length: nsAttributes.length)),
+              styleMatch.range(at: 1).location != NSNotFound else {
+            return nil
+        }
+        let style = nsAttributes.substring(with: styleMatch.range(at: 1))
+        let nsStyle = style as NSString
+        guard let sizeMatch = sizeRegex.firstMatch(in: style, range: NSRange(location: 0, length: nsStyle.length)),
+              sizeMatch.range(at: 1).location != NSNotFound,
+              let rawValue = Double(nsStyle.substring(with: sizeMatch.range(at: 1))) else {
+            return nil
+        }
+        let rawUnit = sizeMatch.range(at: 2).location == NSNotFound ? "px" : nsStyle.substring(with: sizeMatch.range(at: 2)).lowercased()
+        let multiplier: CGFloat = (rawUnit == "em" || rawUnit == "rem") ? bodyFontSize : 1
+        let pointSize = min(max(CGFloat(rawValue) * multiplier, minFontSize), maxFontSize)
+        guard abs(pointSize - bodyFontSize) >= 0.5 else { return nil }
+        return "font-size: \(cssPixels(pointSize))"
     }
 
     private static func markdownHTML(from source: String) -> String {
@@ -13562,20 +13605,39 @@ private enum EventDescriptionHTML {
 
     private static func headingTag(for attributed: NSAttributedString) -> String {
         let range = NSRange(location: 0, length: attributed.length)
-        var maxFontSize: CGFloat = 16
-        var hasBold = false
-        attributed.enumerateAttribute(.font, in: range) { value, _, _ in
-            guard let font = value as? UIFont else { return }
-            maxFontSize = max(maxFontSize, font.pointSize)
-            if font.fontDescriptor.symbolicTraits.contains(.traitBold) {
-                hasBold = true
+        var candidateTag: String?
+        var sawContent = false
+        var invalidHeading = false
+        attributed.enumerateAttribute(.font, in: range) { value, currentRange, stop in
+            let text = (attributed.string as NSString).substring(with: currentRange)
+            guard text.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank != nil else { return }
+            sawContent = true
+            let font = value as? UIFont ?? UIFont.systemFont(ofSize: bodyFontSize)
+            let pointSize = normalizedFontSize(font.pointSize)
+            let isBold = font.fontDescriptor.symbolicTraits.contains(.traitBold)
+            let tag: String?
+            if abs(pointSize - heading1FontSize) < 0.25 {
+                tag = "h1"
+            } else if abs(pointSize - heading2FontSize) < 0.25 {
+                tag = "h2"
+            } else if abs(pointSize - heading3FontSize) < 0.25 {
+                tag = "h3"
+            } else {
+                tag = nil
             }
+            guard isBold, let tag else {
+                invalidHeading = true
+                stop.pointee = true
+                return
+            }
+            if let candidateTag, candidateTag != tag {
+                invalidHeading = true
+                stop.pointee = true
+                return
+            }
+            candidateTag = tag
         }
-
-        if maxFontSize >= 23 { return "h1" }
-        if maxFontSize >= 20 { return "h2" }
-        if maxFontSize >= 17, hasBold { return "h3" }
-        return "p"
+        return sawContent && !invalidHeading ? (candidateTag ?? "p") : "p"
     }
 
     private static func listInfo(for attributed: NSAttributedString) -> (tag: String, content: NSAttributedString)? {
@@ -13629,7 +13691,7 @@ private enum EventDescriptionHTML {
         return substring.attributedSubstring(from: NSRange(location: start, length: end - start))
     }
 
-    private static func inlineHTML(from attributed: NSAttributedString, suppressBold: Bool = false) -> String {
+    private static func inlineHTML(from attributed: NSAttributedString, suppressBold: Bool = false, suppressFontSize: Bool = false) -> String {
         let range = NSRange(location: 0, length: attributed.length)
         guard range.length > 0 else { return "" }
         var output = ""
@@ -13642,6 +13704,10 @@ private enum EventDescriptionHTML {
                 wrappers.append(("<a href=\"\(escapeAttribute(urlString))\">", "</a>"))
             }
             if let font = attributes[.font] as? UIFont {
+                let pointSize = normalizedFontSize(font.pointSize)
+                if !suppressFontSize, abs(pointSize - bodyFontSize) >= 0.5 {
+                    wrappers.append(("<span style=\"font-size: \(cssPixels(pointSize))\">", "</span>"))
+                }
                 let traits = font.fontDescriptor.symbolicTraits
                 if traits.contains(.traitBold), !suppressBold {
                     wrappers.append(("<strong>", "</strong>"))
@@ -23714,6 +23780,8 @@ private enum OrganizerRichTextNativeCommand: String, CaseIterable {
     case heading1
     case heading2
     case heading3
+    case decreaseFontSize
+    case increaseFontSize
     case bulletList
     case orderedList
     case link
@@ -23730,6 +23798,8 @@ private enum OrganizerRichTextNativeCommand: String, CaseIterable {
         case .heading1: "Titolo 1"
         case .heading2: "Titolo 2"
         case .heading3: "Titolo 3"
+        case .decreaseFontSize: "Riduci dimensione testo"
+        case .increaseFontSize: "Aumenta dimensione testo"
         case .bulletList: "Elenco puntato"
         case .orderedList: "Elenco numerato"
         case .link: "Inserisci link"
@@ -23768,6 +23838,8 @@ private final class OrganizerRichTextUIKitEditorView: UIView {
         addButton(title: "H1", command: .heading1, target: target, action: action)
         addButton(title: "H2", command: .heading2, target: target, action: action)
         addButton(title: "H3", command: .heading3, target: target, action: action)
+        addButton(title: "A-", command: .decreaseFontSize, target: target, action: action)
+        addButton(title: "A+", command: .increaseFontSize, target: target, action: action)
         addDivider()
         addButton(title: "•", command: .bulletList, target: target, action: action)
         addButton(title: "1.", command: .orderedList, target: target, action: action)
@@ -23835,7 +23907,7 @@ private final class OrganizerRichTextUIKitEditorView: UIView {
         textView.contentInsetAdjustmentBehavior = .never
         textView.textContainerInset = UIEdgeInsets(top: 18, left: 18, bottom: 36, right: 18)
         textView.textContainer.lineFragmentPadding = 0
-        textView.font = .systemFont(ofSize: 16)
+        textView.font = .systemFont(ofSize: EventDescriptionHTML.bodyFontSize)
         textView.textColor = UIColor(Brand.inputForeground)
         textView.tintColor = UIColor(Brand.primary)
         textView.typingAttributes = EventDescriptionHTML.editorTypingAttributes()
@@ -23972,13 +24044,17 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             case .strikethrough:
                 toggleTextAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, in: textView)
             case .paragraph:
-                applyBlockStyle(pointSize: 16, bold: false, in: textView)
+                applyBlockStyle(pointSize: EventDescriptionHTML.bodyFontSize, bold: false, in: textView)
             case .heading1:
-                applyBlockStyle(pointSize: 24, bold: true, in: textView)
+                applyBlockStyle(pointSize: EventDescriptionHTML.heading1FontSize, bold: true, in: textView)
             case .heading2:
-                applyBlockStyle(pointSize: 21, bold: true, in: textView)
+                applyBlockStyle(pointSize: EventDescriptionHTML.heading2FontSize, bold: true, in: textView)
             case .heading3:
-                applyBlockStyle(pointSize: 17, bold: true, in: textView)
+                applyBlockStyle(pointSize: EventDescriptionHTML.heading3FontSize, bold: true, in: textView)
+            case .decreaseFontSize:
+                adjustFontSize(by: -EventDescriptionHTML.fontSizeStep, in: textView)
+            case .increaseFontSize:
+                adjustFontSize(by: EventDescriptionHTML.fontSizeStep, in: textView)
             case .bulletList:
                 toggleList(kind: .unordered, in: textView)
             case .orderedList:
@@ -24033,6 +24109,9 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             editorView.setActive(block == .heading1, for: .heading1)
             editorView.setActive(block == .heading2, for: .heading2)
             editorView.setActive(block == .heading3, for: .heading3)
+            let currentSize = currentFontSize(in: textView)
+            editorView.setEnabled(currentSize > EventDescriptionHTML.minFontSize + 0.25, for: .decreaseFontSize)
+            editorView.setEnabled(currentSize < EventDescriptionHTML.maxFontSize - 0.25, for: .increaseFontSize)
             editorView.setActive(currentParagraphHasListPrefix(.unordered, in: textView), for: .bulletList)
             editorView.setActive(currentParagraphHasListPrefix(.ordered, in: textView), for: .orderedList)
             editorView.setEnabled(textView.undoManager?.canUndo ?? false, for: .undo)
@@ -24055,7 +24134,7 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             let selectedRange = clampedSelection(in: textView)
             if selectedRange.length == 0 {
                 var attributes = effectiveTypingAttributes(in: textView)
-                let currentFont = attributes[.font] as? UIFont ?? UIFont.systemFont(ofSize: 16)
+                let currentFont = attributes[.font] as? UIFont ?? UIFont.systemFont(ofSize: EventDescriptionHTML.bodyFontSize)
                 attributes[.font] = font(currentFont, setting: trait, enabled: shouldEnable)
                 textView.typingAttributes = attributes
                 return
@@ -24064,7 +24143,7 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             let storage = textView.textStorage
             var replacements: [(NSRange, UIFont)] = []
             storage.enumerateAttribute(.font, in: selectedRange) { value, range, _ in
-                let currentFont = value as? UIFont ?? UIFont.systemFont(ofSize: 16)
+                let currentFont = value as? UIFont ?? UIFont.systemFont(ofSize: EventDescriptionHTML.bodyFontSize)
                 replacements.append((range, font(currentFont, setting: trait, enabled: shouldEnable)))
             }
             storage.beginEditing()
@@ -24094,6 +24173,30 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             } else {
                 textView.textStorage.removeAttribute(key, range: selectedRange)
             }
+            syncHTML(from: textView)
+        }
+
+        private func adjustFontSize(by delta: CGFloat, in textView: UITextView) {
+            let selectedRange = clampedSelection(in: textView)
+            if selectedRange.length == 0 {
+                var attributes = effectiveTypingAttributes(in: textView)
+                let currentFont = attributes[.font] as? UIFont ?? UIFont.systemFont(ofSize: EventDescriptionHTML.bodyFontSize)
+                attributes[.font] = font(currentFont, pointSize: currentFont.pointSize + delta)
+                textView.typingAttributes = attributes
+                return
+            }
+
+            let storage = textView.textStorage
+            var replacements: [(range: NSRange, font: UIFont)] = []
+            storage.enumerateAttribute(.font, in: selectedRange) { value, range, _ in
+                let currentFont = value as? UIFont ?? UIFont.systemFont(ofSize: EventDescriptionHTML.bodyFontSize)
+                replacements.append((range, font(currentFont, pointSize: currentFont.pointSize + delta)))
+            }
+            storage.beginEditing()
+            for replacement in replacements {
+                storage.addAttribute(.font, value: replacement.font, range: replacement.range)
+            }
+            storage.endEditing()
             syncHTML(from: textView)
         }
 
@@ -24225,7 +24328,7 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             }
             var isActive = true
             textView.attributedText.enumerateAttribute(.font, in: range) { value, _, stop in
-                let font = value as? UIFont ?? UIFont.systemFont(ofSize: 16)
+                let font = value as? UIFont ?? UIFont.systemFont(ofSize: EventDescriptionHTML.bodyFontSize)
                 if !font.fontDescriptor.symbolicTraits.contains(trait) {
                     isActive = false
                     stop.pointee = true
@@ -24253,10 +24356,16 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             let attributes = effectiveTypingAttributes(in: textView)
             guard let font = attributes[.font] as? UIFont else { return .paragraph }
             let isBold = font.fontDescriptor.symbolicTraits.contains(.traitBold)
-            if font.pointSize >= 23 { return .heading1 }
-            if font.pointSize >= 20 { return .heading2 }
-            if font.pointSize >= 17, isBold { return .heading3 }
+            guard isBold else { return .paragraph }
+            if abs(font.pointSize - EventDescriptionHTML.heading1FontSize) < 0.75 { return .heading1 }
+            if abs(font.pointSize - EventDescriptionHTML.heading2FontSize) < 0.75 { return .heading2 }
+            if abs(font.pointSize - EventDescriptionHTML.heading3FontSize) < 0.75 { return .heading3 }
             return .paragraph
+        }
+
+        private func currentFontSize(in textView: UITextView) -> CGFloat {
+            let font = effectiveTypingAttributes(in: textView)[.font] as? UIFont
+            return font?.pointSize ?? EventDescriptionHTML.bodyFontSize
         }
 
         private func currentParagraphHasListPrefix(_ kind: ListKind, in textView: UITextView) -> Bool {
@@ -24348,6 +24457,13 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             }
             let descriptor = source.fontDescriptor.withSymbolicTraits(traits) ?? source.fontDescriptor
             return UIFont(descriptor: descriptor, size: source.pointSize)
+        }
+
+        private func font(_ source: UIFont, pointSize: CGFloat) -> UIFont {
+            let size = min(max((pointSize * 2).rounded() / 2, EventDescriptionHTML.minFontSize), EventDescriptionHTML.maxFontSize)
+            let baseFont = UIFont.systemFont(ofSize: size)
+            let descriptor = baseFont.fontDescriptor.withSymbolicTraits(source.fontDescriptor.symbolicTraits) ?? baseFont.fontDescriptor
+            return UIFont(descriptor: descriptor, size: size)
         }
 
         private func blockFont(from source: UIFont?, pointSize: CGFloat, bold: Bool) -> UIFont {
