@@ -23226,7 +23226,6 @@ private struct OrganizerEventDraftPreviewSheet: View {
     let draft: OrganizerEventDraft
     let categories: [EventCategory]
     let directURL: URL?
-    @State private var descriptionExpanded = true
 
     private var category: EventCategory? {
         categories.first { $0.id == draft.categoryId }
@@ -23242,22 +23241,24 @@ private struct OrganizerEventDraftPreviewSheet: View {
         manualBadgeLabels + [draft.customBadge.nilIfBlank].compactMap { $0 }
     }
 
+    private var descriptionPreviewText: String {
+        EventDescriptionHTML.cleanStoredHTML(from: draft.description).htmlPlainText.nilIfBlank ?? "Nessuna descrizione disponibile"
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     hero
                     quickFacts
-                    DescriptionBlock(
-                        description: draft.description.nilIfBlank ?? "Nessuna descrizione disponibile",
-                        expanded: $descriptionExpanded
-                    )
+                    previewDescription
                     meetingPoints
                     equipment
                     pricing
                     registrationFields
                 }
                 .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .background(Brand.background)
             .navigationTitle("Anteprima evento")
@@ -23275,6 +23276,7 @@ private struct OrganizerEventDraftPreviewSheet: View {
     private var hero: some View {
         VStack(alignment: .leading, spacing: 12) {
             RemoteImage(urlString: draft.imageUrl)
+                .frame(maxWidth: .infinity)
                 .frame(height: 220)
                 .clipShape(RoundedRectangle(cornerRadius: 22))
                 .overlay(alignment: .topLeading) {
@@ -23325,6 +23327,7 @@ private struct OrganizerEventDraftPreviewSheet: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var quickFacts: some View {
@@ -23343,6 +23346,20 @@ private struct OrganizerEventDraftPreviewSheet: View {
                 OrganizerDraftPreviewFact(icon: "arrow.up.right", title: "Dislivello", value: elevation.lowercased().contains("m") ? elevation : "\(elevation) m")
             }
         }
+    }
+
+    private var previewDescription: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionTitle("L'esperienza")
+            Text(descriptionPreviewText)
+                .font(.subheadline)
+                .foregroundStyle(Brand.mutedForeground)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Brand.muted, lineWidth: 1))
     }
 
     @ViewBuilder
