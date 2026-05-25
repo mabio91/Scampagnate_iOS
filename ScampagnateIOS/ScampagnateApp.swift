@@ -1824,6 +1824,11 @@ enum ProfileScrollTarget: Hashable, Sendable {
     case help
 }
 
+enum ProfileEditInitialFocus: Hashable, Sendable {
+    case membership
+    case membershipSex
+}
+
 struct HomeDiscoveryRequest: Identifiable, Equatable, Sendable {
     let id = UUID()
     let category: String?
@@ -4081,10 +4086,14 @@ struct Profile: Codable, Identifiable {
         missingMembershipFieldLabels.isEmpty
     }
 
+    var isMissingMembershipSex: Bool {
+        sex != "M" && sex != "F"
+    }
+
     var missingMembershipFieldLabels: [String] {
         var labels: [String] = []
         if birthDate?.nilIfBlank == nil { labels.append("Data di nascita") }
-        if sex != "M" && sex != "F" { labels.append("Sesso anagrafico") }
+        if isMissingMembershipSex { labels.append("Sesso anagrafico") }
         if birthPlace?.nilIfBlank == nil { labels.append("Luogo di nascita") }
         if provinceOfBirth?.nilIfBlank == nil { labels.append("Provincia di nascita") }
         if residentialAddress?.nilIfBlank == nil { labels.append("Indirizzo di residenza") }
@@ -14874,6 +14883,7 @@ struct RegistrationCheckoutSheet: View {
     @State private var submitting = false
     @State private var attemptedSubmit = false
     @State private var showMembershipProfileEditor = false
+    @State private var membershipProfileEditorFocus: ProfileEditInitialFocus?
     @State private var promoNow = Date()
 
     var priceEligibilityContext: PriceEligibilityContext {
@@ -15085,9 +15095,11 @@ struct RegistrationCheckoutSheet: View {
             .onReceive(Timer.publish(every: 60, on: .main, in: .common).autoconnect()) { now in
                 promoNow = now
             }
-            .sheet(isPresented: $showMembershipProfileEditor) {
+            .sheet(isPresented: $showMembershipProfileEditor, onDismiss: {
+                membershipProfileEditorFocus = nil
+            }) {
                 if let profile = store.profile {
-                    ProfileEditSheet(profile: profile)
+                    ProfileEditSheet(profile: profile, initialFocus: membershipProfileEditorFocus)
                         .presentationDetents([.fraction(0.86), .large])
                         .presentationDragIndicator(.hidden)
                 }
@@ -15318,6 +15330,7 @@ struct RegistrationCheckoutSheet: View {
                 }
 
                 Button {
+                    membershipProfileEditorFocus = profile.isMissingMembershipSex ? .membershipSex : .membership
                     showMembershipProfileEditor = true
                 } label: {
                     Label("Completa dati profilo", systemImage: "pencil")
@@ -15506,6 +15519,7 @@ struct RegistrationCheckoutSheet: View {
               !profile.hasCompleteMembershipProfile else {
             return true
         }
+        membershipProfileEditorFocus = profile.isMissingMembershipSex ? .membershipSex : .membership
         showMembershipProfileEditor = true
         return false
     }
@@ -26744,6 +26758,7 @@ struct ProfileView: View {
     @Binding var openRewards: Bool
     @Binding var routedMission: MissionNavigationTarget?
     @State private var showEdit = false
+    @State private var profileEditInitialFocus: ProfileEditInitialFocus?
     @State private var showHealthSafetyEdit = false
     @State private var showPointsInfo = false
     @State private var showRoutedRewards = false
@@ -26788,7 +26803,10 @@ struct ProfileView: View {
                                                 .buttonStyle(.plain)
                                             }
                                             Spacer()
-                                            Button { showEdit = true } label: {
+                                            Button {
+                                                profileEditInitialFocus = nil
+                                                showEdit = true
+                                            } label: {
                                                 Image(systemName: "pencil")
                                                     .font(.system(size: 18, weight: .semibold))
                                                     .foregroundStyle(Brand.mutedForeground)
@@ -26808,10 +26826,12 @@ struct ProfileView: View {
                                         }
 
                                         ProfileCompletenessCard(profile: profile) {
+                                            profileEditInitialFocus = nil
                                             showEdit = true
                                         }
                                         if !profile.hasCompleteMembershipProfile {
                                             MembershipProfileCallout {
+                                                profileEditInitialFocus = profile.isMissingMembershipSex ? .membershipSex : .membership
                                                 showEdit = true
                                             }
                                         }
@@ -26849,8 +26869,10 @@ struct ProfileView: View {
                                 scrollToProfileTarget(with: scrollProxy)
                             }
                         }
-                        .sheet(isPresented: $showEdit) {
-                            ProfileEditSheet(profile: profile)
+                        .sheet(isPresented: $showEdit, onDismiss: {
+                            profileEditInitialFocus = nil
+                        }) {
+                            ProfileEditSheet(profile: profile, initialFocus: profileEditInitialFocus)
                                 .presentationDetents([.fraction(0.86), .large])
                                 .presentationDragIndicator(.hidden)
                         }
@@ -30897,6 +30919,7 @@ struct ProfileEditSheet: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
     let profile: Profile
+    var initialFocus: ProfileEditInitialFocus? = nil
     @State private var input = ProfileEditInput()
     @State private var saving = false
     @State private var selectedAvatarItem: PhotosPickerItem?
@@ -30912,41 +30935,47 @@ struct ProfileEditSheet: View {
     @State private var updatingAccount = false
     @State private var deleteDialog: DeleteAccountDialog?
     @State private var isDeletingAccount = false
+    @State private var highlightedFocus: ProfileEditInitialFocus?
 
     var body: some View {
         NavigationStack {
             ZStack(alignment: .bottom) {
                 Brand.background.ignoresSafeArea()
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 22) {
-                        sheetHeader
-                        profileFields
-                        membershipFields
+                ScrollViewReader { scrollProxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 22) {
+                            sheetHeader
+                            profileFields
+                            membershipFields
 
-                        if hasChanges {
-                            Button {
-                                Task { await saveProfile() }
-                            } label: {
-                                HStack {
-                                    if saving {
-                                        ProgressView()
-                                            .tint(.white)
+                            if hasChanges {
+                                Button {
+                                    Task { await saveProfile() }
+                                } label: {
+                                    HStack {
+                                        if saving {
+                                            ProgressView()
+                                                .tint(.white)
+                                        }
+                                        Text(saving ? "Salvataggio..." : "Salva modifiche")
                                     }
-                                    Text(saving ? "Salvataggio..." : "Salva modifiche")
+                                    .frame(maxWidth: .infinity)
                                 }
-                                .frame(maxWidth: .infinity)
+                                .buttonStyle(PrimaryButtonStyle())
+                                .disabled(saving)
                             }
-                            .buttonStyle(PrimaryButtonStyle())
-                            .disabled(saving)
-                        }
 
-                        preferencesSection
-                        accountSection
+                            preferencesSection
+                            accountSection
+                        }
+                        .padding(.horizontal, 22)
+                        .padding(.top, 22)
+                        .padding(.bottom, 42)
                     }
-                    .padding(.horizontal, 22)
-                    .padding(.top, 22)
-                    .padding(.bottom, 42)
+                    .onAppear {
+                        scheduleInitialFocus(with: scrollProxy)
+                    }
                 }
 
                 if let deleteDialog {
@@ -31085,8 +31114,9 @@ struct ProfileEditSheet: View {
                 )
                 .frame(width: 150)
 
-                ProfileSheetSexField(sex: $input.sex)
+                ProfileSheetSexField(sex: $input.sex, highlighted: highlightedFocus == .membershipSex)
                     .frame(width: 106)
+                    .id(ProfileEditInitialFocus.membershipSex)
             }
             HStack(alignment: .top, spacing: 14) {
                 ProfileSheetField(
@@ -31121,6 +31151,7 @@ struct ProfileEditSheet: View {
         .padding(16)
         .background(Brand.background, in: RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Brand.muted, lineWidth: 1))
+        .id(ProfileEditInitialFocus.membership)
     }
 
     private var preferencesSection: some View {
@@ -31203,6 +31234,27 @@ struct ProfileEditSheet: View {
             bio: profile.bio ?? ""
         )
         input.normalizeProvinceFields()
+    }
+
+    private func scheduleInitialFocus(with proxy: ScrollViewProxy) {
+        guard let initialFocus else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            withAnimation(.snappy) {
+                proxy.scrollTo(initialFocus, anchor: initialFocus == .membershipSex ? .center : .top)
+            }
+
+            if initialFocus == .membershipSex {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    highlightedFocus = .membershipSex
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    guard highlightedFocus == .membershipSex else { return }
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        highlightedFocus = nil
+                    }
+                }
+            }
+        }
     }
 
     private func saveProfile() async {
@@ -31961,6 +32013,7 @@ struct ProfileSheetField: View {
 
 struct ProfileSheetSexField: View {
     @Binding var sex: String
+    var highlighted = false
     private let options = ["M", "F"]
 
     var body: some View {
@@ -31992,14 +32045,21 @@ struct ProfileSheetSexField: View {
                 }
                 .padding(.horizontal, 12)
                 .frame(height: ProfileSheetFieldStyle.inputHeight)
-                .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius))
-                .overlay(RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius).stroke(Brand.inputBorder, lineWidth: ProfileSheetFieldStyle.inputBorderWidth))
+                .background(
+                    highlighted ? Brand.primary.opacity(0.08) : Brand.inputBackground,
+                    in: RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius)
+                        .stroke(highlighted ? Brand.primary : Brand.inputBorder, lineWidth: highlighted ? 2 : ProfileSheetFieldStyle.inputBorderWidth)
+                )
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Sesso")
             .accessibilityValue(sex.isEmpty ? "Non selezionato" : sex)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(.easeInOut(duration: 0.18), value: highlighted)
     }
 }
 
