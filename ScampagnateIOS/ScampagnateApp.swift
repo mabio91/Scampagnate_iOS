@@ -9024,7 +9024,7 @@ struct HomeView: View {
                 event.category?.name ?? ""
             ].contains { $0.normalizedSearchText.contains(normalizedQuery) }
             let matchesCategory = selectedCategory == nil || event.category?.name == selectedCategory
-            let matchesQuickFilter = activeQuickFilters.allSatisfy { $0.matches(event) }
+            let matchesQuickFilter = activeQuickFilters.matchesAll(event)
             let matchesDate = selectedDateFilter.map { event.date == DateFormatter.eventDate.string(from: $0) } ?? true
             let matchesPrice = priceFilter.matches(event)
             return matchesQuery && matchesCategory && matchesQuickFilter && matchesDate && matchesPrice
@@ -9724,6 +9724,12 @@ enum QuickFilter: String, CaseIterable, Identifiable, Sendable {
         case .challenging:
             return event.difficultyLevel.map { $0 == 4 || $0 == 5 } ?? false
         }
+    }
+}
+
+extension Set where Element == QuickFilter {
+    func matchesAll(_ event: Event) -> Bool {
+        allSatisfy { $0.matches(event) }
     }
 }
 
@@ -27100,10 +27106,10 @@ struct MembershipProfileCallout: View {
                     .frame(width: 34, height: 34)
                     .background(Brand.primary.opacity(0.12), in: Circle())
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Completa dati tessera e assicurazione")
+                    Text("Completa dati per tessera e assicurazione")
                         .font(.system(.subheadline, design: .rounded, weight: .bold))
                         .foregroundStyle(Brand.foreground)
-                    Text("Per attivare tessera e copertura assicurativa servono anche sesso anagrafico, nascita e residenza.")
+                    Text("Ci servono data di nascita, sesso anagrafico e residenza per completare tessera associativa e copertura assicurativa.")
                         .font(.caption)
                         .foregroundStyle(Brand.mutedForeground)
                         .fixedSize(horizontal: false, vertical: true)
@@ -31062,21 +31068,26 @@ struct ProfileEditSheet: View {
 
     private var membershipFields: some View {
         VStack(alignment: .leading, spacing: 14) {
-            ProfileSheetLabel("Dati per tesseramento")
-            Text("Questi dati sono richiesti solo per la gestione della tessera associativa della ASD Gruppo Scampagnate.")
+            ProfileSheetLabel("Dati per tessera e assicurazione")
+            Text("Ci servono solo per completare la tessera associativa e la copertura assicurativa. Sono visibili allo staff quando necessario.")
                 .font(.caption)
                 .foregroundStyle(Brand.mutedForeground)
                 .fixedSize(horizontal: false, vertical: true)
 
-            BirthDatePickerField(
-                "Data di nascita",
-                dateString: $input.birthDate,
-                showsClearButton: true,
-                labelFont: ProfileSheetFieldStyle.labelFont,
-                labelSpacing: ProfileSheetFieldStyle.labelSpacing,
-                borderWidth: ProfileSheetFieldStyle.inputBorderWidth
-            )
-            ProfileSheetSexField(sex: $input.sex)
+            HStack(alignment: .top, spacing: 12) {
+                BirthDatePickerField(
+                    "Data di nascita",
+                    dateString: $input.birthDate,
+                    showsClearButton: true,
+                    labelFont: ProfileSheetFieldStyle.labelFont,
+                    labelSpacing: ProfileSheetFieldStyle.labelSpacing,
+                    borderWidth: ProfileSheetFieldStyle.inputBorderWidth
+                )
+                .layoutPriority(1)
+
+                ProfileSheetSexField(sex: $input.sex)
+                    .frame(width: 118)
+            }
             HStack(alignment: .top, spacing: 14) {
                 ProfileSheetField(
                     "Luogo di nascita",
@@ -31955,27 +31966,38 @@ struct ProfileSheetSexField: View {
     var body: some View {
         VStack(alignment: .leading, spacing: ProfileSheetFieldStyle.labelSpacing) {
             HStack(spacing: 6) {
-                ProfileSheetInputLabel("Sesso anagrafico")
+                ProfileSheetInputLabel("Sesso")
                 InfoTooltipButton(text: "Richiesto come valore M/F per tessera associativa e copertura assicurativa.")
             }
-            HStack(spacing: 8) {
-                ForEach(options, id: \.self) { option in
-                    Button {
-                        sex = option
-                    } label: {
-                        Text(option)
-                            .font(.body.weight(.semibold))
-                            .frame(maxWidth: .infinity)
-                            .frame(height: ProfileSheetFieldStyle.inputHeight)
-                            .background(sex == option ? Brand.primary : Brand.inputBackground, in: RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius))
-                            .foregroundStyle(sex == option ? .white : Brand.inputForeground)
-                            .overlay(RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius).stroke(sex == option ? Brand.primary : Brand.inputBorder, lineWidth: ProfileSheetFieldStyle.inputBorderWidth))
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Sesso \(option)")
-                    .accessibilityAddTraits(sex == option ? .isSelected : [])
+            Menu {
+                Button("Non selezionato") {
+                    sex = ""
                 }
+                Divider()
+                ForEach(options, id: \.self) { option in
+                    Button(option) {
+                        sex = option
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Text(sex.isEmpty ? "Seleziona" : sex)
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(sex.isEmpty ? Brand.inputMutedForeground : Brand.inputForeground)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Brand.primary)
+                }
+                .padding(.horizontal, 12)
+                .frame(height: ProfileSheetFieldStyle.inputHeight)
+                .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius))
+                .overlay(RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius).stroke(Brand.inputBorder, lineWidth: ProfileSheetFieldStyle.inputBorderWidth))
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Sesso")
+            .accessibilityValue(sex.isEmpty ? "Non selezionato" : sex)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -32377,13 +32399,17 @@ struct OnboardingView: View {
                     text: $input.instagramHandle
                 )
 
-                OnboardingBirthDateField(
-                    title: "Data di nascita",
-                    required: true,
-                    dateString: $input.birthDate
-                )
+                HStack(alignment: .top, spacing: 12) {
+                    OnboardingBirthDateField(
+                        title: "Data di nascita",
+                        required: true,
+                        dateString: $input.birthDate
+                    )
+                    .layoutPriority(1)
 
-                OnboardingSexField(sex: $input.sex)
+                    OnboardingSexField(sex: $input.sex)
+                        .frame(width: 118)
+                }
 
                 OnboardingInfoBox(
                     title: "Usiamo questi dati solo quando serve",
@@ -33022,25 +33048,36 @@ struct OnboardingSexField: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            OnboardingFieldLabel(title: "Sesso anagrafico", required: true)
-            HStack(spacing: 8) {
-                ForEach(options, id: \.self) { option in
-                    Button {
-                        sex = option
-                    } label: {
-                        Text(option)
-                            .font(.body.weight(.semibold))
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 54)
-                            .background(sex == option ? Brand.primary : Brand.inputBackground, in: RoundedRectangle(cornerRadius: 14))
-                            .foregroundStyle(sex == option ? .white : Brand.inputForeground)
-                            .overlay(RoundedRectangle(cornerRadius: 14).stroke(sex == option ? Brand.primary : Brand.inputBorder, lineWidth: 1))
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Sesso \(option)")
-                    .accessibilityAddTraits(sex == option ? .isSelected : [])
+            OnboardingFieldLabel(title: "Sesso", required: true)
+            Menu {
+                Button("Non selezionato") {
+                    sex = ""
                 }
+                Divider()
+                ForEach(options, id: \.self) { option in
+                    Button(option) {
+                        sex = option
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Text(sex.isEmpty ? "Seleziona" : sex)
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(sex.isEmpty ? Brand.inputMutedForeground : Brand.inputForeground)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Brand.primary)
+                }
+                .padding(.horizontal, 12)
+                .frame(height: 54)
+                .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.inputBorder, lineWidth: 1))
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Sesso")
+            .accessibilityValue(sex.isEmpty ? "Non selezionato" : sex)
         }
     }
 }
