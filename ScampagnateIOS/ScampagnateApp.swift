@@ -22169,8 +22169,6 @@ struct OrganizerEventEditorView: View {
                                     )
                                 }
                             }
-                            Field("URL immagine", text: $draft.imageUrl, keyboard: .URL)
-                                .textInputAutocapitalization(.never)
                             PhotosPicker(selection: $selectedPhoto, matching: .images) {
                                 Label("Carica immagine evento", systemImage: "photo.badge.plus")
                                     .frame(maxWidth: .infinity)
@@ -24650,11 +24648,10 @@ struct OrganizerGalleryEditor: View {
                             Text("Immagine \(index + 1)")
                                 .font(.caption.weight(.bold))
                                 .foregroundStyle(Brand.foreground)
-                            Text(currentURL.nilIfBlank ?? "URL non impostato")
+                            Text(currentURL.nilIfBlank == nil ? "Immagine non impostata" : "Foto galleria")
                                 .font(.caption2)
                                 .foregroundStyle(Brand.mutedForeground)
                                 .lineLimit(1)
-                                .truncationMode(.middle)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -24671,22 +24668,9 @@ struct OrganizerGalleryEditor: View {
                             }
                         }
                     }
-
-                    TextField("URL immagine", text: safeURLBinding(for: index))
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.URL)
-                        .autocorrectionDisabled()
-                        .frame(maxWidth: .infinity)
-                        .editableTextInput(cornerRadius: 10)
                 }
                 .padding(10)
                 .background(Brand.background, in: RoundedRectangle(cornerRadius: 14))
-            }
-            if urls.count < 5 {
-                Button("Aggiungi URL") {
-                    urls.append("")
-                }
-                .font(.footnote.weight(.bold))
             }
         }
     }
@@ -24731,14 +24715,6 @@ struct OrganizerGalleryEditor: View {
         .disabled(disabled)
     }
 
-    private func safeURLBinding(for index: Int) -> Binding<String> {
-        Binding {
-            urls.indices.contains(index) ? urls[index] : ""
-        } set: { value in
-            guard urls.indices.contains(index) else { return }
-            urls[index] = value
-        }
-    }
 }
 
 enum OrganizerImageCropKind {
