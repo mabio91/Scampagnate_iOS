@@ -22154,24 +22154,19 @@ struct OrganizerEventEditorView: View {
                                 }
                             }
 
-                        OrganizerEditorSection(title: "Galleria") {
+                        OrganizerEditorSection(title: "Immagini") {
                             if draft.imageUrl.nilIfBlank != nil {
-                                RemoteImage(urlString: draft.imageUrl)
-                                    .aspectRatio(1, contentMode: .fit)
-                                    .clipShape(RoundedRectangle(cornerRadius: 14))
-                                HStack(spacing: 12) {
-                                    RemoteImage(urlString: draft.homeCardImageUrl.nilIfBlank ?? draft.imageUrl)
-                                        .frame(width: 86, height: 86)
-                                        .clipShape(RoundedRectangle(cornerRadius: 14))
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text("Anteprima home")
-                                            .font(.caption.weight(.bold))
-                                            .foregroundStyle(Brand.foreground)
-                                        Text("Riquadro 1:1 usato nelle card evento.")
-                                            .font(.caption2)
-                                            .foregroundStyle(Brand.mutedForeground)
-                                    }
-                                    Spacer()
+                                VStack(spacing: 8) {
+                                    OrganizerImagePreviewRow(
+                                        title: "Copertina evento",
+                                        subtitle: "Riquadro 1:1 usato nel dettaglio evento.",
+                                        urlString: draft.imageUrl
+                                    )
+                                    OrganizerImagePreviewRow(
+                                        title: "Anteprima home",
+                                        subtitle: "Riquadro 1:1 usato nelle card evento.",
+                                        urlString: draft.homeCardImageUrl.nilIfBlank ?? draft.imageUrl
+                                    )
                                 }
                             }
                             Field("URL immagine", text: $draft.imageUrl, keyboard: .URL)
@@ -24604,6 +24599,35 @@ struct OrganizerStringListEditor: View {
     }
 }
 
+struct OrganizerImagePreviewRow: View {
+    let title: String
+    let subtitle: String
+    let urlString: String?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            RemoteImage(urlString: urlString)
+                .frame(width: 74, height: 74)
+                .background(Brand.muted, in: RoundedRectangle(cornerRadius: 12))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(Brand.foreground)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(Brand.mutedForeground)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(10)
+        .background(Brand.background, in: RoundedRectangle(cornerRadius: 14))
+    }
+}
+
 struct OrganizerGalleryEditor: View {
     @Binding var urls: [String]
 
@@ -24618,44 +24642,42 @@ struct OrganizerGalleryEditor: View {
                     .foregroundStyle(Brand.mutedForeground)
             }
             ForEach(Array(urls.indices), id: \.self) { index in
-                HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 8) {
                     let currentURL = urls.indices.contains(index) ? urls[index] : ""
-                    if currentURL.nilIfBlank != nil {
-                        RemoteImage(urlString: currentURL, contentMode: .fit)
-                            .frame(width: 58, height: 58)
-                            .background(Brand.muted, in: RoundedRectangle(cornerRadius: 10))
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    } else {
-                        RoundedRectangle(cornerRadius: 10)
-                            .fill(Brand.muted)
-                            .frame(width: 58, height: 58)
-                            .overlay(Image(systemName: "photo").foregroundStyle(Brand.mutedForeground))
+                    HStack(spacing: 10) {
+                        galleryThumbnail(for: currentURL)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Immagine \(index + 1)")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(Brand.foreground)
+                            Text(currentURL.nilIfBlank ?? "URL non impostato")
+                                .font(.caption2)
+                                .foregroundStyle(Brand.mutedForeground)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                        HStack(spacing: 6) {
+                            galleryActionButton(systemName: "chevron.up", disabled: index == 0) {
+                                move(index, by: -1)
+                            }
+                            galleryActionButton(systemName: "chevron.down", disabled: index == urls.count - 1) {
+                                move(index, by: 1)
+                            }
+                            galleryActionButton(systemName: "trash", role: .destructive) {
+                                guard urls.indices.contains(index) else { return }
+                                urls.remove(at: index)
+                            }
+                        }
                     }
+
                     TextField("URL immagine", text: safeURLBinding(for: index))
-                    .textInputAutocapitalization(.never)
-                    .keyboardType(.URL)
-                    .editableTextInput(cornerRadius: 10)
-                    VStack(spacing: 4) {
-                        Button {
-                            move(index, by: -1)
-                        } label: {
-                            Image(systemName: "chevron.up")
-                        }
-                        .disabled(index == 0)
-                        Button {
-                            move(index, by: 1)
-                        } label: {
-                            Image(systemName: "chevron.down")
-                        }
-                        .disabled(index == urls.count - 1)
-                    }
-                    .font(.caption.weight(.bold))
-                    Button(role: .destructive) {
-                        guard urls.indices.contains(index) else { return }
-                        urls.remove(at: index)
-                    } label: {
-                        Image(systemName: "trash")
-                    }
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                        .autocorrectionDisabled()
+                        .frame(maxWidth: .infinity)
+                        .editableTextInput(cornerRadius: 10)
                 }
                 .padding(10)
                 .background(Brand.background, in: RoundedRectangle(cornerRadius: 14))
@@ -24673,6 +24695,40 @@ struct OrganizerGalleryEditor: View {
         let target = index + offset
         guard urls.indices.contains(index), urls.indices.contains(target) else { return }
         urls.swapAt(index, target)
+    }
+
+    @ViewBuilder
+    private func galleryThumbnail(for url: String) -> some View {
+        if url.nilIfBlank != nil {
+            RemoteImage(urlString: url, contentMode: .fit)
+                .frame(width: 58, height: 58)
+                .background(Brand.muted, in: RoundedRectangle(cornerRadius: 10))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+        } else {
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Brand.muted)
+                .frame(width: 58, height: 58)
+                .overlay(Image(systemName: "photo").foregroundStyle(Brand.mutedForeground))
+        }
+    }
+
+    private func galleryActionButton(
+        systemName: String,
+        role: ButtonRole? = nil,
+        disabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(role: role, action: action) {
+            Image(systemName: systemName)
+                .font(.caption.weight(.bold))
+                .frame(width: 30, height: 30)
+                .background(Brand.card, in: Circle())
+                .overlay(Circle().stroke(Brand.muted, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(role == .destructive ? Brand.destructive : Brand.primary)
+        .opacity(disabled ? 0.35 : 1)
+        .disabled(disabled)
     }
 
     private func safeURLBinding(for index: Int) -> Binding<String> {
