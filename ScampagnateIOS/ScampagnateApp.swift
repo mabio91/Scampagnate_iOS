@@ -16866,6 +16866,11 @@ private extension OrganizerEditorRoute.Mode {
         if case .duplicate = self { return true }
         return false
     }
+
+    var existingEventId: String? {
+        if case .edit(let eventId) = self { return eventId }
+        return nil
+    }
 }
 
 private enum OrganizerEventBoardFilter: String, CaseIterable, Identifiable {
@@ -19998,9 +20003,23 @@ struct OrganizerManageHero: View {
                         .font(.caption.weight(.bold))
                         .foregroundStyle(Brand.mutedForeground)
                 }
-                Text(event.title)
-                    .font(.system(.title2, design: .rounded, weight: .bold))
-                    .foregroundStyle(Brand.foreground)
+                Button {
+                    if let url = event.webURL {
+                        UIApplication.shared.open(url)
+                    }
+                } label: {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(event.title)
+                            .font(.system(.title2, design: .rounded, weight: .bold))
+                            .foregroundStyle(Brand.foreground)
+                            .multilineTextAlignment(.leading)
+                        Image(systemName: "arrow.up.forward")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(Brand.primary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Apri link diretto evento")
                 Text("\(formatLongDate(event.date)) · \(timeRange(event)) · \(event.displayLocation)")
                     .font(.subheadline)
                     .foregroundStyle(Brand.mutedForeground)
@@ -22580,6 +22599,7 @@ struct OrganizerEventEditorView: View {
     @State private var uploadingImages = false
     @State private var keyboardInset: CGFloat = 0
     @State private var validationMessage: String?
+    @State private var showPreview = false
 
     var body: some View {
         ZStack {
@@ -22948,7 +22968,12 @@ struct OrganizerEventEditorView: View {
         .animation(.easeOut(duration: 0.22), value: keyboardInset)
         .roundedInlineNavigationTitle(route.title)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button("Anteprima") {
+                    showPreview = true
+                }
+                .disabled(saving || loading || uploadingImages)
+
                 Button(saveButtonTitle) {
                     Task { await save() }
                 }
@@ -22960,6 +22985,14 @@ struct OrganizerEventEditorView: View {
                     dismissKeyboard()
                 }
             }
+        }
+        .sheet(isPresented: $showPreview) {
+            OrganizerEventDraftPreviewSheet(
+                draft: draft,
+                categories: store.categories,
+                directURL: route.mode.existingEventId.flatMap { URL(string: "\(ScampagnateConfig.stripeOrigin)/event/\($0)") }
+            )
+            .presentationDetents([.large])
         }
         .task { await load() }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notification in
@@ -23185,6 +23218,302 @@ struct OrganizerEventEditorView: View {
             guard let index = draft.additionalFields.firstIndex(where: { $0.id == id }) else { return }
             draft.additionalFields[index] = updated
         }
+    }
+}
+
+private struct OrganizerEventDraftPreviewSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let draft: OrganizerEventDraft
+    let categories: [EventCategory]
+    let directURL: URL?
+    @State private var descriptionExpanded = true
+
+    private var category: EventCategory? {
+        categories.first { $0.id == draft.categoryId }
+    }
+
+    private var manualBadgeLabels: [String] {
+        draft.manualBadges.map { badgeId in
+            OrganizerEventDraft.manualBadgeOptions.first { $0.id == badgeId }?.label ?? badgeId
+        }
+    }
+
+    private var allBadgeLabels: [String] {
+        manualBadgeLabels + [draft.customBadge.nilIfBlank].compactMap { $0 }
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    hero
+                    quickFacts
+                    DescriptionBlock(
+                        description: draft.description.nilIfBlank ?? "Nessuna descrizione disponibile",
+                        expanded: $descriptionExpanded
+                    )
+                    meetingPoints
+                    equipment
+                    pricing
+                    registrationFields
+                }
+                .padding(16)
+            }
+            .background(Brand.background)
+            .navigationTitle("Anteprima evento")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Chiudi") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+
+    private var hero: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            RemoteImage(urlString: draft.imageUrl)
+                .frame(height: 220)
+                .clipShape(RoundedRectangle(cornerRadius: 22))
+                .overlay(alignment: .topLeading) {
+                    HStack(spacing: 6) {
+                        BadgeLabel(text: statusLabel, color: statusColor.opacity(0.16), foreground: statusColor)
+                        BadgeLabel(text: draft.visibility == "private" ? "Solo link" : "Pubblico", color: Brand.muted, foreground: Brand.mutedForeground)
+                    }
+                    .padding(12)
+                }
+
+            VStack(alignment: .leading, spacing: 8) {
+                if let directURL {
+                    Button {
+                        UIApplication.shared.open(directURL)
+                    } label: {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(draft.title.nilIfBlank ?? "Titolo evento")
+                                .font(.system(.title2, design: .rounded, weight: .bold))
+                                .foregroundStyle(Brand.foreground)
+                                .multilineTextAlignment(.leading)
+                            Image(systemName: "arrow.up.forward")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(Brand.primary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Apri link diretto evento")
+                } else {
+                    Text(draft.title.nilIfBlank ?? "Titolo evento")
+                        .font(.system(.title2, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("\(formatLongDate(draft.date)) · \(draft.time.nilIfBlank ?? "Ora da definire")", systemImage: "calendar")
+                    Label(draft.locationLabel.nilIfBlank ?? draft.location.nilIfBlank ?? "Luogo da definire", systemImage: "mappin.and.ellipse")
+                    Label(categoryLabel(category), systemImage: "tag")
+                }
+                .font(.subheadline)
+                .foregroundStyle(Brand.mutedForeground)
+
+                if !allBadgeLabels.isEmpty {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 6)], alignment: .leading, spacing: 6) {
+                        ForEach(allBadgeLabels, id: \.self) { badge in
+                            BadgeLabel(text: badge, color: Brand.primary.opacity(0.12), foreground: Brand.primary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var quickFacts: some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+            OrganizerDraftPreviewFact(icon: "person.2", title: "Posti", value: "\(draft.spotsTotal)")
+            if let difficulty = draft.difficulty.nilIfBlank {
+                OrganizerDraftPreviewFact(icon: "mountain.2", title: "Difficoltà", value: "Livello \(difficulty)")
+            }
+            if let duration = draft.duration.nilIfBlank {
+                OrganizerDraftPreviewFact(icon: "clock", title: "Durata", value: duration)
+            }
+            if let distance = draft.distance.nilIfBlank {
+                OrganizerDraftPreviewFact(icon: "figure.hiking", title: "Distanza", value: distance.lowercased().contains("km") ? distance : "\(distance) km")
+            }
+            if let elevation = draft.elevation.nilIfBlank {
+                OrganizerDraftPreviewFact(icon: "arrow.up.right", title: "Dislivello", value: elevation.lowercased().contains("m") ? elevation : "\(elevation) m")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var meetingPoints: some View {
+        let visiblePoints = draft.meetingPoints.filter { $0.name.nilIfBlank != nil || $0.location.nilIfBlank != nil }
+        if !visiblePoints.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle("Ritrovi")
+                ForEach(visiblePoints) { point in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(point.name.nilIfBlank ?? "Punto di ritrovo")
+                            .font(.subheadline.weight(.bold))
+                            .foregroundStyle(Brand.foreground)
+                        Text("\(point.time.nilIfBlank ?? draft.time) · \(point.location.nilIfBlank ?? draft.location)")
+                            .font(.caption)
+                            .foregroundStyle(Brand.mutedForeground)
+                        if let notes = point.notes.nilIfBlank {
+                            Text(notes)
+                                .font(.caption2)
+                                .foregroundStyle(Brand.mutedForeground)
+                        }
+                    }
+                    .padding(12)
+                    .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var equipment: some View {
+        let visibleItems = draft.equipmentItems.filter { $0.name.nilIfBlank != nil }
+        if !visibleItems.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle("Attrezzatura")
+                ForEach(visibleItems) { item in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: item.isMandatory ? "checkmark.seal.fill" : "circle")
+                            .foregroundStyle(item.isMandatory ? Brand.primary : Brand.mutedForeground)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.name.nilIfBlank ?? "Oggetto")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(Brand.foreground)
+                            if let notes = item.notes.nilIfBlank {
+                                Text(notes)
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.mutedForeground)
+                            }
+                        }
+                    }
+                    .padding(12)
+                    .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+                }
+            }
+        }
+    }
+
+    private var pricing: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionTitle("Formule")
+            ForEach(Array(draft.priceOptions.enumerated()), id: \.element.id) { index, option in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(option.name.nilIfBlank ?? "Formula \(index + 1)")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                    Text(paymentSummary(for: option))
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                    if option.eligibleGroup != "all" {
+                        Text(eligibilityLabel(for: option.eligibleGroup))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(Brand.primary)
+                    }
+                }
+                .padding(12)
+                .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var registrationFields: some View {
+        let visibleFields = draft.additionalFields.filter { $0.label.nilIfBlank != nil }
+        if !visibleFields.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle("Domande iscrizione")
+                ForEach(visibleFields) { field in
+                    Text("\(field.required ? "* " : "")\(field.label)")
+                        .font(.subheadline)
+                        .foregroundStyle(Brand.foreground)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+                }
+            }
+        }
+    }
+
+    private var statusLabel: String {
+        switch draft.status {
+        case "draft": return "Non pubblicato"
+        case "upcoming": return "In arrivo"
+        case "closed": return "Chiuso"
+        case "full": return "Sold out"
+        case "cancelled": return "Annullato"
+        default: return "Aperto"
+        }
+    }
+
+    private var statusColor: Color {
+        switch draft.status {
+        case "cancelled", "closed": return Brand.destructive
+        case "draft": return Brand.mutedForeground
+        case "upcoming", "full": return Brand.warning
+        default: return Brand.success
+        }
+    }
+
+    private func paymentSummary(for option: OrganizerPriceOptionDraft) -> String {
+        switch option.paymentType {
+        case "free":
+            return "Gratis"
+        case "location":
+            return "€\(money(option.price)) sul posto"
+        case "deposit":
+            let balance = max(0, option.price - option.depositAmount)
+            let balanceMode = option.balancePaymentMode == "on_site" ? "sul posto" : "online"
+            return "Acconto €\(money(option.depositAmount)) + saldo €\(money(balance)) \(balanceMode)"
+        default:
+            return "€\(money(option.price)) online"
+        }
+    }
+
+    private func eligibilityLabel(for group: String) -> String {
+        if group == "members" { return "Soci" }
+        if group == "new_users" { return "Nuovi utenti" }
+        if group == "experienced" { return "Esperti" }
+        if group == "loyal" { return "Fedeli" }
+        if group.hasPrefix("badge:") { return "Promo riservata" }
+        if group.hasPrefix("trekking_gt:") || group.hasPrefix("events_gt:") { return "Promo riservata" }
+        return group
+    }
+}
+
+private struct OrganizerDraftPreviewFact: View {
+    let icon: String
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Image(systemName: icon)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Brand.primary)
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Brand.mutedForeground)
+            Text(value)
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(Brand.foreground)
+                .lineLimit(2)
+                .minimumScaleFactor(0.78)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
     }
 }
 
