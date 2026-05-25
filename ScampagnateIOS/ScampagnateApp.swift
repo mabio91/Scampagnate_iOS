@@ -23230,11 +23230,14 @@ private struct OrganizerWebRichTextEditor: UIViewRepresentable {
           font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
           -webkit-font-smoothing: antialiased;
         }
-        body { overflow: hidden; }
+        body {
+          overflow: auto;
+          -webkit-overflow-scrolling: touch;
+        }
         .shell {
           display: flex;
           flex-direction: column;
-          min-height: 100vh;
+          min-height: 100dvh;
           background: #FFFFFF;
         }
         .toolbar {
@@ -23249,6 +23252,8 @@ private struct OrganizerWebRichTextEditor: UIViewRepresentable {
           border-bottom: 1px solid #DAD5C9;
           backdrop-filter: blur(16px);
           -webkit-backdrop-filter: blur(16px);
+          -webkit-user-select: none;
+          user-select: none;
         }
         .tool {
           appearance: none;
@@ -23260,6 +23265,8 @@ private struct OrganizerWebRichTextEditor: UIViewRepresentable {
           color: #15281F;
           background: #FFFFFF;
           font: 700 14px/1 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+          -webkit-user-select: none;
+          user-select: none;
         }
         .tool.icon {
           width: 34px;
@@ -23279,17 +23286,25 @@ private struct OrganizerWebRichTextEditor: UIViewRepresentable {
         }
         .editor-wrap {
           flex: 1;
-          overflow: auto;
-          -webkit-overflow-scrolling: touch;
+          overflow: visible;
         }
         #editor {
-          min-height: calc(100vh - 58px);
+          min-height: calc(100dvh - 58px);
           padding: 18px 18px 48vh;
           outline: none;
           color: #15281F;
           font-size: 16px;
           line-height: 1.55;
           overflow-wrap: anywhere;
+          caret-color: #224E38;
+          -webkit-touch-callout: default;
+          -webkit-user-select: text;
+          user-select: text;
+        }
+        #editor * {
+          -webkit-touch-callout: default;
+          -webkit-user-select: text;
+          user-select: text;
         }
         #editor[data-empty="true"]::before {
           content: attr(data-placeholder);
