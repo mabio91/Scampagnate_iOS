@@ -17038,7 +17038,7 @@ struct OrganizerDashboardView: View {
                 }
             }
             .navigationDestination(item: $selectedEvent) { event in
-                OrganizerEventManageView(eventId: event.id)
+                OrganizerEventManageView(eventId: event.id, showAuth: $showAuth)
             }
             .navigationDestination(item: $editorRoute) { route in
                 OrganizerEventEditorView(route: route)
@@ -19416,6 +19416,7 @@ struct OrganizerEventManageView: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
     let eventId: String
+    @Binding var showAuth: Bool
     @State private var event: Event?
     @State private var registrations: [OrganizerRegistration] = []
     @State private var meetingPoints: [MeetingPoint] = []
@@ -19434,6 +19435,7 @@ struct OrganizerEventManageView: View {
     @State private var sharePayload: SharePayload?
     @State private var exportingCSV = false
     @State private var selectedParticipantProfile: OrganizerRegistration?
+    @State private var publicEventTarget: EventNavigationTarget?
 
     private var activeRegistrations: [OrganizerRegistration] {
         registrations.filter(\.isActive)
@@ -19485,6 +19487,9 @@ struct OrganizerEventManageView: View {
         .navigationBarTitleDisplayMode(.inline)
         .navigationDestination(item: $editorRoute) { route in
             OrganizerEventEditorView(route: route)
+        }
+        .navigationDestination(item: $publicEventTarget) { target in
+            EventDetailView(eventId: target.eventId, showAuth: $showAuth)
         }
         .sheet(isPresented: $showAddParticipant) {
             OrganizerAddParticipantSheet(eventId: eventId, meetingPoints: meetingPoints, priceOptions: priceOptions) {
@@ -19549,7 +19554,9 @@ struct OrganizerEventManageView: View {
     @ViewBuilder
     private func eventManagementContent(event: Event, width: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 16) {
-            OrganizerManageHero(event: event)
+            OrganizerManageHero(event: event) {
+                publicEventTarget = EventNavigationTarget(id: event.id)
+            }
 
             OrganizerManageQuickActions(
                 onEdit: { editorRoute = OrganizerEditorRoute(mode: .edit(eventId)) },
@@ -19989,6 +19996,7 @@ private enum OrganizerParticipantCSVExporter {
 
 struct OrganizerManageHero: View {
     let event: Event
+    let onOpenPublicEvent: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -20003,23 +20011,22 @@ struct OrganizerManageHero: View {
                         .font(.caption.weight(.bold))
                         .foregroundStyle(Brand.mutedForeground)
                 }
-                Button {
-                    if let url = event.webURL {
-                        UIApplication.shared.open(url)
-                    }
-                } label: {
+                Button(action: onOpenPublicEvent) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text(event.title)
                             .font(.system(.title2, design: .rounded, weight: .bold))
                             .foregroundStyle(Brand.foreground)
                             .multilineTextAlignment(.leading)
-                        Image(systemName: "arrow.up.forward")
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Image(systemName: "chevron.right")
                             .font(.caption.weight(.bold))
                             .foregroundStyle(Brand.primary)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Apri link diretto evento")
+                .accessibilityLabel("Apri evento nell'app")
                 Text("\(formatLongDate(event.date)) · \(timeRange(event)) · \(event.displayLocation)")
                     .font(.subheadline)
                     .foregroundStyle(Brand.mutedForeground)
