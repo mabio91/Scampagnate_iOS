@@ -15,6 +15,7 @@ enum ScampagnateConfig {
     static let supabaseURL = URL(string: "https://istotjnoqtrtthnyreyv.supabase.co")!
     static let publishableKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlzdG90am5vcXRydHRobnlyZXl2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg2ODIxMzMsImV4cCI6MjA5NDI1ODEzM30.GcrdLFBW1oDW9-hQ960eqpOtfGb0k_XsQhT2juFuwWc"
     static let stripeOrigin = "https://scampagnate.com"
+    static let googlePlacesAPIKey = "AIzaSyCPktJ9nE3SLzugNWgWoh_givCXkl8w2Qg"
 }
 
 enum IssueMediaLimits {
@@ -23790,6 +23791,20 @@ struct OrganizerAddressSuggestion: Identifiable, Hashable, Sendable {
     let id = UUID()
     let title: String
     let subtitle: String
+    let placeId: String?
+    let source: Source
+
+    enum Source: Hashable, Sendable {
+        case google
+        case mapKit
+    }
+
+    init(title: String, subtitle: String, placeId: String? = nil, source: Source) {
+        self.title = title
+        self.subtitle = subtitle
+        self.placeId = placeId
+        self.source = source
+    }
 
     var query: String {
         [title, subtitle].compactMap(\.nilIfBlank).joined(separator: ", ")
@@ -23939,6 +23954,9 @@ struct OrganizerAddressSelection {
 final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLocalSearchCompleterDelegate {
     @Published var results: [OrganizerAddressSuggestion] = []
     private let completer = MKLocalSearchCompleter()
+    private var searchTask: Task<Void, Never>?
+    private var latestQuery = ""
+    private var googleSessionToken = UUID().uuidString
 
     override init() {
         super.init()
@@ -23953,17 +23971,38 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
             clear()
             return
         }
-        completer.queryFragment = value
+
+        latestQuery = value
+        searchTask?.cancel()
+        let sessionToken = googleSessionToken
+        searchTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled, let self else { return }
+
+            let googleResults = await Self.fetchGoogleSuggestions(query: value, sessionToken: sessionToken)
+            guard !Task.isCancelled, self.latestQuery == value else { return }
+
+            if googleResults.isEmpty {
+                self.completer.queryFragment = value
+            } else {
+                self.completer.queryFragment = ""
+                self.results = googleResults
+            }
+        }
     }
 
     func clear() {
+        searchTask?.cancel()
+        searchTask = nil
+        latestQuery = ""
+        googleSessionToken = UUID().uuidString
         completer.queryFragment = ""
         results = []
     }
 
     nonisolated func completerDidUpdateResults(_ completer: MKLocalSearchCompleter) {
         let suggestions = completer.results.prefix(6).map {
-            OrganizerAddressSuggestion(title: $0.title, subtitle: $0.subtitle)
+            OrganizerAddressSuggestion(title: $0.title, subtitle: $0.subtitle, source: .mapKit)
         }
         Task { @MainActor [weak self] in
             self?.results = suggestions
@@ -23977,6 +24016,15 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
     }
 
     func resolve(_ suggestion: OrganizerAddressSuggestion) async -> OrganizerAddressSelection {
+        if suggestion.source == .google,
+           let placeId = suggestion.placeId,
+           let selection = await Self.fetchGooglePlaceDetails(placeId: placeId, fallback: suggestion, sessionToken: googleSessionToken) {
+            return selection
+        }
+        return await resolveWithMapKit(suggestion)
+    }
+
+    private func resolveWithMapKit(_ suggestion: OrganizerAddressSuggestion) async -> OrganizerAddressSelection {
         let request = MKLocalSearch.Request()
         request.naturalLanguageQuery = suggestion.query
         request.region = Self.italyRegion
@@ -23991,10 +24039,105 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
         )
     }
 
+    private static func fetchGoogleSuggestions(query: String, sessionToken: String) async -> [OrganizerAddressSuggestion] {
+        guard let url = URL(string: "https://places.googleapis.com/v1/places:autocomplete") else { return [] }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(ScampagnateConfig.googlePlacesAPIKey, forHTTPHeaderField: "X-Goog-Api-Key")
+        let payload = GoogleAutocompleteRequest(input: query, includedRegionCodes: ["it"], languageCode: "it", sessionToken: sessionToken)
+        guard let body = try? JSONEncoder().encode(payload) else { return [] }
+        request.httpBody = body
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return [] }
+            let decoded = try JSONDecoder().decode(GoogleAutocompleteResponse.self, from: data)
+            return decoded.suggestions.compactMap { suggestion in
+                guard let prediction = suggestion.placePrediction else { return nil }
+                let fullText = prediction.text?.text.nilIfBlank
+                let title = prediction.structuredFormat?.mainText?.text.nilIfBlank ?? fullText
+                guard let title else { return nil }
+                return OrganizerAddressSuggestion(
+                    title: title,
+                    subtitle: prediction.structuredFormat?.secondaryText?.text ?? "",
+                    placeId: prediction.placeId,
+                    source: .google
+                )
+            }
+        } catch {
+            return []
+        }
+    }
+
+    private static func fetchGooglePlaceDetails(placeId: String, fallback: OrganizerAddressSuggestion, sessionToken: String) async -> OrganizerAddressSelection? {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "places.googleapis.com"
+        components.path = "/v1/places/\(placeId)"
+        components.queryItems = [
+            URLQueryItem(name: "fields", value: "formattedAddress,displayName"),
+            URLQueryItem(name: "languageCode", value: "it"),
+            URLQueryItem(name: "sessionToken", value: sessionToken)
+        ]
+        guard let url = components.url else { return nil }
+
+        var request = URLRequest(url: url)
+        request.setValue(ScampagnateConfig.googlePlacesAPIKey, forHTTPHeaderField: "X-Goog-Api-Key")
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            let place = try JSONDecoder().decode(GooglePlaceDetailsResponse.self, from: data)
+            return OrganizerAddressSelection(
+                address: place.formattedAddress?.nilIfBlank ?? fallback.query,
+                label: place.displayName?.text.nilIfBlank ?? fallback.title
+            )
+        } catch {
+            return nil
+        }
+    }
+
     private static let italyRegion = MKCoordinateRegion(
         center: CLLocationCoordinate2D(latitude: 41.8719, longitude: 12.5674),
         span: MKCoordinateSpan(latitudeDelta: 14, longitudeDelta: 14)
     )
+}
+
+private struct GoogleAutocompleteRequest: Encodable {
+    let input: String
+    let includedRegionCodes: [String]
+    let languageCode: String
+    let sessionToken: String
+}
+
+private struct GoogleAutocompleteResponse: Decodable {
+    let suggestions: [GoogleAutocompleteSuggestion]
+}
+
+private struct GoogleAutocompleteSuggestion: Decodable {
+    let placePrediction: GooglePlacePrediction?
+}
+
+private struct GooglePlacePrediction: Decodable {
+    let placeId: String
+    let structuredFormat: GoogleStructuredFormat?
+    let text: GoogleLocalizedText?
+}
+
+private struct GoogleStructuredFormat: Decodable {
+    let mainText: GoogleLocalizedText?
+    let secondaryText: GoogleLocalizedText?
+}
+
+private struct GoogleLocalizedText: Decodable {
+    let text: String
+}
+
+private struct GooglePlaceDetailsResponse: Decodable {
+    let formattedAddress: String?
+    let displayName: GoogleLocalizedText?
 }
 
 struct OrganizerEditorSection<Content: View>: View {
