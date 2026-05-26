@@ -30070,10 +30070,6 @@ struct KeyboardDismissOnTapView: UIViewRepresentable {
             true
         }
 
-        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-            true
-        }
-
         @objc private func dismissKeyboard() {
             UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         }
