@@ -5674,7 +5674,7 @@ struct OrganizerEventDraft: Equatable {
         cancellationPolicy = Self.normalizedCancellationPolicy(event.cancellationPolicy)
         imageUrl = event.imageUrl ?? ""
         homeCardImageUrl = event.homeCardImageUrl ?? ""
-        visibility = duplicate ? "private" : (event.visibility ?? "public")
+        visibility = duplicate ? "private" : Self.editableVisibility(event.visibility)
         status = duplicate ? "open" : Self.editableStatus(event.status)
         galleryImageURLs = event.gallery.compactMap(\.url)
         let manualBadgeIds = Set(OrganizerEventDraft.manualBadgeOptions.map(\.id))
@@ -5764,6 +5764,10 @@ struct OrganizerEventDraft: Equatable {
         default:
             return "open"
         }
+    }
+
+    static func editableVisibility(_ visibility: String?) -> String {
+        visibility == "private" ? "private" : "public"
     }
 
     static let manualBadgeOptions: [(id: String, label: String)] = [
@@ -5913,7 +5917,7 @@ struct OrganizerEventDraft: Equatable {
             "featured": .bool(featured),
             "cancellation_policy": .string(Self.normalizedCancellationPolicy(cancellationPolicy)),
             "image_url": image.map { .string($0) } ?? .null,
-            "visibility": .string(visibility),
+            "visibility": .string(Self.editableVisibility(visibility)),
             "gallery_images": .array(gallery),
             "equipment_list": .array(equipmentItems.filter { $0.name.nilIfBlank != nil }.map(\.jsonValue)),
             "additional_fields": .object(additionalObject),
@@ -13587,6 +13591,15 @@ private enum EventDescriptionHTML {
             openList = nil
         }
 
+        func hasNonBlankText(after location: Int) -> Bool {
+            guard location < fullText.length else { return false }
+            let remainingRange = NSRange(location: location, length: fullText.length - location)
+            return fullText
+                .substring(with: remainingRange)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank != nil
+        }
+
         while position < fullText.length {
             let paragraphRange = fullText.paragraphRange(for: NSRange(location: position, length: 0))
             defer { position = paragraphRange.location + paragraphRange.length }
@@ -13594,6 +13607,9 @@ private enum EventDescriptionHTML {
             let plain = paragraph.string.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !plain.isEmpty else {
                 closeList()
+                if !parts.isEmpty, hasNonBlankText(after: NSMaxRange(paragraphRange)) {
+                    parts.append("<p><br></p>")
+                }
                 continue
             }
 
@@ -13608,10 +13624,7 @@ private enum EventDescriptionHTML {
             }
 
             closeList()
-            let tag = headingTag(for: paragraph)
-            let suppressBold = tag != "p"
-            let suppressFontSize = tag != "p"
-            parts.append("<\(tag)>\(inlineHTML(from: paragraph, suppressBold: suppressBold, suppressFontSize: suppressFontSize))</\(tag)>")
+            parts.append("<p>\(inlineHTML(from: paragraph))</p>")
         }
 
         closeList()
@@ -13812,9 +13825,6 @@ private enum EventDescriptionHTML {
     }
 
     private static func normalizedFontSize(_ value: CGFloat) -> CGFloat {
-        if abs(value - heading1FontSize) < 0.75 { return heading1FontSize }
-        if abs(value - heading2FontSize) < 0.75 { return heading2FontSize }
-        if abs(value - heading3FontSize) < 0.75 { return heading3FontSize }
         if abs(value - bodyFontSize) < 0.75 { return bodyFontSize }
         return min(max((value * 2).rounded() / 2, minFontSize), maxFontSize)
     }
@@ -13845,7 +13855,7 @@ private enum EventDescriptionHTML {
             result.replaceSubrange(range, with: replacement)
         }
 
-        result = result.replacingOccurrences(of: #"(?is)<p>\s*</p>"#, with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: #"(?is)<p>\s*</p>"#, with: "<p><br></p>", options: .regularExpression)
             .replacingOccurrences(of: #"(?is)(<br>\s*){3,}"#, with: "<br><br>", options: .regularExpression)
             .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -13960,11 +13970,21 @@ private enum EventDescriptionHTML {
             paragraphLines.removeAll()
         }
 
-        for rawLine in lines {
+        func hasNonBlankLine(after index: Int) -> Bool {
+            guard index + 1 < lines.count else { return false }
+            return lines[(index + 1)...].contains { line in
+                line.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank != nil
+            }
+        }
+
+        for (index, rawLine) in lines.enumerated() {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             guard !line.isEmpty else {
                 flushParagraph()
                 closeList()
+                if !parts.isEmpty, hasNonBlankLine(after: index) {
+                    parts.append("<p><br></p>")
+                }
                 continue
             }
 
@@ -14014,43 +14034,6 @@ private enum EventDescriptionHTML {
             .replacingOccurrences(of: #"(?s)\*\*(.+?)\*\*"#, with: "<strong>$1</strong>", options: .regularExpression)
             .replacingOccurrences(of: #"(?s)__(.+?)__"#, with: "<strong>$1</strong>", options: .regularExpression)
             .replacingOccurrences(of: #"(?s)(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)"#, with: "<em>$1</em>", options: .regularExpression)
-    }
-
-    private static func headingTag(for attributed: NSAttributedString) -> String {
-        let range = NSRange(location: 0, length: attributed.length)
-        var candidateTag: String?
-        var sawContent = false
-        var invalidHeading = false
-        attributed.enumerateAttribute(.font, in: range) { value, currentRange, stop in
-            let text = (attributed.string as NSString).substring(with: currentRange)
-            guard text.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank != nil else { return }
-            sawContent = true
-            let font = value as? UIFont ?? UIFont.systemFont(ofSize: bodyFontSize)
-            let pointSize = normalizedFontSize(font.pointSize)
-            let isBold = font.fontDescriptor.symbolicTraits.contains(.traitBold)
-            let tag: String?
-            if abs(pointSize - heading1FontSize) < 0.25 {
-                tag = "h1"
-            } else if abs(pointSize - heading2FontSize) < 0.25 {
-                tag = "h2"
-            } else if abs(pointSize - heading3FontSize) < 0.25 {
-                tag = "h3"
-            } else {
-                tag = nil
-            }
-            guard isBold, let tag else {
-                invalidHeading = true
-                stop.pointee = true
-                return
-            }
-            if let candidateTag, candidateTag != tag {
-                invalidHeading = true
-                stop.pointee = true
-                return
-            }
-            candidateTag = tag
-        }
-        return sawContent && !invalidHeading ? (candidateTag ?? "p") : "p"
     }
 
     private static func listInfo(for attributed: NSAttributedString) -> (tag: String, content: NSAttributedString)? {
@@ -16896,6 +16879,11 @@ private extension OrganizerEditorRoute.Mode {
         if case .duplicate = self { return true }
         return false
     }
+
+    var existingEventId: String? {
+        if case .edit(let eventId) = self { return eventId }
+        return nil
+    }
 }
 
 private enum OrganizerEventBoardFilter: String, CaseIterable, Identifiable {
@@ -17063,7 +17051,7 @@ struct OrganizerDashboardView: View {
                 }
             }
             .navigationDestination(item: $selectedEvent) { event in
-                OrganizerEventManageView(eventId: event.id)
+                OrganizerEventManageView(eventId: event.id, showAuth: $showAuth)
             }
             .navigationDestination(item: $editorRoute) { route in
                 OrganizerEventEditorView(route: route)
@@ -19441,6 +19429,7 @@ struct OrganizerEventManageView: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
     let eventId: String
+    @Binding var showAuth: Bool
     @State private var event: Event?
     @State private var registrations: [OrganizerRegistration] = []
     @State private var meetingPoints: [MeetingPoint] = []
@@ -19459,6 +19448,7 @@ struct OrganizerEventManageView: View {
     @State private var sharePayload: SharePayload?
     @State private var exportingCSV = false
     @State private var selectedParticipantProfile: OrganizerRegistration?
+    @State private var publicEventTarget: EventNavigationTarget?
 
     private var activeRegistrations: [OrganizerRegistration] {
         registrations.filter(\.isActive)
@@ -19510,6 +19500,9 @@ struct OrganizerEventManageView: View {
         .navigationBarTitleDisplayMode(.inline)
         .navigationDestination(item: $editorRoute) { route in
             OrganizerEventEditorView(route: route)
+        }
+        .navigationDestination(item: $publicEventTarget) { target in
+            EventDetailView(eventId: target.eventId, showAuth: $showAuth)
         }
         .sheet(isPresented: $showAddParticipant) {
             OrganizerAddParticipantSheet(eventId: eventId, meetingPoints: meetingPoints, priceOptions: priceOptions) {
@@ -19574,7 +19567,9 @@ struct OrganizerEventManageView: View {
     @ViewBuilder
     private func eventManagementContent(event: Event, width: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 16) {
-            OrganizerManageHero(event: event)
+            OrganizerManageHero(event: event) {
+                publicEventTarget = EventNavigationTarget(id: event.id)
+            }
 
             OrganizerManageQuickActions(
                 onEdit: { editorRoute = OrganizerEditorRoute(mode: .edit(eventId)) },
@@ -20014,6 +20009,7 @@ private enum OrganizerParticipantCSVExporter {
 
 struct OrganizerManageHero: View {
     let event: Event
+    let onOpenPublicEvent: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -20028,9 +20024,22 @@ struct OrganizerManageHero: View {
                         .font(.caption.weight(.bold))
                         .foregroundStyle(Brand.mutedForeground)
                 }
-                Text(event.title)
-                    .font(.system(.title2, design: .rounded, weight: .bold))
-                    .foregroundStyle(Brand.foreground)
+                Button(action: onOpenPublicEvent) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(event.title)
+                            .font(.system(.title2, design: .rounded, weight: .bold))
+                            .foregroundStyle(Brand.foreground)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(Brand.primary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Apri evento nell'app")
                 Text("\(formatLongDate(event.date)) · \(timeRange(event)) · \(event.displayLocation)")
                     .font(.subheadline)
                     .foregroundStyle(Brand.mutedForeground)
@@ -22624,6 +22633,7 @@ struct OrganizerEventEditorView: View {
     @State private var uploadingImages = false
     @State private var keyboardInset: CGFloat = 0
     @State private var validationMessage: String?
+    @State private var showPreview = false
 
     var body: some View {
         ZStack {
@@ -22992,7 +23002,12 @@ struct OrganizerEventEditorView: View {
         .animation(.easeOut(duration: 0.22), value: keyboardInset)
         .roundedInlineNavigationTitle(route.title)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button("Anteprima") {
+                    showPreview = true
+                }
+                .disabled(saving || loading || uploadingImages)
+
                 Button(saveButtonTitle) {
                     Task { await save() }
                 }
@@ -23004,6 +23019,14 @@ struct OrganizerEventEditorView: View {
                     dismissKeyboard()
                 }
             }
+        }
+        .sheet(isPresented: $showPreview) {
+            OrganizerEventDraftPreviewSheet(
+                draft: draft,
+                categories: store.categories,
+                directURL: route.mode.existingEventId.flatMap { URL(string: "\(ScampagnateConfig.stripeOrigin)/event/\($0)") }
+            )
+            .presentationDetents([.large])
         }
         .task { await load() }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notification in
@@ -23229,6 +23252,349 @@ struct OrganizerEventEditorView: View {
             guard let index = draft.additionalFields.firstIndex(where: { $0.id == id }) else { return }
             draft.additionalFields[index] = updated
         }
+    }
+}
+
+private struct OrganizerEventDraftPreviewSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let draft: OrganizerEventDraft
+    let categories: [EventCategory]
+    let directURL: URL?
+    @State private var descriptionExpanded = false
+
+    private var category: EventCategory? {
+        categories.first { $0.id == draft.categoryId }
+    }
+
+    private var manualBadgeLabels: [String] {
+        draft.manualBadges.map { badgeId in
+            OrganizerEventDraft.manualBadgeOptions.first { $0.id == badgeId }?.label ?? badgeId
+        }
+    }
+
+    private var allBadgeLabels: [String] {
+        manualBadgeLabels + [draft.customBadge.nilIfBlank].compactMap { $0 }
+    }
+
+    private var descriptionPreviewText: String {
+        EventDescriptionHTML.cleanStoredHTML(from: draft.description).htmlPlainText.nilIfBlank ?? "Nessuna descrizione disponibile"
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(alignment: .center, spacing: 12) {
+                    Text("Anteprima evento")
+                        .font(.system(.title3, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                    Spacer(minLength: 12)
+                    Button("Chiudi") {
+                        dismiss()
+                    }
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Brand.primary)
+                }
+
+                hero
+                quickFacts
+                previewDescription
+                meetingPoints
+                equipment
+                pricing
+                registrationFields
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(Brand.background)
+    }
+
+    @ViewBuilder
+    private var titleBlock: some View {
+        let title = draft.title.nilIfBlank ?? "Titolo evento"
+        if let directURL {
+            Button {
+                UIApplication.shared.open(directURL)
+            } label: {
+                HStack(alignment: .top, spacing: 8) {
+                    Text(title)
+                        .font(.system(.title3, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Image(systemName: "arrow.up.forward")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.primary)
+                        .padding(.top, 5)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Apri link diretto evento")
+        } else {
+            Text(title)
+                .font(.system(.title3, design: .rounded, weight: .bold))
+                .foregroundStyle(Brand.foreground)
+                .lineLimit(3)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var hero: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            RemoteImage(urlString: draft.imageUrl)
+                .frame(maxWidth: .infinity)
+                .frame(height: 190)
+                .clipShape(RoundedRectangle(cornerRadius: 20))
+                .overlay(alignment: .topLeading) {
+                    HStack(spacing: 6) {
+                        BadgeLabel(text: statusLabel, color: statusColor.opacity(0.16), foreground: statusColor)
+                        BadgeLabel(text: draft.visibility == "private" ? "Solo link" : "Pubblico", color: Brand.muted, foreground: Brand.mutedForeground)
+                    }
+                    .padding(12)
+                }
+
+            VStack(alignment: .leading, spacing: 8) {
+                titleBlock
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("\(formatLongDate(draft.date)) · \(draft.time.nilIfBlank ?? "Ora da definire")", systemImage: "calendar")
+                    Label(draft.locationLabel.nilIfBlank ?? draft.location.nilIfBlank ?? "Luogo da definire", systemImage: "mappin.and.ellipse")
+                    Label(categoryLabel(category), systemImage: "tag")
+                }
+                .font(.subheadline)
+                .foregroundStyle(Brand.mutedForeground)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+
+                if !allBadgeLabels.isEmpty {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 6)], alignment: .leading, spacing: 6) {
+                        ForEach(allBadgeLabels, id: \.self) { badge in
+                            BadgeLabel(text: badge, color: Brand.primary.opacity(0.12), foreground: Brand.primary)
+                        }
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var quickFacts: some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+            OrganizerDraftPreviewFact(icon: "person.2", title: "Posti", value: "\(draft.spotsTotal)")
+            if let difficulty = draft.difficulty.nilIfBlank {
+                OrganizerDraftPreviewFact(icon: "mountain.2", title: "Difficoltà", value: "Livello \(difficulty)")
+            }
+            if let duration = draft.duration.nilIfBlank {
+                OrganizerDraftPreviewFact(icon: "clock", title: "Durata", value: duration)
+            }
+            if let distance = draft.distance.nilIfBlank {
+                OrganizerDraftPreviewFact(icon: "figure.hiking", title: "Distanza", value: distance.lowercased().contains("km") ? distance : "\(distance) km")
+            }
+            if let elevation = draft.elevation.nilIfBlank {
+                OrganizerDraftPreviewFact(icon: "arrow.up.right", title: "Dislivello", value: elevation.lowercased().contains("m") ? elevation : "\(elevation) m")
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var previewDescription: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionTitle("L'esperienza")
+            Text(descriptionPreviewText)
+                .font(.subheadline)
+                .foregroundStyle(Brand.mutedForeground)
+                .lineLimit(descriptionExpanded ? nil : 10)
+                .fixedSize(horizontal: false, vertical: true)
+            if descriptionPreviewText.count > 700 {
+                Button(descriptionExpanded ? "Mostra meno" : "Leggi tutto") {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        descriptionExpanded.toggle()
+                    }
+                }
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(Brand.primary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Brand.muted, lineWidth: 1))
+    }
+
+    @ViewBuilder
+    private var meetingPoints: some View {
+        let visiblePoints = draft.meetingPoints.filter { $0.name.nilIfBlank != nil || $0.location.nilIfBlank != nil }
+        if !visiblePoints.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle("Ritrovi")
+                ForEach(visiblePoints) { point in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(point.name.nilIfBlank ?? "Punto di ritrovo")
+                            .font(.subheadline.weight(.bold))
+                            .foregroundStyle(Brand.foreground)
+                        Text("\(point.time.nilIfBlank ?? draft.time) · \(point.location.nilIfBlank ?? draft.location)")
+                            .font(.caption)
+                            .foregroundStyle(Brand.mutedForeground)
+                        if let notes = point.notes.nilIfBlank {
+                            Text(notes)
+                                .font(.caption2)
+                                .foregroundStyle(Brand.mutedForeground)
+                        }
+                    }
+                    .padding(12)
+                    .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var equipment: some View {
+        let visibleItems = draft.equipmentItems.filter { $0.name.nilIfBlank != nil }
+        if !visibleItems.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle("Attrezzatura")
+                ForEach(visibleItems) { item in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: item.isMandatory ? "checkmark.seal.fill" : "circle")
+                            .foregroundStyle(item.isMandatory ? Brand.primary : Brand.mutedForeground)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.name.nilIfBlank ?? "Oggetto")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(Brand.foreground)
+                            if let notes = item.notes.nilIfBlank {
+                                Text(notes)
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.mutedForeground)
+                            }
+                        }
+                    }
+                    .padding(12)
+                    .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+                }
+            }
+        }
+    }
+
+    private var pricing: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionTitle("Formule")
+            ForEach(Array(draft.priceOptions.enumerated()), id: \.element.id) { index, option in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(option.name.nilIfBlank ?? "Formula \(index + 1)")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                    Text(paymentSummary(for: option))
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                    if option.eligibleGroup != "all" {
+                        Text(eligibilityLabel(for: option.eligibleGroup))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(Brand.primary)
+                    }
+                }
+                .padding(12)
+                .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var registrationFields: some View {
+        let visibleFields = draft.additionalFields.filter { $0.label.nilIfBlank != nil }
+        if !visibleFields.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle("Domande iscrizione")
+                ForEach(visibleFields) { field in
+                    Text("\(field.required ? "* " : "")\(field.label)")
+                        .font(.subheadline)
+                        .foregroundStyle(Brand.foreground)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+                }
+            }
+        }
+    }
+
+    private var statusLabel: String {
+        switch draft.status {
+        case "draft": return "Non pubblicato"
+        case "upcoming": return "In arrivo"
+        case "closed": return "Chiuso"
+        case "full": return "Sold out"
+        case "cancelled": return "Annullato"
+        default: return "Aperto"
+        }
+    }
+
+    private var statusColor: Color {
+        switch draft.status {
+        case "cancelled", "closed": return Brand.destructive
+        case "draft": return Brand.mutedForeground
+        case "upcoming", "full": return Brand.warning
+        default: return Brand.success
+        }
+    }
+
+    private func paymentSummary(for option: OrganizerPriceOptionDraft) -> String {
+        switch option.paymentType {
+        case "free":
+            return "Gratis"
+        case "location":
+            return "€\(money(option.price)) sul posto"
+        case "deposit":
+            let balance = max(0, option.price - option.depositAmount)
+            let balanceMode = option.balancePaymentMode == "on_site" ? "sul posto" : "online"
+            return "Acconto €\(money(option.depositAmount)) + saldo €\(money(balance)) \(balanceMode)"
+        default:
+            return "€\(money(option.price)) online"
+        }
+    }
+
+    private func eligibilityLabel(for group: String) -> String {
+        if group == "members" { return "Soci" }
+        if group == "new_users" { return "Nuovi utenti" }
+        if group == "experienced" { return "Esperti" }
+        if group == "loyal" { return "Fedeli" }
+        if group.hasPrefix("badge:") { return "Promo riservata" }
+        if group.hasPrefix("trekking_gt:") || group.hasPrefix("events_gt:") { return "Promo riservata" }
+        return group
+    }
+}
+
+private struct OrganizerDraftPreviewFact: View {
+    let icon: String
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Image(systemName: icon)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Brand.primary)
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Brand.mutedForeground)
+            Text(value)
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(Brand.foreground)
+                .lineLimit(2)
+                .minimumScaleFactor(0.78)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
     }
 }
 
@@ -24244,9 +24610,6 @@ private enum OrganizerRichTextNativeCommand: String, CaseIterable {
     case underline
     case strikethrough
     case paragraph
-    case heading1
-    case heading2
-    case heading3
     case decreaseFontSize
     case increaseFontSize
     case bulletList
@@ -24262,9 +24625,6 @@ private enum OrganizerRichTextNativeCommand: String, CaseIterable {
         case .underline: "Sottolineato"
         case .strikethrough: "Barrato"
         case .paragraph: "Paragrafo"
-        case .heading1: "Titolo 1"
-        case .heading2: "Titolo 2"
-        case .heading3: "Titolo 3"
         case .decreaseFontSize: "Riduci dimensione testo"
         case .increaseFontSize: "Aumenta dimensione testo"
         case .bulletList: "Elenco puntato"
@@ -24276,8 +24636,19 @@ private enum OrganizerRichTextNativeCommand: String, CaseIterable {
     }
 }
 
+private final class OrganizerRichTextUITextView: UITextView {
+    var customPasteHandler: ((UITextView) -> Bool)?
+
+    override func paste(_ sender: Any?) {
+        if customPasteHandler?(self) == true {
+            return
+        }
+        super.paste(sender)
+    }
+}
+
 private final class OrganizerRichTextUIKitEditorView: UIView {
-    let textView = UITextView()
+    let textView = OrganizerRichTextUITextView()
 
     private let toolbarScrollView = UIScrollView()
     private let toolbarStack = UIStackView()
@@ -24302,9 +24673,6 @@ private final class OrganizerRichTextUIKitEditorView: UIView {
         addButton(title: "S", command: .strikethrough, target: target, action: action)
         addDivider()
         addButton(title: "P", command: .paragraph, target: target, action: action)
-        addButton(title: "H1", command: .heading1, target: target, action: action)
-        addButton(title: "H2", command: .heading2, target: target, action: action)
-        addButton(title: "H3", command: .heading3, target: target, action: action)
         addButton(title: "A-", command: .decreaseFontSize, target: target, action: action)
         addButton(title: "A+", command: .increaseFontSize, target: target, action: action)
         addDivider()
@@ -24458,6 +24826,10 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
         let editorView = OrganizerRichTextUIKitEditorView()
         editorView.configureToolbar(target: context.coordinator, action: #selector(Coordinator.toolbarButtonTapped(_:)))
         editorView.textView.delegate = context.coordinator
+        let coordinator = context.coordinator
+        editorView.textView.customPasteHandler = { [weak coordinator] textView in
+            coordinator?.pasteFromClipboard(in: textView) ?? false
+        }
         context.coordinator.editorView = editorView
         context.coordinator.apply(html, to: editorView.textView)
         return editorView
@@ -24476,6 +24848,7 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
 
     static func dismantleUIView(_ uiView: OrganizerRichTextUIKitEditorView, coordinator: Coordinator) {
         uiView.textView.delegate = nil
+        uiView.textView.customPasteHandler = nil
         coordinator.editorView = nil
     }
 
@@ -24512,12 +24885,6 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
                 toggleTextAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, in: textView)
             case .paragraph:
                 applyBlockStyle(pointSize: EventDescriptionHTML.bodyFontSize, bold: false, in: textView)
-            case .heading1:
-                applyBlockStyle(pointSize: EventDescriptionHTML.heading1FontSize, bold: true, in: textView)
-            case .heading2:
-                applyBlockStyle(pointSize: EventDescriptionHTML.heading2FontSize, bold: true, in: textView)
-            case .heading3:
-                applyBlockStyle(pointSize: EventDescriptionHTML.heading3FontSize, bold: true, in: textView)
             case .decreaseFontSize:
                 adjustFontSize(by: -EventDescriptionHTML.fontSizeStep, in: textView)
             case .increaseFontSize:
@@ -24571,18 +24938,24 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             editorView.setActive(textAttributeActive(.underlineStyle, in: textView), for: .underline)
             editorView.setActive(textAttributeActive(.strikethroughStyle, in: textView), for: .strikethrough)
 
-            let block = currentBlockCommand(in: textView)
-            editorView.setActive(block == .paragraph, for: .paragraph)
-            editorView.setActive(block == .heading1, for: .heading1)
-            editorView.setActive(block == .heading2, for: .heading2)
-            editorView.setActive(block == .heading3, for: .heading3)
             let currentSize = currentFontSize(in: textView)
+            editorView.setActive(abs(currentSize - EventDescriptionHTML.bodyFontSize) < 0.75, for: .paragraph)
             editorView.setEnabled(currentSize > EventDescriptionHTML.minFontSize + 0.25, for: .decreaseFontSize)
             editorView.setEnabled(currentSize < EventDescriptionHTML.maxFontSize - 0.25, for: .increaseFontSize)
             editorView.setActive(currentParagraphHasListPrefix(.unordered, in: textView), for: .bulletList)
             editorView.setActive(currentParagraphHasListPrefix(.ordered, in: textView), for: .orderedList)
             editorView.setEnabled(textView.undoManager?.canUndo ?? false, for: .undo)
             editorView.setEnabled(textView.undoManager?.canRedo ?? false, for: .redo)
+        }
+
+        func pasteFromClipboard(in textView: UITextView) -> Bool {
+            guard let cleanHTML = EventDescriptionHTML.cleanHTMLFromPasteboard(.general) else {
+                return false
+            }
+            let attributed = EventDescriptionHTML.attributedStringForEditing(from: cleanHTML)
+            guard attributed.length > 0 else { return false }
+            insert(attributed, in: textView)
+            return true
         }
 
         private func syncHTML(from textView: UITextView) {
@@ -24641,6 +25014,18 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
                 textView.textStorage.removeAttribute(key, range: selectedRange)
             }
             syncHTML(from: textView)
+        }
+
+        private func insert(_ attributed: NSAttributedString, in textView: UITextView) {
+            let selectedRange = clampedSelection(in: textView)
+            let storage = textView.textStorage
+            storage.beginEditing()
+            storage.replaceCharacters(in: selectedRange, with: attributed)
+            storage.endEditing()
+            textView.selectedRange = NSRange(location: selectedRange.location + attributed.length, length: 0)
+            textView.typingAttributes = effectiveTypingAttributes(in: textView)
+            syncHTML(from: textView)
+            updateToolbarState(textView)
         }
 
         private func adjustFontSize(by delta: CGFloat, in textView: UITextView) {
@@ -24817,17 +25202,6 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
                 }
             }
             return isActive
-        }
-
-        private func currentBlockCommand(in textView: UITextView) -> OrganizerRichTextNativeCommand {
-            let attributes = effectiveTypingAttributes(in: textView)
-            guard let font = attributes[.font] as? UIFont else { return .paragraph }
-            let isBold = font.fontDescriptor.symbolicTraits.contains(.traitBold)
-            guard isBold else { return .paragraph }
-            if abs(font.pointSize - EventDescriptionHTML.heading1FontSize) < 0.75 { return .heading1 }
-            if abs(font.pointSize - EventDescriptionHTML.heading2FontSize) < 0.75 { return .heading2 }
-            if abs(font.pointSize - EventDescriptionHTML.heading3FontSize) < 0.75 { return .heading3 }
-            return .paragraph
         }
 
         private func currentFontSize(in textView: UITextView) -> CGFloat {
@@ -25145,8 +25519,7 @@ struct OrganizerVisibilityPickerField: View {
 
     private static let options = [
         OrganizerVisibilityOption(id: "public", label: "🌍 Pubblico — Visibile a tutti", description: "Tutti possono trovare e visualizzare questo evento."),
-        OrganizerVisibilityOption(id: "private", label: "🔗 Privato — Solo link diretto", description: "Non visibile nella scoperta. Accessibile solo tramite link diretto o invito."),
-        OrganizerVisibilityOption(id: "hidden", label: "👁️ Nascosto — Solo organizzatori e admin", description: "Visibile solo agli organizzatori e agli admin.")
+        OrganizerVisibilityOption(id: "private", label: "🔗 Privato — Solo link diretto", description: "Non visibile nella scoperta. Accessibile solo tramite link diretto o invito.")
     ]
 
     var body: some View {
@@ -25205,7 +25578,6 @@ struct OrganizerRegistrationRulesSummary: View {
         switch visibility {
         case "public": return "Visibile a tutti"
         case "private": return "Solo link diretto"
-        case "hidden": return "Nascosto"
         default: return "Visibilità personalizzata"
         }
     }
