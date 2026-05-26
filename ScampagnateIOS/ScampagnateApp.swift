@@ -8812,7 +8812,6 @@ struct HomeView: View {
     @State private var selectedCategory: String?
     @State private var searchOpen = false
     @State private var activeQuickFilters: Set<QuickFilter> = []
-    @State private var selectedDateFilter: Date?
     @State private var priceFilter: HomePriceFilter = .all
     @State private var selectedEvent: Event?
     @State private var showCalendar = false
@@ -8837,9 +8836,8 @@ struct HomeView: View {
             ].contains { $0.normalizedSearchText.contains(normalizedQuery) }
             let matchesCategory = selectedCategory == nil || event.category?.name == selectedCategory
             let matchesQuickFilter = activeQuickFilters.allSatisfy { $0.matches(event) }
-            let matchesDate = selectedDateFilter.map { event.date == DateFormatter.eventDate.string(from: $0) } ?? true
             let matchesPrice = priceFilter.matches(event)
-            return matchesQuery && matchesCategory && matchesQuickFilter && matchesDate && matchesPrice
+            return matchesQuery && matchesCategory && matchesQuickFilter && matchesPrice
         }
     }
 
@@ -8859,7 +8857,6 @@ struct HomeView: View {
         !query.normalizedSearchText.isEmpty ||
         selectedCategory != nil ||
         !activeQuickFilters.isEmpty ||
-        selectedDateFilter != nil ||
         priceFilter != .all
     }
 
@@ -8884,9 +8881,8 @@ struct HomeView: View {
                         if searchOpen {
                             SearchField(query: $query, isFocused: $searchFocused)
                             HomeSearchFilters(
-                                selectedDate: $selectedDateFilter,
                                 priceFilter: $priceFilter,
-                                hasActiveFilters: selectedDateFilter != nil || priceFilter != .all
+                                hasActiveFilters: priceFilter != .all
                             ) {
                                 clearSearchFilters()
                             }
@@ -8967,7 +8963,6 @@ struct HomeView: View {
                     }
                 } else {
                     query = ""
-                    selectedDateFilter = nil
                     priceFilter = .all
                     searchFocused = false
                 }
@@ -8993,7 +8988,6 @@ struct HomeView: View {
     }
 
     private func clearSearchFilters() {
-        selectedDateFilter = nil
         priceFilter = .all
     }
 
@@ -9009,7 +9003,6 @@ struct HomeView: View {
         query = ""
         selectedCategory = request.category
         activeQuickFilters = Set(request.quickFilter.map { [$0] } ?? [])
-        selectedDateFilter = nil
         priceFilter = .all
         searchOpen = false
         searchFocused = false
@@ -9404,47 +9397,12 @@ enum HomePriceFilter: String, CaseIterable, Identifiable {
 }
 
 struct HomeSearchFilters: View {
-    @Binding var selectedDate: Date?
     @Binding var priceFilter: HomePriceFilter
     let hasActiveFilters: Bool
     let onClear: () -> Void
 
-    private var dateSelection: Binding<Date> {
-        Binding {
-            selectedDate ?? Date()
-        } set: { value in
-            selectedDate = Calendar.current.startOfDay(for: value)
-        }
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                DatePicker(
-                    selectedDate.map { DateFormatter.shortItalian.string(from: $0) } ?? "Data",
-                    selection: dateSelection,
-                    in: Date()...,
-                    displayedComponents: .date
-                )
-                .datePickerStyle(.compact)
-                .environment(\.locale, Locale(identifier: "it_IT"))
-                .labelsHidden()
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                if selectedDate != nil {
-                    Button {
-                        selectedDate = nil
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.headline)
-                            .foregroundStyle(Brand.mutedForeground)
-                            .frame(width: 34, height: 34)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Cancella filtro data")
-                }
-            }
-
             Picker("Prezzo", selection: $priceFilter) {
                 ForEach(HomePriceFilter.allCases) { filter in
                     Text(filter.title).tag(filter)
