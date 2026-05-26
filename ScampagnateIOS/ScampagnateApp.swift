@@ -4801,23 +4801,28 @@ struct PriceOption: Codable, Identifiable, Hashable {
         return type == "paid" || type == "deposit"
     }
 
-    func realRemainingSpots(in event: Event) -> Int {
-        let eventRemaining = max((event.spotsTotal ?? 0) - (event.spotsTaken ?? 0), 0)
-        guard let dedicatedRemaining = dedicatedRemainingSpots else { return eventRemaining }
+    func realRemainingSpots(in event: Event, eventSpotsTaken: Int? = nil, optionSpotsTaken: Int? = nil) -> Int {
+        let effectiveEventSpotsTaken = max(eventSpotsTaken ?? event.spotsTaken ?? 0, 0)
+        let eventRemaining = max((event.spotsTotal ?? 0) - effectiveEventSpotsTaken, 0)
+        guard usesDedicatedSpots else { return eventRemaining }
+
+        let effectiveOptionSpotsTaken = max(optionSpotsTaken ?? spotsTaken ?? 0, 0)
+        let dedicatedRemaining = max((dedicatedSpots ?? 0) - effectiveOptionSpotsTaken, 0)
         return min(eventRemaining, dedicatedRemaining)
     }
 
-    func isBookable(in event: Event, now: Date = Date()) -> Bool {
-        guard isCurrentlyAvailable(now: now), event.acceptsRegistrations, !event.isSoldOut else { return false }
-        return realRemainingSpots(in: event) > 0
+    func isBookable(in event: Event, now: Date = Date(), eventSpotsTaken: Int? = nil, optionSpotsTaken: Int? = nil) -> Bool {
+        guard isCurrentlyAvailable(now: now), event.acceptsRegistrations, event.normalizedStatus != "full" else { return false }
+        return realRemainingSpots(in: event, eventSpotsTaken: eventSpotsTaken, optionSpotsTaken: optionSpotsTaken) > 0
     }
 
-    func canJoinWaitlist(in event: Event, now: Date = Date()) -> Bool {
-        guard isCurrentlyAvailable(now: now), event.acceptsRegistrations, event.isSoldOut || realRemainingSpots(in: event) <= 0 else { return false }
-        return !isBookable(in: event, now: now) && event.waitingListEnabled
+    func canJoinWaitlist(in event: Event, now: Date = Date(), eventSpotsTaken: Int? = nil, optionSpotsTaken: Int? = nil) -> Bool {
+        let remaining = realRemainingSpots(in: event, eventSpotsTaken: eventSpotsTaken, optionSpotsTaken: optionSpotsTaken)
+        guard isCurrentlyAvailable(now: now), event.acceptsRegistrations, event.normalizedStatus == "full" || remaining <= 0 else { return false }
+        return !isBookable(in: event, now: now, eventSpotsTaken: eventSpotsTaken, optionSpotsTaken: optionSpotsTaken) && event.waitingListEnabled
     }
 
-    func availabilityText(in event: Event, now: Date = Date()) -> String {
+    func availabilityText(in event: Event, now: Date = Date(), eventSpotsTaken: Int? = nil, optionSpotsTaken: Int? = nil) -> String {
         if isPromotional == true {
             switch promoStatus(now: now) {
             case .upcoming:
@@ -4829,11 +4834,11 @@ struct PriceOption: Codable, Identifiable, Hashable {
             }
         }
 
-        if isBookable(in: event, now: now) {
-            let remaining = realRemainingSpots(in: event)
+        if isBookable(in: event, now: now, eventSpotsTaken: eventSpotsTaken, optionSpotsTaken: optionSpotsTaken) {
+            let remaining = realRemainingSpots(in: event, eventSpotsTaken: eventSpotsTaken, optionSpotsTaken: optionSpotsTaken)
             return remaining == 1 ? "1 posto disponibile" : "\(remaining) posti disponibili"
         }
-        return canJoinWaitlist(in: event, now: now) ? "Lista d'attesa disponibile" : "Sold out"
+        return canJoinWaitlist(in: event, now: now, eventSpotsTaken: eventSpotsTaken, optionSpotsTaken: optionSpotsTaken) ? "Lista d'attesa disponibile" : "Sold out"
     }
 
     func paymentSummary(in event: Event) -> String {
@@ -20268,6 +20273,10 @@ struct OrganizerParticipationOptionsBreakdown: View {
         }
     }
 
+    private var activeRegistrations: [OrganizerRegistration] {
+        registrations.filter(\.isActive)
+    }
+
     var body: some View {
         if !sortedOptions.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
@@ -20279,6 +20288,7 @@ struct OrganizerParticipationOptionsBreakdown: View {
                         event: event,
                         option: option,
                         activeCount: count(for: option, matching: \.isActive),
+                        eventActiveCount: activeRegistrations.count,
                         waitlistCount: registrations.filter { $0.priceOption?.id == option.id && $0.normalizedStatus == "waitlist" }.count
                     )
                 }
@@ -20295,6 +20305,7 @@ struct OrganizerParticipationOptionRow: View {
     let event: Event
     let option: PriceOption
     let activeCount: Int
+    let eventActiveCount: Int
     let waitlistCount: Int
 
     private var capacity: Int? {
@@ -20304,6 +20315,14 @@ struct OrganizerParticipationOptionRow: View {
     private var progress: Double? {
         guard let capacity, capacity > 0 else { return nil }
         return min(Double(activeCount) / Double(capacity), 1)
+    }
+
+    private var availabilityText: String {
+        option.availabilityText(in: event, eventSpotsTaken: eventActiveCount, optionSpotsTaken: activeCount)
+    }
+
+    private var isBookable: Bool {
+        option.isBookable(in: event, eventSpotsTaken: eventActiveCount, optionSpotsTaken: activeCount)
     }
 
     var body: some View {
@@ -20322,9 +20341,9 @@ struct OrganizerParticipationOptionRow: View {
                     Text(capacity.map { "\(activeCount)/\($0)" } ?? "\(activeCount)")
                         .font(.caption.weight(.bold))
                         .foregroundStyle(Brand.foreground)
-                    Text(option.availabilityText(in: event))
+                    Text(availabilityText)
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(option.isBookable(in: event) ? Brand.success : Brand.warning)
+                        .foregroundStyle(isBookable ? Brand.success : Brand.warning)
                 }
             }
             if let progress {
