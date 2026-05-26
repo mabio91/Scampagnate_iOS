@@ -8878,6 +8878,7 @@ struct HomeView: View {
                         ) {
                             showCalendar = true
                         }
+                        .zIndex(10)
 
                         if searchOpen {
                             SearchField(query: $query, isFocused: $searchFocused)
@@ -9286,49 +9287,61 @@ struct AppHeader: View {
                 .font(.system(size: 27, weight: .bold, design: .rounded))
                 .foregroundStyle(Brand.foreground)
                 .lineLimit(1)
-                .minimumScaleFactor(0.72)
-            Spacer()
-            Button(action: onOpenCalendar) {
-                Image(systemName: "calendar")
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(Brand.mutedForeground)
-                    .frame(width: 32, height: 36)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Apri calendario eventi")
-            Button {
-                withAnimation(.snappy) { searchOpen.toggle() }
-            } label: {
-                Image(systemName: searchOpen ? "xmark" : "magnifyingglass")
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(Brand.mutedForeground)
-                    .frame(width: 32, height: 36)
-            }
-            .buttonStyle(.plain)
-            if store.isAuthenticated {
-                Button {
-                    showNotifications = true
-                } label: {
-                    ZStack(alignment: .topTrailing) {
-                        Image(systemName: "bell")
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(Brand.mutedForeground)
-                            .frame(width: 32, height: 36)
-                        if unreadCount > 0 {
-                            Text(unreadCount > 99 ? "99+" : "\(unreadCount)")
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 5)
-                                .background(Brand.destructive, in: Capsule())
-                                .offset(x: 4, y: -4)
-                        }
+                .minimumScaleFactor(0.62)
+            Spacer(minLength: 2)
+            HStack(spacing: 2) {
+                AppHeaderIconButton(systemName: "calendar", accessibilityLabel: "Apri calendario eventi", action: onOpenCalendar)
+                AppHeaderIconButton(
+                    systemName: searchOpen ? "xmark" : "magnifyingglass",
+                    accessibilityLabel: searchOpen ? "Chiudi ricerca eventi" : "Apri ricerca eventi"
+                ) {
+                    withAnimation(.snappy) { searchOpen.toggle() }
+                }
+                if store.isAuthenticated {
+                    AppHeaderIconButton(
+                        systemName: "bell",
+                        accessibilityLabel: "Apri notifiche",
+                        badgeText: unreadCount > 0 ? (unreadCount > 99 ? "99+" : "\(unreadCount)") : nil
+                    ) {
+                        showNotifications = true
                     }
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Apri notifiche")
             }
+            .fixedSize()
+            .layoutPriority(1)
         }
         .frame(maxWidth: .infinity)
+    }
+}
+
+private struct AppHeaderIconButton: View {
+    let systemName: String
+    let accessibilityLabel: String
+    var badgeText: String?
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack(alignment: .topTrailing) {
+                Image(systemName: systemName)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(Brand.mutedForeground)
+                    .frame(width: 32, height: 36)
+
+                if let badgeText {
+                    Text(badgeText)
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 5)
+                        .background(Brand.destructive, in: Capsule())
+                        .offset(x: 4, y: -4)
+                }
+            }
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
     }
 }
 
@@ -9667,6 +9680,7 @@ struct FeaturedEventCard: View {
         .frame(height: 260)
         .frame(maxWidth: .infinity)
         .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
+        .contentShape(RoundedRectangle(cornerRadius: 20))
     }
 }
 
@@ -29910,6 +29924,10 @@ struct KeyboardDismissOnTapView: UIViewRepresentable {
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            true
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer) -> Bool {
             true
         }
 
