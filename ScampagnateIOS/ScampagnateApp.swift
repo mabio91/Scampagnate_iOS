@@ -28739,9 +28739,11 @@ struct RewardDetailItem: Identifiable {
     let copyCode: String?
 
     init(reward: Reward) {
+        let subtitle = reward.summaryDescription
+
         self.id = "reward-\(reward.id)"
         self.title = reward.displayTitle
-        self.subtitle = reward.summaryDescription
+        self.subtitle = subtitle
         self.iconName = reward.badgeIconValue == nil ? reward.iconName : nil
         self.badgeIcon = reward.badgeIconValue
         self.accentColor = reward.accentColor
@@ -28754,16 +28756,18 @@ struct RewardDetailItem: Identifiable {
         case .points:
             self.valueLabel = "Valore"
             self.valueText = reward.pointValueLabel
-            self.sourceLabel = "Ottenuti grazie a"
-            self.sourceText = reward.earnedDescription
+            let source = Self.nonDuplicateSourceRow(label: "Ottenuti grazie a", text: reward.earnedDescription, visibleSubtitle: subtitle)
+            self.sourceLabel = source.label
+            self.sourceText = source.text
             self.helpLabel = "Nota"
             self.helpText = nil
             self.copyCode = nil
         case .badge:
             self.valueLabel = nil
             self.valueText = nil
-            self.sourceLabel = "Sbloccato con"
-            self.sourceText = reward.earnedDescription
+            let source = Self.nonDuplicateSourceRow(label: "Sbloccato con", text: reward.earnedDescription, visibleSubtitle: subtitle)
+            self.sourceLabel = source.label
+            self.sourceText = source.text
             self.helpLabel = "Nota"
             self.helpText = "Resta visibile nel profilo e contribuisce alla tua progressione nella community."
             self.copyCode = nil
@@ -28771,8 +28775,9 @@ struct RewardDetailItem: Identifiable {
             let code = reward.value?.nilIfBlank
             self.valueLabel = "Codice"
             self.valueText = code
-            self.sourceLabel = "Ottenuto grazie a"
-            self.sourceText = reward.earnedDescription
+            let source = Self.nonDuplicateSourceRow(label: "Ottenuto grazie a", text: reward.earnedDescription, visibleSubtitle: subtitle)
+            self.sourceLabel = source.label
+            self.sourceText = source.text
             let expiry = reward.expiryDate?.shortDateLabel.map { " Scade il \($0)." } ?? ""
             self.helpLabel = "Nota"
             self.helpText = "Inserisci il codice in fase di pagamento.\(expiry)"
@@ -28780,8 +28785,9 @@ struct RewardDetailItem: Identifiable {
         case .physical:
             self.valueLabel = "Premio"
             self.valueText = reward.physicalRewardConfig?.rewardName?.nilIfBlank
-            self.sourceLabel = "Ottenuto grazie a"
-            self.sourceText = reward.earnedDescription
+            let source = Self.nonDuplicateSourceRow(label: "Ottenuto grazie a", text: reward.earnedDescription, visibleSubtitle: subtitle)
+            self.sourceLabel = source.label
+            self.sourceText = source.text
             let claimInstructions = reward.physicalClaimInstructions
             self.helpLabel = claimInstructions == nil ? "Nota" : "Istruzioni di riscatto"
             self.helpText = claimInstructions ?? (reward.effectiveStatus == "pending" ? "Potrai ritirarlo al prossimo evento." : nil)
@@ -28789,8 +28795,9 @@ struct RewardDetailItem: Identifiable {
         case .other:
             self.valueLabel = nil
             self.valueText = reward.value?.nilIfBlank
-            self.sourceLabel = "Ottenuta grazie a"
-            self.sourceText = reward.earnedDescription
+            let source = Self.nonDuplicateSourceRow(label: "Ottenuta grazie a", text: reward.earnedDescription, visibleSubtitle: subtitle)
+            self.sourceLabel = source.label
+            self.sourceText = source.text
             self.helpLabel = "Nota"
             self.helpText = nil
             self.copyCode = nil
@@ -28798,9 +28805,11 @@ struct RewardDetailItem: Identifiable {
     }
 
     init(badge: UserBadge) {
+        let subtitle = badge.displayDescription.nilIfBlank ?? "Badge ottenuto"
+
         self.id = "badge-\(badge.id)"
         self.title = badge.displayName
-        self.subtitle = badge.displayDescription.nilIfBlank ?? "Badge ottenuto"
+        self.subtitle = subtitle
         self.iconName = nil
         self.badgeIcon = badge.displayIcon
         self.accentColor = Brand.accent
@@ -28809,12 +28818,40 @@ struct RewardDetailItem: Identifiable {
         self.categoryText = badge.badges?.category?.nilIfBlank?.replacingOccurrences(of: "_", with: " ").capitalized ?? "Badge"
         self.valueLabel = nil
         self.valueText = nil
-        self.sourceLabel = "Ottenuto grazie a"
-        self.sourceText = badge.displayDescription.nilIfBlank ?? "Obiettivo completato nella community."
+        let source = Self.nonDuplicateSourceRow(label: "Ottenuto grazie a", text: badge.displayDescription.nilIfBlank ?? "Obiettivo completato nella community.", visibleSubtitle: subtitle)
+        self.sourceLabel = source.label
+        self.sourceText = source.text
         self.dateText = badge.earnedAt?.shortDateLabel ?? badge.completedAt?.shortDateLabel
         self.helpLabel = "Nota"
         self.helpText = "Resta visibile nel profilo e racconta un traguardo raggiunto."
         self.copyCode = nil
+    }
+
+    private static func nonDuplicateSourceRow(label: String, text: String, visibleSubtitle: String?) -> (label: String?, text: String?) {
+        guard let cleanText = text.nilIfBlank else { return (nil, nil) }
+        guard !isDuplicateSourceText(cleanText, visibleSubtitle: visibleSubtitle) else { return (nil, nil) }
+        return (label, cleanText)
+    }
+
+    private static func isDuplicateSourceText(_ sourceText: String, visibleSubtitle: String?) -> Bool {
+        guard let visibleSubtitle = visibleSubtitle?.nilIfBlank else { return false }
+
+        let source = normalizedDetailText(sourceText)
+        let subtitle = normalizedDetailText(visibleSubtitle)
+        if source == subtitle {
+            return true
+        }
+
+        let missionPrefix = "missione completata: "
+        guard source.hasPrefix(missionPrefix) else { return false }
+        return String(source.dropFirst(missionPrefix.count)) == subtitle
+    }
+
+    private static func normalizedDetailText(_ text: String) -> String {
+        text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
     }
 }
 
