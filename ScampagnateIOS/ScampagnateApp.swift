@@ -9010,7 +9010,7 @@ struct HomeView: View {
     @Binding var showAuth: Bool
     @Binding var showNotifications: Bool
     @State private var query = ""
-    @State private var selectedCategory: String?
+    @State private var selectedCategories: Set<String> = []
     @State private var searchOpen = false
     @State private var activeQuickFilters: Set<QuickFilter> = []
     @State private var selectedDateFilter: Date?
@@ -9036,8 +9036,8 @@ struct HomeView: View {
                 event.description ?? "",
                 event.category?.name ?? ""
             ].contains { $0.normalizedSearchText.contains(normalizedQuery) }
-            let matchesCategory = selectedCategory == nil || event.category?.name == selectedCategory
-            let matchesQuickFilter = activeQuickFilters.matchesAll(event)
+            let matchesCategory = selectedCategories.isEmpty || selectedCategories.contains(event.category?.name ?? "")
+            let matchesQuickFilter = activeQuickFilters.matchesAny(event)
             let matchesDate = selectedDateFilter.map { event.date == DateFormatter.eventDate.string(from: $0) } ?? true
             let matchesPrice = priceFilter.matches(event)
             return matchesQuery && matchesCategory && matchesQuickFilter && matchesDate && matchesPrice
@@ -9058,7 +9058,7 @@ struct HomeView: View {
 
     var hasActiveDiscoveryFilters: Bool {
         !query.normalizedSearchText.isEmpty ||
-        selectedCategory != nil ||
+        !selectedCategories.isEmpty ||
         !activeQuickFilters.isEmpty ||
         selectedDateFilter != nil ||
         priceFilter != .all
@@ -9098,7 +9098,7 @@ struct HomeView: View {
                         }
 
                         VStack(alignment: .leading, spacing: 6) {
-                            CategoryStrip(categories: store.categories, selected: $selectedCategory)
+                            CategoryStrip(categories: store.categories, selected: $selectedCategories)
                             QuickFilterStrip(selected: $activeQuickFilters)
                         }
 
@@ -9199,7 +9199,7 @@ struct HomeView: View {
 
     private func clearAllDiscoveryFilters() {
         query = ""
-        selectedCategory = nil
+        selectedCategories.removeAll()
         activeQuickFilters.removeAll()
         clearSearchFilters()
     }
@@ -9207,7 +9207,7 @@ struct HomeView: View {
     private func applyHomeDiscoveryRequest() {
         guard let request = store.homeDiscoveryRequest else { return }
         query = ""
-        selectedCategory = request.category
+        selectedCategories = Set(request.category.map { [$0] } ?? [])
         activeQuickFilters = Set(request.quickFilter.map { [$0] } ?? [])
         selectedDateFilter = nil
         priceFilter = .all
@@ -9222,11 +9222,11 @@ struct EventCalendarView: View {
     @State private var visibleMonth = Calendar.current.startOfMonth(for: Date())
     @State private var selectedDate = Calendar.current.startOfDay(for: Date())
     @State private var selectedEvent: Event?
-    @State private var selectedCategory: String?
+    @State private var selectedCategories: Set<String> = []
 
     private var visibleEvents: [Event] {
         store.events.filter { event in
-            event.isVisibleInUpcomingList && (selectedCategory == nil || event.category?.name == selectedCategory)
+            event.isVisibleInUpcomingList && (selectedCategories.isEmpty || selectedCategories.contains(event.category?.name ?? ""))
         }
     }
 
@@ -9249,7 +9249,7 @@ struct EventCalendarView: View {
         GeometryReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    CategoryStrip(categories: store.categories, selected: $selectedCategory)
+                    CategoryStrip(categories: store.categories, selected: $selectedCategories)
 
                     EventMonthCalendar(
                         visibleMonth: $visibleMonth,
@@ -9676,18 +9676,22 @@ struct HomeEventsEmptyState: View {
 
 struct CategoryStrip: View {
     let categories: [EventCategory]
-    @Binding var selected: String?
+    @Binding var selected: Set<String>
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                CategoryPill(title: "Tutti", icon: "✨", selected: selected == nil) {
-                    selected = nil
+                CategoryPill(title: "Tutti", icon: "✨", selected: selected.isEmpty) {
+                    selected.removeAll()
                 }
                 ForEach(categories.filter { $0.name?.isEmpty == false }, id: \.self) { category in
                     let name = category.name ?? ""
-                    CategoryPill(title: name, icon: category.icon, selected: selected == name) {
-                        selected = name
+                    CategoryPill(title: name, icon: category.icon, selected: selected.contains(name)) {
+                        if selected.contains(name) {
+                            selected.remove(name)
+                        } else {
+                            selected.insert(name)
+                        }
                     }
                 }
             }
@@ -9741,8 +9745,8 @@ enum QuickFilter: String, CaseIterable, Identifiable, Sendable {
 }
 
 extension Set where Element == QuickFilter {
-    func matchesAll(_ event: Event) -> Bool {
-        allSatisfy { $0.matches(event) }
+    func matchesAny(_ event: Event) -> Bool {
+        isEmpty || contains { $0.matches(event) }
     }
 }
 
