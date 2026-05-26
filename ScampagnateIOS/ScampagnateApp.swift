@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import SafariServices
 import PhotosUI
 import UIKit
@@ -21,6 +22,152 @@ enum ScampagnateConfig {
 enum IssueMediaLimits {
     static let maxFiles = 4
     static let maxFileSize = 50 * 1024 * 1024
+}
+
+enum EventAvailabilityRules {
+    static let lastSpotsFillRatio = 0.70
+}
+
+enum PromoBoundary {
+    case start
+    case end
+}
+
+enum PromoWindowStatus {
+    case active
+    case upcoming
+    case expired
+}
+
+enum PromoPricing {
+    static let timeZone = TimeZone(identifier: "Europe/Rome")!
+
+    private static let dateOnlyPattern = #"^\d{4}-\d{2}-\d{2}$"#
+    private static let localDateTimePattern = #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$"#
+    private static let legacyUTCMidnightPattern = #"^(\d{4}-\d{2}-\d{2})[T ]00:00(?::00(?:\.0+)?)?(?:Z|[+-]00(?::?00)?)?$"#
+
+    private static let calendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        return calendar
+    }()
+
+    private static func dateInputFormatter() -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.locale = Locale(identifier: "it_IT")
+        formatter.timeZone = timeZone
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }
+
+    private static func storageFormatter() -> ISO8601DateFormatter {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)!
+        return formatter
+    }
+
+    private static func localDateTimeFormatter(format: String) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.calendar = calendar
+        formatter.locale = Locale(identifier: "it_IT")
+        formatter.timeZone = timeZone
+        formatter.dateFormat = format
+        return formatter
+    }
+
+    private static func dateOnlyValue(from value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.range(of: dateOnlyPattern, options: .regularExpression) != nil {
+            return trimmed
+        }
+        return trimmed.firstRegexCapture(legacyUTCMidnightPattern)
+    }
+
+    private static func dayBoundary(for date: Date, boundary: PromoBoundary) -> Date? {
+        var components = calendar.dateComponents([.year, .month, .day], from: date)
+        components.hour = boundary == .start ? 0 : 23
+        components.minute = boundary == .start ? 0 : 59
+        components.second = boundary == .start ? 0 : 59
+        components.nanosecond = boundary == .start ? 0 : 999_000_000
+        return calendar.date(from: components)
+    }
+
+    static func boundaryDate(from value: String?, boundary: PromoBoundary) -> Date? {
+        guard let rawValue = value?.trimmingCharacters(in: .whitespacesAndNewlines), !rawValue.isEmpty else {
+            return nil
+        }
+
+        if let dateOnly = dateOnlyValue(from: rawValue),
+           let date = dateInputFormatter().date(from: dateOnly) {
+            return dayBoundary(for: date, boundary: boundary)
+        }
+
+        if rawValue.range(of: localDateTimePattern, options: .regularExpression) != nil {
+            for format in ["yyyy-MM-dd'T'HH:mm:ss.SSS", "yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd'T'HH:mm"] {
+                if let date = localDateTimeFormatter(format: format).date(from: rawValue) {
+                    return date
+                }
+            }
+        }
+
+        return rawValue.iso8601Date
+    }
+
+    static func storageString(from input: String?, boundary: PromoBoundary) -> String? {
+        guard let date = boundaryDate(from: input, boundary: boundary) else { return nil }
+        return storageFormatter().string(from: date)
+    }
+
+    static func dateInputString(from value: String?) -> String {
+        guard let rawValue = value?.trimmingCharacters(in: .whitespacesAndNewlines), !rawValue.isEmpty else {
+            return ""
+        }
+        if let dateOnly = dateOnlyValue(from: rawValue) {
+            return dateOnly
+        }
+        guard let date = boundaryDate(from: rawValue, boundary: .start) else {
+            return ""
+        }
+        return dateInputFormatter().string(from: date)
+    }
+
+    static func windowStatus(start: String?, end: String?, now: Date = Date()) -> PromoWindowStatus {
+        if let startsAt = boundaryDate(from: start, boundary: .start), startsAt > now {
+            return .upcoming
+        }
+        if let endsAt = boundaryDate(from: end, boundary: .end), endsAt < now {
+            return .expired
+        }
+        return .active
+    }
+
+    static func countdownLabel(end: String?, now: Date = Date()) -> String? {
+        guard let endsAt = boundaryDate(from: end, boundary: .end) else { return nil }
+        let diff = endsAt.timeIntervalSince(now)
+        guard diff > 0 else { return "Promo scaduta" }
+
+        let totalMinutes = max(1, Int(ceil(diff / 60)))
+        if totalMinutes >= 1_440 {
+            let days = totalMinutes / 1_440
+            let hours = (totalMinutes % 1_440) / 60
+            return hours > 0 ? "scade tra \(days)g \(hours)h" : "scade tra \(days)g"
+        }
+
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        if hours > 0 {
+            return minutes > 0 ? "scade tra \(hours)h \(minutes)m" : "scade tra \(hours)h"
+        }
+
+        return "scade tra \(totalMinutes)m"
+    }
+
+    static func badgeLabel(end: String?, now: Date = Date()) -> String {
+        guard let countdown = countdownLabel(end: end, now: now) else { return "Promo" }
+        return countdown == "Promo scaduta" ? countdown : "Promo · \(countdown)"
+    }
 }
 
 enum Brand {
@@ -841,6 +988,15 @@ final class AppStore: ObservableObject {
             eventStaff[eventId] = try await api.fetchEventStaff(eventId: eventId, session: session)
         } catch {
             eventStaff[eventId] = []
+        }
+    }
+
+    func fetchPublicProfiles(userIds: [String], reportingErrors: Bool = true) async -> [String: PublicProfile] {
+        do {
+            return try await api.fetchPublicProfiles(userIds: userIds, session: session)
+        } catch {
+            report(error, when: reportingErrors)
+            return [:]
         }
     }
 
@@ -1669,6 +1825,11 @@ enum ProfileScrollTarget: Hashable, Sendable {
     case help
 }
 
+enum ProfileEditInitialFocus: Hashable, Sendable {
+    case membership
+    case membershipSex
+}
+
 struct HomeDiscoveryRequest: Identifiable, Equatable, Sendable {
     let id = UUID()
     let category: String?
@@ -1682,12 +1843,9 @@ struct HomeDiscoveryRequest: Identifiable, Equatable, Sendable {
     init(mission: MissionCardModel) {
         let missionCategory = mission.missions?.category?.nilIfBlank
         let action = (mission.missions?.targetAction ?? "").lowercased()
-        let type = (mission.missions?.type ?? "").lowercased()
         let quickFilter: QuickFilter?
         if action == "limited_spots" {
             quickFilter = .lastSpots
-        } else if type == "weekly" {
-            quickFilter = .thisWeek
         } else {
             quickFilter = nil
         }
@@ -2647,7 +2805,7 @@ struct SupabaseAPI {
         )
     }
 
-    private func fetchPublicProfiles(userIds: [String], session: AuthSession?) async throws -> [String: PublicProfile] {
+    func fetchPublicProfiles(userIds: [String], session: AuthSession?) async throws -> [String: PublicProfile] {
         guard !userIds.isEmpty else { return [:] }
         let body: [String: JSONValue] = ["profile_ids": .array(userIds.map { .string($0) })]
         let profiles: [PublicProfile] = try await request(path: "/rest/v1/rpc/get_public_profiles", method: "POST", body: body, auth: session, decode: [PublicProfile].self)
@@ -2807,6 +2965,7 @@ struct SupabaseAPI {
         var payload: [String: JSONValue] = [
             "phone": .string(input.phone),
             "birth_date": input.birthDate.isEmpty ? .null : .string(input.birthDate),
+            "sex": input.sex.isEmpty ? .null : .string(input.sex),
             "instagram_handle": normalizedInstagramHandle.map { .string($0) } ?? .null,
             "trekking_experience": .string(input.trekkingExperience),
             "activity_frequency": .string(input.activityFrequency),
@@ -2856,6 +3015,7 @@ struct SupabaseAPI {
             "instagram_handle": normalizedInstagramHandle.map { .string($0) } ?? .null,
             "bio": input.bio.isEmpty ? .null : .string(input.bio),
             "birth_date": input.birthDate.isEmpty ? .null : .string(input.birthDate),
+            "sex": input.sex.isEmpty ? .null : .string(input.sex),
             "birth_place": input.birthPlace.isEmpty ? .null : .string(input.birthPlace),
             "province_of_birth": input.provinceOfBirth.isEmpty ? .null : .string(input.provinceOfBirth.uppercased()),
             "residential_address": input.residentialAddress.isEmpty ? .null : .string(input.residentialAddress),
@@ -3099,8 +3259,8 @@ struct SupabaseAPI {
                 "eligible_group": .string(eligibleGroup),
                 "original_price": option.originalPrice.map { .number($0) } ?? .null,
                 "is_promotional": .bool(option.isPromotional),
-                "promo_start": option.promoStart.nilIfBlank.map { .string($0) } ?? .null,
-                "promo_end": option.promoEnd.nilIfBlank.map { .string($0) } ?? .null,
+                "promo_start": option.promoStart.nilIfBlank.flatMap { PromoPricing.storageString(from: $0, boundary: .start) }.map { .string($0) } ?? .null,
+                "promo_end": option.promoEnd.nilIfBlank.flatMap { PromoPricing.storageString(from: $0, boundary: .end) }.map { .string($0) } ?? .null,
                 "payment_type": .string(option.paymentType),
                 "deposit_amount": option.paymentType == "deposit" ? .number(option.depositAmount) : .null,
                 "balance_amount": option.paymentType == "deposit" ? .number(resolvedBalance) : .null,
@@ -3895,6 +4055,7 @@ struct Profile: Codable, Identifiable {
     var healthSafetyHelpNotes: String?
     var healthSafetyUpdatedAt: String?
     var birthDate: String?
+    var sex: String?
     var birthPlace: String?
     var provinceOfBirth: String?
     var residentialAddress: String?
@@ -3926,9 +4087,14 @@ struct Profile: Codable, Identifiable {
         missingMembershipFieldLabels.isEmpty
     }
 
+    var isMissingMembershipSex: Bool {
+        sex != "M" && sex != "F"
+    }
+
     var missingMembershipFieldLabels: [String] {
         var labels: [String] = []
         if birthDate?.nilIfBlank == nil { labels.append("Data di nascita") }
+        if isMissingMembershipSex { labels.append("Sesso anagrafico") }
         if birthPlace?.nilIfBlank == nil { labels.append("Luogo di nascita") }
         if provinceOfBirth?.nilIfBlank == nil { labels.append("Provincia di nascita") }
         if residentialAddress?.nilIfBlank == nil { labels.append("Indirizzo di residenza") }
@@ -4022,6 +4188,17 @@ struct Event: Codable, Identifiable, Hashable {
     }
     var availableSpots: Int { max(0, (spotsTotal ?? 0) - attendeeSpotsTaken) }
     var bookableSpots: Int { max(0, (spotsTotal ?? 0) - (spotsTaken ?? 0)) }
+    var capacityFillRatio: Double {
+        let total = spotsTotal ?? 0
+        guard total > 0 else { return 0 }
+        return min(1, max(0, Double(attendeeSpotsTaken) / Double(total)))
+    }
+    var hasLastSpots: Bool {
+        (spotsTotal ?? 0) > 0
+            && capacityFillRatio >= EventAvailabilityRules.lastSpotsFillRatio
+            && bookableSpots > 0
+            && !isSoldOut
+    }
     var hasBookableParticipationOption: Bool {
         guard acceptsRegistrations, !isSoldOut else { return false }
         guard !priceOptions.isEmpty else { return bookableSpots > 0 }
@@ -4546,7 +4723,7 @@ struct PriceOption: Codable, Identifiable, Hashable {
             parts.append(eligibleLabel)
         }
         if isPromotional == true {
-            parts.append("Promo")
+            parts.append(promoBadgeText())
         }
         return parts.joined(separator: " · ")
     }
@@ -4566,8 +4743,23 @@ struct PriceOption: Codable, Identifiable, Hashable {
         price ?? 0
     }
 
-    var showsPromoBadge: Bool {
-        isPromotional == true
+    func promoStatus(now: Date = Date()) -> PromoWindowStatus {
+        guard isPromotional == true else { return .active }
+        return PromoPricing.windowStatus(start: promoStart, end: promoEnd, now: now)
+    }
+
+    func showsPromoBadge(now: Date = Date()) -> Bool {
+        guard isPromotional == true else { return false }
+        let status = promoStatus(now: now)
+        return status == .active || status == .expired
+    }
+
+    func hasActivePromo(now: Date = Date()) -> Bool {
+        isPromotional == true && promoStatus(now: now) == .active
+    }
+
+    func promoBadgeText(now: Date = Date()) -> String {
+        PromoPricing.badgeLabel(end: promoEnd, now: now)
     }
 
     var usesDedicatedSpots: Bool {
@@ -4610,28 +4802,44 @@ struct PriceOption: Codable, Identifiable, Hashable {
         return type == "paid" || type == "deposit"
     }
 
-    func realRemainingSpots(in event: Event) -> Int {
-        let eventRemaining = max((event.spotsTotal ?? 0) - (event.spotsTaken ?? 0), 0)
-        guard let dedicatedRemaining = dedicatedRemainingSpots else { return eventRemaining }
+    func realRemainingSpots(in event: Event, eventSpotsTaken: Int? = nil, optionSpotsTaken: Int? = nil) -> Int {
+        let effectiveEventSpotsTaken = max(eventSpotsTaken ?? event.spotsTaken ?? 0, 0)
+        let eventRemaining = max((event.spotsTotal ?? 0) - effectiveEventSpotsTaken, 0)
+        guard usesDedicatedSpots else { return eventRemaining }
+
+        let effectiveOptionSpotsTaken = max(optionSpotsTaken ?? spotsTaken ?? 0, 0)
+        let dedicatedRemaining = max((dedicatedSpots ?? 0) - effectiveOptionSpotsTaken, 0)
         return min(eventRemaining, dedicatedRemaining)
     }
 
-    func isBookable(in event: Event) -> Bool {
-        guard event.acceptsRegistrations, !event.isSoldOut else { return false }
-        return realRemainingSpots(in: event) > 0
+    func isBookable(in event: Event, now: Date = Date(), eventSpotsTaken: Int? = nil, optionSpotsTaken: Int? = nil) -> Bool {
+        guard isCurrentlyAvailable(now: now), event.acceptsRegistrations, event.normalizedStatus != "full" else { return false }
+        return realRemainingSpots(in: event, eventSpotsTaken: eventSpotsTaken, optionSpotsTaken: optionSpotsTaken) > 0
     }
 
-    func canJoinWaitlist(in event: Event) -> Bool {
-        guard event.acceptsRegistrations, event.isSoldOut || realRemainingSpots(in: event) <= 0 else { return false }
-        return !isBookable(in: event) && event.waitingListEnabled
+    func canJoinWaitlist(in event: Event, now: Date = Date(), eventSpotsTaken: Int? = nil, optionSpotsTaken: Int? = nil) -> Bool {
+        let remaining = realRemainingSpots(in: event, eventSpotsTaken: eventSpotsTaken, optionSpotsTaken: optionSpotsTaken)
+        guard isCurrentlyAvailable(now: now), event.acceptsRegistrations, event.normalizedStatus == "full" || remaining <= 0 else { return false }
+        return !isBookable(in: event, now: now, eventSpotsTaken: eventSpotsTaken, optionSpotsTaken: optionSpotsTaken) && event.waitingListEnabled
     }
 
-    func availabilityText(in event: Event) -> String {
-        if isBookable(in: event) {
-            let remaining = realRemainingSpots(in: event)
+    func availabilityText(in event: Event, now: Date = Date(), eventSpotsTaken: Int? = nil, optionSpotsTaken: Int? = nil) -> String {
+        if isPromotional == true {
+            switch promoStatus(now: now) {
+            case .upcoming:
+                return "Promozione non ancora attiva"
+            case .expired:
+                return "Promozione scaduta"
+            case .active:
+                break
+            }
+        }
+
+        if isBookable(in: event, now: now, eventSpotsTaken: eventSpotsTaken, optionSpotsTaken: optionSpotsTaken) {
+            let remaining = realRemainingSpots(in: event, eventSpotsTaken: eventSpotsTaken, optionSpotsTaken: optionSpotsTaken)
             return remaining == 1 ? "1 posto disponibile" : "\(remaining) posti disponibili"
         }
-        return canJoinWaitlist(in: event) ? "Lista d'attesa disponibile" : "Sold out"
+        return canJoinWaitlist(in: event, now: now, eventSpotsTaken: eventSpotsTaken, optionSpotsTaken: optionSpotsTaken) ? "Lista d'attesa disponibile" : "Sold out"
     }
 
     func paymentSummary(in event: Event) -> String {
@@ -4657,24 +4865,13 @@ struct PriceOption: Codable, Identifiable, Hashable {
             : "Partecipazione evento"
     }
 
-    var isCurrentlyAvailable: Bool {
+    func isCurrentlyAvailable(now: Date = Date()) -> Bool {
         guard isPromotional == true else { return true }
-        let today = Calendar.current.startOfDay(for: Date())
-        if let start = promoStart?.prefix(10).description,
-           let startDate = DateFormatter.eventDate.date(from: start),
-           startDate > today {
-            return false
-        }
-        if let end = promoEnd?.prefix(10).description,
-           let endDate = DateFormatter.eventDate.date(from: end),
-           endDate < today {
-            return false
-        }
-        return true
+        return promoStatus(now: now) == .active
     }
 
     func isEligible(for context: PriceEligibilityContext) -> Bool {
-        guard isCurrentlyAvailable else { return false }
+        guard isCurrentlyAvailable() else { return false }
         guard let rawGroup = eligibleGroup?.nilIfBlank?.lowercased() else { return true }
         if rawGroup == "all" { return true }
         guard let profile = context.profile else { return false }
@@ -5292,8 +5489,8 @@ struct OrganizerPriceOptionDraft: Identifiable, Equatable {
         }
         originalPrice = option.originalPrice
         isPromotional = option.isPromotional ?? false
-        promoStart = option.promoStart?.prefix(10).description ?? ""
-        promoEnd = option.promoEnd?.prefix(10).description ?? ""
+        promoStart = PromoPricing.dateInputString(from: option.promoStart)
+        promoEnd = PromoPricing.dateInputString(from: option.promoEnd)
     }
 }
 
@@ -5478,7 +5675,7 @@ struct OrganizerEventDraft: Equatable {
         cancellationPolicy = Self.normalizedCancellationPolicy(event.cancellationPolicy)
         imageUrl = event.imageUrl ?? ""
         homeCardImageUrl = event.homeCardImageUrl ?? ""
-        visibility = duplicate ? "private" : (event.visibility ?? "public")
+        visibility = duplicate ? "private" : Self.editableVisibility(event.visibility)
         status = duplicate ? "open" : Self.editableStatus(event.status)
         galleryImageURLs = event.gallery.compactMap(\.url)
         let manualBadgeIds = Set(OrganizerEventDraft.manualBadgeOptions.map(\.id))
@@ -5568,6 +5765,10 @@ struct OrganizerEventDraft: Equatable {
         default:
             return "open"
         }
+    }
+
+    static func editableVisibility(_ visibility: String?) -> String {
+        visibility == "private" ? "private" : "public"
     }
 
     static let manualBadgeOptions: [(id: String, label: String)] = [
@@ -5717,7 +5918,7 @@ struct OrganizerEventDraft: Equatable {
             "featured": .bool(featured),
             "cancellation_policy": .string(Self.normalizedCancellationPolicy(cancellationPolicy)),
             "image_url": image.map { .string($0) } ?? .null,
-            "visibility": .string(visibility),
+            "visibility": .string(Self.editableVisibility(visibility)),
             "gallery_images": .array(gallery),
             "equipment_list": .array(equipmentItems.filter { $0.name.nilIfBlank != nil }.map(\.jsonValue)),
             "additional_fields": .object(additionalObject),
@@ -6715,6 +6916,10 @@ private extension MissionCardModel {
         min(max(progress ?? 0, 0), targetValue)
     }
 
+    var completionRatio: Double {
+        Double(clampedProgress) / Double(targetValue)
+    }
+
     var displayTitle: String {
         missions?.title?.nilIfBlank ?? "Missione"
     }
@@ -6984,6 +7189,7 @@ struct UserConsentRow: Decodable {
 struct OnboardingInput {
     var phone = ""
     var birthDate = ""
+    var sex = ""
     var instagramHandle = ""
     var trekkingExperience = ""
     var selfLevel = ""
@@ -7073,6 +7279,7 @@ struct ProfileEditInput {
     var phone = ""
     var instagramHandle = ""
     var birthDate = ""
+    var sex = ""
     var birthPlace = ""
     var provinceOfBirth = ""
     var residentialAddress = ""
@@ -7530,6 +7737,10 @@ struct RootView: View {
             await refreshProfileTabAvatar()
         }
         .onOpenURL { url in
+            handleDeepLink(url)
+        }
+        .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
+            guard let url = activity.webpageURL else { return }
             handleDeepLink(url)
         }
     }
@@ -8809,7 +9020,7 @@ struct HomeView: View {
     @Binding var showAuth: Bool
     @Binding var showNotifications: Bool
     @State private var query = ""
-    @State private var selectedCategory: String?
+    @State private var selectedCategories: Set<String> = []
     @State private var searchOpen = false
     @State private var activeQuickFilters: Set<QuickFilter> = []
     @State private var priceFilter: HomePriceFilter = .all
@@ -8834,8 +9045,8 @@ struct HomeView: View {
                 event.description ?? "",
                 event.category?.name ?? ""
             ].contains { $0.normalizedSearchText.contains(normalizedQuery) }
-            let matchesCategory = selectedCategory == nil || event.category?.name == selectedCategory
-            let matchesQuickFilter = activeQuickFilters.allSatisfy { $0.matches(event) }
+            let matchesCategory = selectedCategories.isEmpty || selectedCategories.contains(event.category?.name ?? "")
+            let matchesQuickFilter = activeQuickFilters.matchesAny(event)
             let matchesPrice = priceFilter.matches(event)
             return matchesQuery && matchesCategory && matchesQuickFilter && matchesPrice
         }
@@ -8855,7 +9066,7 @@ struct HomeView: View {
 
     var hasActiveDiscoveryFilters: Bool {
         !query.normalizedSearchText.isEmpty ||
-        selectedCategory != nil ||
+        !selectedCategories.isEmpty ||
         !activeQuickFilters.isEmpty ||
         priceFilter != .all
     }
@@ -8894,7 +9105,7 @@ struct HomeView: View {
                         }
 
                         VStack(alignment: .leading, spacing: 6) {
-                            CategoryStrip(categories: store.categories, selected: $selectedCategory)
+                            CategoryStrip(categories: store.categories, selected: $selectedCategories)
                             QuickFilterStrip(selected: $activeQuickFilters)
                         }
 
@@ -8993,7 +9204,7 @@ struct HomeView: View {
 
     private func clearAllDiscoveryFilters() {
         query = ""
-        selectedCategory = nil
+        selectedCategories.removeAll()
         activeQuickFilters.removeAll()
         clearSearchFilters()
     }
@@ -9001,7 +9212,7 @@ struct HomeView: View {
     private func applyHomeDiscoveryRequest() {
         guard let request = store.homeDiscoveryRequest else { return }
         query = ""
-        selectedCategory = request.category
+        selectedCategories = Set(request.category.map { [$0] } ?? [])
         activeQuickFilters = Set(request.quickFilter.map { [$0] } ?? [])
         priceFilter = .all
         searchOpen = false
@@ -9015,11 +9226,11 @@ struct EventCalendarView: View {
     @State private var visibleMonth = Calendar.current.startOfMonth(for: Date())
     @State private var selectedDate = Calendar.current.startOfDay(for: Date())
     @State private var selectedEvent: Event?
-    @State private var selectedCategory: String?
+    @State private var selectedCategories: Set<String> = []
 
     private var visibleEvents: [Event] {
         store.events.filter { event in
-            event.isVisibleInUpcomingList && (selectedCategory == nil || event.category?.name == selectedCategory)
+            event.isVisibleInUpcomingList && (selectedCategories.isEmpty || selectedCategories.contains(event.category?.name ?? ""))
         }
     }
 
@@ -9042,7 +9253,7 @@ struct EventCalendarView: View {
         GeometryReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    CategoryStrip(categories: store.categories, selected: $selectedCategory)
+                    CategoryStrip(categories: store.categories, selected: $selectedCategories)
 
                     EventMonthCalendar(
                         visibleMonth: $visibleMonth,
@@ -9446,18 +9657,22 @@ struct HomeEventsEmptyState: View {
 
 struct CategoryStrip: View {
     let categories: [EventCategory]
-    @Binding var selected: String?
+    @Binding var selected: Set<String>
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                CategoryPill(title: "Tutti", icon: "✨", selected: selected == nil) {
-                    selected = nil
+                CategoryPill(title: "Tutti", icon: "✨", selected: selected.isEmpty) {
+                    selected.removeAll()
                 }
                 ForEach(categories.filter { $0.name?.isEmpty == false }, id: \.self) { category in
                     let name = category.name ?? ""
-                    CategoryPill(title: name, icon: category.icon, selected: selected == name) {
-                        selected = name
+                    CategoryPill(title: name, icon: category.icon, selected: selected.contains(name)) {
+                        if selected.contains(name) {
+                            selected.remove(name)
+                        } else {
+                            selected.insert(name)
+                        }
                     }
                 }
             }
@@ -9468,47 +9683,51 @@ struct CategoryStrip: View {
 }
 
 enum QuickFilter: String, CaseIterable, Identifiable, Sendable {
-    case featured
     case lastSpots
-    case thisWeek
-    case nextWeek
-    case weekend
+    case weekendAway
+    case easy
+    case intermediate
+    case challenging
 
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .featured: "In evidenza"
         case .lastSpots: "Ultimi posti"
-        case .thisWeek: "Questa settimana"
-        case .nextWeek: "Prossima settimana"
-        case .weekend: "Weekend"
+        case .weekendAway: "Weekend fuori"
+        case .easy: "Facile"
+        case .intermediate: "Intermedio"
+        case .challenging: "Impegnativo"
         }
     }
-    var icon: String {
+    var emoji: String {
         switch self {
-        case .featured: "star"
-        case .lastSpots: "flame"
-        case .thisWeek: "calendar.badge.clock"
-        case .nextWeek: "calendar.badge.plus"
-        case .weekend: "beach.umbrella"
+        case .lastSpots: "🔥"
+        case .weekendAway: "🎒"
+        case .easy: "🌱"
+        case .intermediate: "⛰️"
+        case .challenging: "🧗"
         }
     }
 
     func matches(_ event: Event) -> Bool {
         switch self {
-        case .featured:
-            return event.featured == true
         case .lastSpots:
-            let total = event.spotsTotal ?? 0
-            let taken = event.attendeeSpotsTaken
-            return event.acceptsRegistrations && total > 0 && Double(taken) / Double(total) > 0.8 && !event.isFull
-        case .thisWeek:
-            return event.isThisWeek
-        case .nextWeek:
-            return event.isNextWeek
-        case .weekend:
-            return event.isWeekend
+            return event.acceptsRegistrations && event.hasLastSpots
+        case .weekendAway:
+            return event.isLongerThan24Hours
+        case .easy:
+            return event.difficultyLevel.map { $0 == 1 || $0 == 2 } ?? false
+        case .intermediate:
+            return event.difficultyLevel == 3
+        case .challenging:
+            return event.difficultyLevel.map { $0 == 4 || $0 == 5 } ?? false
         }
+    }
+}
+
+extension Set where Element == QuickFilter {
+    func matchesAny(_ event: Event) -> Bool {
+        isEmpty || contains { $0.matches(event) }
     }
 }
 
@@ -9528,8 +9747,8 @@ struct QuickFilterStrip: View {
                         }
                     } label: {
                         HStack(spacing: 4) {
-                            Image(systemName: filter.icon)
-                                .font(.system(size: 13, weight: .semibold))
+                            Text(filter.emoji)
+                                .font(.system(size: 13))
                             Text(filter.title)
                                 .lineLimit(1)
                         }
@@ -9652,9 +9871,7 @@ struct EventCard: View {
     }
     var status: EventStatusStyle { event.cardStatusStyle(registration: registration) }
     var fillPercent: Double {
-        let total = event.spotsTotal ?? 0
-        guard total > 0 else { return 0 }
-        return min(1, Double(event.attendeeSpotsTaken) / Double(total))
+        event.capacityFillRatio
     }
 
     var body: some View {
@@ -9728,21 +9945,24 @@ struct EventCard: View {
                 .foregroundStyle(Brand.mutedForeground)
                 Spacer()
                 if event.shouldShowPublicCapacity {
-                    HStack {
+                    VStack(alignment: .trailing, spacing: 4) {
                         Label("\(event.attendeeSpotsTaken)/\(event.spotsTotal ?? 0) posti", systemImage: "person.2")
-                    }
-                    .font(.caption)
-                    .foregroundStyle(Brand.mutedForeground)
-                    .overlay(alignment: .bottom) {
+                            .font(.caption)
+                            .foregroundStyle(Brand.mutedForeground)
                         GeometryReader { proxy in
                             ZStack(alignment: .leading) {
                                 Capsule().fill(Brand.muted)
-                                Capsule().fill(event.isSoldOut ? Brand.destructive : Brand.success)
+                                Capsule().fill(event.isSoldOut ? Brand.destructive : (event.hasLastSpots ? Brand.destructive : Brand.success))
                                     .frame(width: proxy.size.width * fillPercent)
                             }
                         }
-                        .frame(height: 4)
-                        .offset(y: 9)
+                        .frame(width: 86, height: 4)
+                        if event.hasLastSpots {
+                            Text("Ultimi posti!")
+                                .font(.system(size: 10, weight: .bold, design: .rounded))
+                                .foregroundStyle(Brand.destructive)
+                                .lineLimit(1)
+                        }
                     }
                 }
             }
@@ -9788,6 +10008,19 @@ struct EventCardPillLabel: View {
             .padding(.vertical, 4)
             .background(color, in: Capsule())
             .foregroundStyle(foreground)
+    }
+}
+
+struct LastSpotsCTABadge: View {
+    var body: some View {
+        Text("Ultimi posti!")
+            .font(.system(size: 13, weight: .bold, design: .rounded))
+            .foregroundStyle(.black)
+            .lineLimit(1)
+            .padding(.horizontal, 13)
+            .padding(.vertical, 6)
+            .background(.white, in: Capsule())
+            .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
     }
 }
 
@@ -10222,7 +10455,10 @@ struct EventDetailView: View {
     }
 
     var attendeeParticipants: [EventParticipant] {
-        participants.filter(\.isParticipant)
+        participants.filter { participant in
+            guard let organizerId = event?.organizerId else { return participant.isParticipant }
+            return participant.isParticipant && participant.userId != organizerId
+        }
     }
 
     var organizerProfile: PublicProfile? {
@@ -10351,7 +10587,7 @@ struct EventDetailView: View {
                             .presentationDetents([.medium, .large])
                     }
                     .sheet(isPresented: $showStaff) {
-                        EventStaffSheet(event: event, staffMembers: staffMembers, organizerProfile: organizerProfile)
+                        EventStaffSheet(event: event, staffMembers: staffMembers, organizerProfile: organizerProfile, showAuth: $showAuth)
                             .presentationDetents([.medium, .large])
                     }
                     .fullScreenCover(isPresented: $showGallery) {
@@ -10802,17 +11038,23 @@ struct EventDetailView: View {
                         .frame(height: 50)
                         .background(event.statusStyle.background, in: RoundedRectangle(cornerRadius: 18))
                 } else {
-                    Button(check.isBlocking ? "Requisiti" : (event.isFull ? "Entra in lista d'attesa" : "Partecipa")) {
-                        if !store.isAuthenticated {
-                            showAuth = true
-                        } else if check.isBlocking || check.hasWarnings {
-                            showAccessWarning = true
-                        } else {
-                            requestApprovalOverride = false
-                            showCheckout = true
+                    VStack(spacing: -8) {
+                        if event.hasLastSpots {
+                            LastSpotsCTABadge()
+                                .zIndex(1)
                         }
+                        Button(check.isBlocking ? "Requisiti" : (event.isFull ? "Entra in lista d'attesa" : "Partecipa")) {
+                            if !store.isAuthenticated {
+                                showAuth = true
+                            } else if check.isBlocking || check.hasWarnings {
+                                showAccessWarning = true
+                            } else {
+                                requestApprovalOverride = false
+                                showCheckout = true
+                            }
+                        }
+                        .buttonStyle(PrimaryButtonStyle(width: 170))
                     }
-                    .buttonStyle(PrimaryButtonStyle(width: 170))
                 }
             }
             .padding(.horizontal, 18)
@@ -11076,6 +11318,10 @@ struct EventPillsRow: View {
                 CompactEventPill(text: event.statusStyle.label, color: event.statusStyle.background, foreground: event.statusStyle.foreground)
             }
 
+            if event.hasLastSpots {
+                CompactEventPill(text: "🔥 Ultimi posti", color: Brand.destructive.opacity(0.14), foreground: Brand.destructive)
+            }
+
             if let difficulty = event.difficultyLabel {
                 CompactEventPill(text: difficulty.text, color: difficulty.background, foreground: difficulty.foreground)
             }
@@ -11256,12 +11502,35 @@ struct EventStaffAvatarStack: View {
 
 struct EventStaffSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var store: AppStore
     let event: Event
     let staffMembers: [EventStaffMember]
     let organizerProfile: PublicProfile?
+    @Binding var showAuth: Bool
+    @State private var selectedContact: StaffContactSelection?
+    @State private var profileContact: StaffContactSelection?
+    @State private var staffProfiles: [String: PublicProfile] = [:]
 
     private var organizerName: String {
         organizerProfile?.firstName.nilIfBlank ?? event.organizerName ?? "Organizzatore"
+    }
+
+    private var staffProfileIds: [String] {
+        staffMembers.compactMap { member in
+            member.profileId?.nilIfBlank
+        }
+        .removingDuplicates()
+    }
+
+    private var organizerContact: StaffContactSelection {
+        StaffContactSelection(
+            id: event.organizerId ?? "organizer-\(event.id)",
+            name: organizerName,
+            role: "Organizzatore",
+            avatarUrl: organizerProfile?.avatarUrl,
+            profileId: event.organizerId,
+            phone: organizerProfile?.phone
+        )
     }
 
     var body: some View {
@@ -11293,30 +11562,28 @@ struct EventStaffSheet: View {
                     Text("ORGANIZZATORE")
                         .font(.caption.weight(.bold))
                         .foregroundStyle(Brand.primary)
-                    HStack(spacing: 14) {
-                        OrganizerAvatar(name: organizerName, avatarUrl: organizerProfile?.avatarUrl, size: 52)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(organizerName)
-                                .font(.system(.body, design: .rounded, weight: .semibold))
-                                .foregroundStyle(Brand.foreground)
-                            Text("Organizzatore")
-                                .font(.system(.caption, design: .rounded))
+                    Button {
+                        selectedContact = organizerContact
+                    } label: {
+                        HStack(spacing: 14) {
+                            OrganizerAvatar(name: organizerName, avatarUrl: organizerProfile?.avatarUrl, size: 52)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(organizerName)
+                                    .font(.system(.body, design: .rounded, weight: .semibold))
+                                    .foregroundStyle(Brand.foreground)
+                                Text("Organizzatore")
+                                    .font(.system(.caption, design: .rounded))
+                                    .foregroundStyle(Brand.mutedForeground)
+                            }
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 14, weight: .bold))
                                 .foregroundStyle(Brand.mutedForeground)
                         }
-                        Spacer()
-                        if let phone = organizerProfile?.phone?.nilIfBlank {
-                            Button {
-                                openOrganizerWhatsApp(phone: phone, event: event)
-                            } label: {
-                                Image(systemName: "message.fill")
-                                    .font(.subheadline.weight(.bold))
-                                    .foregroundStyle(.white)
-                                    .frame(width: 36, height: 36)
-                                    .background(Brand.primary, in: Circle())
-                            }
-                            .buttonStyle(.plain)
-                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
                 }
 
                 if !staffMembers.isEmpty {
@@ -11325,25 +11592,182 @@ struct EventStaffSheet: View {
                             .font(.caption.weight(.bold))
                             .foregroundStyle(Brand.primary)
                         ForEach(staffMembers) { member in
-                            HStack(spacing: 14) {
-                                OrganizerAvatar(name: member.name, avatarUrl: member.avatarUrl, size: 52)
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(member.name)
-                                        .font(.system(.body, design: .rounded, weight: .semibold))
-                                        .foregroundStyle(Brand.foreground)
-                                    Text(member.role)
-                                        .font(.system(.caption, design: .rounded))
+                            let contact = staffContact(for: member)
+                            Button {
+                                selectedContact = contact
+                            } label: {
+                                HStack(spacing: 14) {
+                                    OrganizerAvatar(name: contact.name, avatarUrl: contact.avatarUrl, size: 52)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(contact.name)
+                                            .font(.system(.body, design: .rounded, weight: .semibold))
+                                            .foregroundStyle(Brand.foreground)
+                                        Text(contact.role)
+                                            .font(.system(.caption, design: .rounded))
+                                            .foregroundStyle(Brand.mutedForeground)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 14, weight: .bold))
                                         .foregroundStyle(Brand.mutedForeground)
                                 }
-                                Spacer()
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
                             }
                             .padding(.vertical, 4)
+                            .buttonStyle(.plain)
                         }
                     }
                 }
             }
             .padding(22)
         }
+        .background(Brand.background)
+        .task(id: staffProfileIds.joined(separator: ",")) {
+            await loadStaffProfiles()
+        }
+        .sheet(item: $selectedContact) { contact in
+            StaffContactActionSheet(contact: contact, event: event) {
+                selectedContact = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+                    profileContact = contact
+                }
+            }
+            .presentationDetents([.height(contact.actionSheetHeight), .medium])
+        }
+        .fullScreenCover(item: $profileContact) { contact in
+            OrganizerProfileView(
+                organizerId: contact.profileId,
+                fallbackName: contact.name,
+                profile: profile(for: contact),
+                showAuth: $showAuth
+            )
+            .environmentObject(store)
+        }
+    }
+
+    private func loadStaffProfiles() async {
+        let profiles = await store.fetchPublicProfiles(userIds: staffProfileIds, reportingErrors: false)
+        staffProfiles = profiles
+    }
+
+    private func staffContact(for member: EventStaffMember) -> StaffContactSelection {
+        let profile = normalizedProfileId(member.profileId).flatMap { staffProfiles[$0] }
+        return StaffContactSelection(
+            id: member.id,
+            name: profile?.firstName.nilIfBlank ?? member.name,
+            role: member.role,
+            avatarUrl: profile?.avatarUrl ?? member.avatarUrl,
+            profileId: normalizedProfileId(member.profileId),
+            phone: profile?.phone
+        )
+    }
+
+    private func profile(for contact: StaffContactSelection) -> PublicProfile? {
+        if contact.id == organizerContact.id {
+            return organizerProfile
+        }
+        return normalizedProfileId(contact.profileId).flatMap { staffProfiles[$0] }
+    }
+
+    private func normalizedProfileId(_ value: String?) -> String? {
+        value?.nilIfBlank
+    }
+}
+
+struct StaffContactSelection: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let role: String
+    let avatarUrl: String?
+    let profileId: String?
+    let phone: String?
+
+    var actionSheetHeight: CGFloat {
+        let actionCount = (profileId?.nilIfBlank == nil ? 0 : 1) + (phone?.nilIfBlank == nil ? 0 : 2)
+        switch actionCount {
+        case 3:
+            return 500
+        case 2:
+            return 430
+        case 1:
+            return 340
+        default:
+            return 320
+        }
+    }
+}
+
+struct StaffContactActionSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let contact: StaffContactSelection
+    let event: Event
+    let onProfile: () -> Void
+
+    private var phone: String? {
+        contact.phone?.nilIfBlank
+    }
+
+    private var hasProfile: Bool {
+        contact.profileId?.nilIfBlank != nil
+    }
+
+    var body: some View {
+        VStack(spacing: 22) {
+            Capsule()
+                .fill(Brand.muted.opacity(0.65))
+                .frame(width: 44, height: 5)
+                .padding(.bottom, 2)
+
+            VStack(spacing: 12) {
+                OrganizerAvatar(name: contact.name, avatarUrl: contact.avatarUrl, size: 92)
+
+                VStack(spacing: 5) {
+                    Text(contact.name)
+                        .font(.system(.title2, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                        .multilineTextAlignment(.center)
+
+                    Text(contact.role)
+                        .font(.system(.caption, design: .rounded, weight: .bold))
+                        .tracking(0.6)
+                        .foregroundStyle(Brand.mutedForeground)
+                        .textCase(.uppercase)
+                }
+            }
+
+            VStack(spacing: 12) {
+                if hasProfile {
+                    ContactActionButton(icon: "person", title: "Profilo", action: onProfile)
+                }
+
+                if let phone {
+                    ContactActionButton(icon: "message", title: "WhatsApp") {
+                        dismiss()
+                        openOrganizerWhatsApp(phone: phone, event: event)
+                    }
+
+                    ContactActionButton(icon: "phone", title: "Telefona") {
+                        dismiss()
+                        if let url = URL(string: "tel:\(phone.filter { $0.isNumber || $0 == "+" })") {
+                            UIApplication.shared.open(url)
+                        }
+                    }
+                }
+
+                if !hasProfile && phone == nil {
+                    Label("Nessuna azione disponibile", systemImage: "info.circle")
+                        .font(.system(.footnote, design: .rounded, weight: .semibold))
+                        .foregroundStyle(Brand.mutedForeground)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 16)
+                        .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.top, 18)
+        .padding(.bottom, 26)
         .background(Brand.background)
     }
 }
@@ -12152,12 +12576,11 @@ struct ParticipantsSheet: View {
             ?? store.myEvents.compactMap(\.event).first { $0.id == eventId }
     }
 
-    private var organizer: EventParticipant {
-        participants.first(where: \.isOrganizer) ?? EventParticipant(id: "organizer-placeholder-\(eventId)", userId: nil, firstName: "Organizzatore", lastNameInitial: nil, avatarUrl: nil, role: "organizer")
-    }
-
     private var attendeeParticipants: [EventParticipant] {
-        participants.filter(\.isParticipant)
+        participants.filter { participant in
+            guard let organizerId = event?.organizerId else { return participant.isParticipant }
+            return participant.isParticipant && participant.userId != organizerId
+        }
     }
 
     private var attendeeCount: Int {
@@ -12195,46 +12618,40 @@ struct ParticipantsSheet: View {
             VStack(alignment: .leading, spacing: 24) {
                 header
 
-                ParticipantsSection(title: "ORGANIZZATORE") {
-                    ParticipantPersonRow(participant: organizer, levels: store.communityLevels, mode: canViewDetails ? .details : .publicOrganizer)
-                }
-
-                ParticipantsSection(title: "CHI CI SARÀ") {
-                    if canViewDetails {
-                        if attendeeParticipants.isEmpty {
-                            ParticipantsEmptyState(
-                                title: attendeeCount == 0 ? "Ancora nessun partecipante" : "\(attendeeCount) persone stanno partecipando",
-                                message: attendeeCount == 0 ? "Quando qualcuno si iscriverà, lo vedrai qui." : "Stiamo aggiornando la lista dei partecipanti."
-                            )
-                        } else {
-                            VStack(alignment: .leading, spacing: 18) {
-                                ForEach(attendeeParticipants) { participant in
-                                    if canViewOrganizerDetails, let event {
-                                        OrganizerPublicParticipantDetailRow(
-                                            participant: participant,
-                                            registration: organizerRegistration(for: participant),
-                                            event: event,
-                                            levels: store.communityLevels,
-                                            history: history(for: participant),
-                                            onOpenProfile: {
-                                                if let registration = organizerRegistration(for: participant), !registration.isManual {
-                                                    selectedParticipantProfile = registration
-                                                }
+                if canViewDetails {
+                    if attendeeParticipants.isEmpty {
+                        ParticipantsEmptyState(
+                            title: attendeeCount == 0 ? "Ancora nessun partecipante" : "\(attendeeCount) persone stanno partecipando",
+                            message: attendeeCount == 0 ? "Quando qualcuno si iscriverà, lo vedrai qui." : "Stiamo aggiornando la lista dei partecipanti."
+                        )
+                    } else {
+                        VStack(alignment: .leading, spacing: 18) {
+                            ForEach(attendeeParticipants) { participant in
+                                if canViewOrganizerDetails, let event {
+                                    OrganizerPublicParticipantDetailRow(
+                                        participant: participant,
+                                        registration: organizerRegistration(for: participant),
+                                        event: event,
+                                        levels: store.communityLevels,
+                                        history: history(for: participant),
+                                        onOpenProfile: {
+                                            if let registration = organizerRegistration(for: participant), !registration.isManual {
+                                                selectedParticipantProfile = registration
                                             }
-                                        )
-                                    } else {
-                                        ParticipantPersonRow(participant: participant, levels: store.communityLevels, mode: .details)
-                                    }
+                                        }
+                                    )
+                                } else {
+                                    ParticipantPersonRow(participant: participant, levels: store.communityLevels, mode: .details)
                                 }
                             }
                         }
-                    } else if attendeeCount == 0 {
-                        ParticipantsEmptyState(title: "Ancora nessun partecipante", message: "Quando qualcuno si iscriverà, lo vedrai qui.")
-                    } else {
-                        VStack(alignment: .leading, spacing: 18) {
-                            ForEach(Array(previewParticipants.enumerated()), id: \.offset) { _, participant in
-                                ParticipantPrivacyPreviewRow(participant: participant)
-                            }
+                    }
+                } else if attendeeCount == 0 {
+                    ParticipantsEmptyState(title: "Ancora nessun partecipante", message: "Quando qualcuno si iscriverà, lo vedrai qui.")
+                } else {
+                    VStack(alignment: .leading, spacing: 18) {
+                        ForEach(Array(previewParticipants.enumerated()), id: \.offset) { _, participant in
+                            ParticipantPrivacyPreviewRow(participant: participant)
                         }
                     }
                 }
@@ -13090,6 +13507,14 @@ private struct EventDescriptionHTMLView: UIViewRepresentable {
 }
 
 private enum EventDescriptionHTML {
+    static let bodyFontSize: CGFloat = 16
+    static let heading1FontSize: CGFloat = bodyFontSize * 1.5
+    static let heading2FontSize: CGFloat = bodyFontSize * 1.25
+    static let heading3FontSize: CGFloat = bodyFontSize * 1.1
+    static let minFontSize: CGFloat = 12
+    static let maxFontSize: CGFloat = 30
+    static let fontSizeStep: CGFloat = 1
+
     static func cleanStoredHTML(from source: String) -> String {
         let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -13139,6 +13564,15 @@ private enum EventDescriptionHTML {
             openList = nil
         }
 
+        func hasNonBlankText(after location: Int) -> Bool {
+            guard location < fullText.length else { return false }
+            let remainingRange = NSRange(location: location, length: fullText.length - location)
+            return fullText
+                .substring(with: remainingRange)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .nilIfBlank != nil
+        }
+
         while position < fullText.length {
             let paragraphRange = fullText.paragraphRange(for: NSRange(location: position, length: 0))
             defer { position = paragraphRange.location + paragraphRange.length }
@@ -13146,6 +13580,9 @@ private enum EventDescriptionHTML {
             let plain = paragraph.string.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !plain.isEmpty else {
                 closeList()
+                if !parts.isEmpty, hasNonBlankText(after: NSMaxRange(paragraphRange)) {
+                    parts.append("<p><br></p>")
+                }
                 continue
             }
 
@@ -13160,9 +13597,7 @@ private enum EventDescriptionHTML {
             }
 
             closeList()
-            let tag = headingTag(for: paragraph)
-            let suppressBold = tag != "p"
-            parts.append("<\(tag)>\(inlineHTML(from: paragraph, suppressBold: suppressBold))</\(tag)>")
+            parts.append("<p>\(inlineHTML(from: paragraph))</p>")
         }
 
         closeList()
@@ -13208,10 +13643,18 @@ private enum EventDescriptionHTML {
         paragraphStyle.lineSpacing = 5
         paragraphStyle.paragraphSpacing = 14
         return [
-            .font: UIFont.systemFont(ofSize: 16, weight: .regular),
+            .font: UIFont.systemFont(ofSize: bodyFontSize, weight: .regular),
             .foregroundColor: UIColor(Brand.inputForeground),
             .paragraphStyle: paragraphStyle
         ]
+    }
+
+    static func cssPixels(_ value: CGFloat) -> String {
+        let rounded = (Double(value) * 10).rounded() / 10
+        if rounded.rounded() == rounded {
+            return "\(Int(rounded))px"
+        }
+        return "\(rounded)px"
     }
 
     static func renderDocument(for html: String) -> String {
@@ -13228,31 +13671,31 @@ private enum EventDescriptionHTML {
         body {
           color: #15281F;
           font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-          font-size: 16px;
+          font-size: \(Self.cssPixels(bodyFontSize));
           line-height: 1.55;
           -webkit-font-smoothing: antialiased;
           overflow-wrap: anywhere;
         }
         h1 {
-          font-size: 24px;
+          font-size: \(Self.cssPixels(heading1FontSize));
           font-weight: 800;
           line-height: 1.2;
-          margin: 32px 0 16px;
+          margin: 0.8em 0 0.4em;
         }
         h2 {
-          font-size: 21px;
+          font-size: \(Self.cssPixels(heading2FontSize));
           font-weight: 800;
           line-height: 1.25;
-          margin: 30px 0 12px;
+          margin: 0.7em 0 0.3em;
         }
         h3 {
-          font-size: 17px;
+          font-size: \(Self.cssPixels(heading3FontSize));
           font-weight: 700;
           line-height: 1.35;
-          margin: 22px 0 8px;
+          margin: 0.6em 0 0.2em;
         }
         p {
-          margin: 0 0 14px;
+          margin: 0.5em 0;
           line-height: 1.55;
         }
         ul, ol {
@@ -13313,15 +13756,15 @@ private enum EventDescriptionHTML {
         <style>
         body {
           font-family: -apple-system;
-          font-size: 16px;
+          font-size: \(Self.cssPixels(bodyFontSize));
           line-height: 1.45;
           margin: 0;
           color: #15281F;
         }
-        h1 { font-size: 24px; font-weight: 800; line-height: 1.2; margin: 24px 0 12px; }
-        h2 { font-size: 21px; font-weight: 800; line-height: 1.25; margin: 22px 0 10px; }
-        h3 { font-size: 17px; font-weight: 700; line-height: 1.35; margin: 18px 0 8px; }
-        p { margin: 0 0 12px; }
+        h1 { font-size: \(Self.cssPixels(heading1FontSize)); font-weight: 800; line-height: 1.2; margin: 0.8em 0 0.4em; }
+        h2 { font-size: \(Self.cssPixels(heading2FontSize)); font-weight: 800; line-height: 1.25; margin: 0.7em 0 0.3em; }
+        h3 { font-size: \(Self.cssPixels(heading3FontSize)); font-weight: 700; line-height: 1.35; margin: 0.6em 0 0.2em; }
+        p { margin: 0.5em 0; }
         ul, ol { margin: 8px 0 14px 20px; padding: 0; }
         li { margin: 0 0 6px; }
         </style>
@@ -13334,21 +13777,11 @@ private enum EventDescriptionHTML {
     private static func normalizeForEditing(_ attributed: NSMutableAttributedString) {
         let fullRange = NSRange(location: 0, length: attributed.length)
         guard fullRange.length > 0 else { return }
-        let bodySize: CGFloat = 16
         attributed.enumerateAttribute(.font, in: fullRange) { value, range, _ in
-            let currentFont = value as? UIFont ?? UIFont.systemFont(ofSize: bodySize)
-            let pointSize: CGFloat
-            if currentFont.pointSize >= 23 {
-                pointSize = 24
-            } else if currentFont.pointSize >= 20 {
-                pointSize = 21
-            } else if currentFont.pointSize >= 17 {
-                pointSize = 17
-            } else {
-                pointSize = bodySize
-            }
+            let currentFont = value as? UIFont ?? UIFont.systemFont(ofSize: bodyFontSize)
+            let pointSize = normalizedFontSize(currentFont.pointSize)
             var traits = UIFontDescriptor.SymbolicTraits()
-            if currentFont.fontDescriptor.symbolicTraits.contains(.traitBold) || pointSize > bodySize {
+            if currentFont.fontDescriptor.symbolicTraits.contains(.traitBold) {
                 traits.insert(.traitBold)
             }
             if currentFont.fontDescriptor.symbolicTraits.contains(.traitItalic) {
@@ -13362,6 +13795,11 @@ private enum EventDescriptionHTML {
         attributed.removeAttribute(.foregroundColor, range: fullRange)
         attributed.removeAttribute(.backgroundColor, range: fullRange)
         attributed.addAttribute(.foregroundColor, value: UIColor(Brand.inputForeground), range: fullRange)
+    }
+
+    private static func normalizedFontSize(_ value: CGFloat) -> CGFloat {
+        if abs(value - bodyFontSize) < 0.75 { return bodyFontSize }
+        return min(max((value * 2).rounded() / 2, minFontSize), maxFontSize)
     }
 
     private static func sanitizeRawHTML(_ source: String) -> String {
@@ -13390,7 +13828,7 @@ private enum EventDescriptionHTML {
             result.replaceSubrange(range, with: replacement)
         }
 
-        result = result.replacingOccurrences(of: #"(?is)<p>\s*</p>"#, with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: #"(?is)<p>\s*</p>"#, with: "<p><br></p>", options: .regularExpression)
             .replacingOccurrences(of: #"(?is)(<br>\s*){3,}"#, with: "<br><br>", options: .regularExpression)
             .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -13415,7 +13853,7 @@ private enum EventDescriptionHTML {
             mappedTag = "s"
         case "div":
             mappedTag = "p"
-        case "h1", "h2", "h3", "p", "strong", "em", "u", "s", "ul", "ol", "li", "br", "a", "blockquote", "hr":
+        case "h1", "h2", "h3", "p", "strong", "em", "u", "s", "span", "ul", "ol", "li", "br", "a", "blockquote", "hr":
             mappedTag = rawTag
         case "h4", "h5", "h6":
             mappedTag = "h3"
@@ -13433,6 +13871,10 @@ private enum EventDescriptionHTML {
 
         if mappedTag == "a", let href = hrefValue(from: attributes) {
             return "<a href=\"\(escapeAttribute(href))\">"
+        }
+
+        if mappedTag == "span", let style = fontSizeStyle(from: attributes) {
+            return "<span style=\"\(style)\">"
         }
 
         return "<\(mappedTag)>"
@@ -13458,6 +13900,30 @@ private enum EventDescriptionHTML {
         return value
     }
 
+    private static func fontSizeStyle(from attributes: String) -> String? {
+        guard let styleRegex = try? NSRegularExpression(pattern: #"(?i)style\s*=\s*["']([^"']+)["']"#),
+              let sizeRegex = try? NSRegularExpression(pattern: #"(?i)(?:^|;)\s*font-size\s*:\s*([0-9]+(?:\.[0-9]+)?)(px|pt|em|rem)?"#) else {
+            return nil
+        }
+        let nsAttributes = attributes as NSString
+        guard let styleMatch = styleRegex.firstMatch(in: attributes, range: NSRange(location: 0, length: nsAttributes.length)),
+              styleMatch.range(at: 1).location != NSNotFound else {
+            return nil
+        }
+        let style = nsAttributes.substring(with: styleMatch.range(at: 1))
+        let nsStyle = style as NSString
+        guard let sizeMatch = sizeRegex.firstMatch(in: style, range: NSRange(location: 0, length: nsStyle.length)),
+              sizeMatch.range(at: 1).location != NSNotFound,
+              let rawValue = Double(nsStyle.substring(with: sizeMatch.range(at: 1))) else {
+            return nil
+        }
+        let rawUnit = sizeMatch.range(at: 2).location == NSNotFound ? "px" : nsStyle.substring(with: sizeMatch.range(at: 2)).lowercased()
+        let multiplier: CGFloat = (rawUnit == "em" || rawUnit == "rem") ? bodyFontSize : 1
+        let pointSize = min(max(CGFloat(rawValue) * multiplier, minFontSize), maxFontSize)
+        guard abs(pointSize - bodyFontSize) >= 0.5 else { return nil }
+        return "font-size: \(cssPixels(pointSize))"
+    }
+
     private static func markdownHTML(from source: String) -> String {
         let lines = source.components(separatedBy: .newlines)
         var parts: [String] = []
@@ -13477,11 +13943,21 @@ private enum EventDescriptionHTML {
             paragraphLines.removeAll()
         }
 
-        for rawLine in lines {
+        func hasNonBlankLine(after index: Int) -> Bool {
+            guard index + 1 < lines.count else { return false }
+            return lines[(index + 1)...].contains { line in
+                line.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank != nil
+            }
+        }
+
+        for (index, rawLine) in lines.enumerated() {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
             guard !line.isEmpty else {
                 flushParagraph()
                 closeList()
+                if !parts.isEmpty, hasNonBlankLine(after: index) {
+                    parts.append("<p><br></p>")
+                }
                 continue
             }
 
@@ -13531,24 +14007,6 @@ private enum EventDescriptionHTML {
             .replacingOccurrences(of: #"(?s)\*\*(.+?)\*\*"#, with: "<strong>$1</strong>", options: .regularExpression)
             .replacingOccurrences(of: #"(?s)__(.+?)__"#, with: "<strong>$1</strong>", options: .regularExpression)
             .replacingOccurrences(of: #"(?s)(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)"#, with: "<em>$1</em>", options: .regularExpression)
-    }
-
-    private static func headingTag(for attributed: NSAttributedString) -> String {
-        let range = NSRange(location: 0, length: attributed.length)
-        var maxFontSize: CGFloat = 16
-        var hasBold = false
-        attributed.enumerateAttribute(.font, in: range) { value, _, _ in
-            guard let font = value as? UIFont else { return }
-            maxFontSize = max(maxFontSize, font.pointSize)
-            if font.fontDescriptor.symbolicTraits.contains(.traitBold) {
-                hasBold = true
-            }
-        }
-
-        if maxFontSize >= 23 { return "h1" }
-        if maxFontSize >= 20 { return "h2" }
-        if maxFontSize >= 17, hasBold { return "h3" }
-        return "p"
     }
 
     private static func listInfo(for attributed: NSAttributedString) -> (tag: String, content: NSAttributedString)? {
@@ -13602,7 +14060,7 @@ private enum EventDescriptionHTML {
         return substring.attributedSubstring(from: NSRange(location: start, length: end - start))
     }
 
-    private static func inlineHTML(from attributed: NSAttributedString, suppressBold: Bool = false) -> String {
+    private static func inlineHTML(from attributed: NSAttributedString, suppressBold: Bool = false, suppressFontSize: Bool = false) -> String {
         let range = NSRange(location: 0, length: attributed.length)
         guard range.length > 0 else { return "" }
         var output = ""
@@ -13615,6 +14073,10 @@ private enum EventDescriptionHTML {
                 wrappers.append(("<a href=\"\(escapeAttribute(urlString))\">", "</a>"))
             }
             if let font = attributes[.font] as? UIFont {
+                let pointSize = normalizedFontSize(font.pointSize)
+                if !suppressFontSize, abs(pointSize - bodyFontSize) >= 0.5 {
+                    wrappers.append(("<span style=\"font-size: \(cssPixels(pointSize))\">", "</span>"))
+                }
                 let traits = font.fontDescriptor.symbolicTraits
                 if traits.contains(.traitBold), !suppressBold {
                     wrappers.append(("<strong>", "</strong>"))
@@ -14390,6 +14852,8 @@ struct RegistrationCheckoutSheet: View {
     @State private var submitting = false
     @State private var attemptedSubmit = false
     @State private var showMembershipProfileEditor = false
+    @State private var membershipProfileEditorFocus: ProfileEditInitialFocus?
+    @State private var promoNow = Date()
 
     var priceEligibilityContext: PriceEligibilityContext {
         PriceEligibilityContext(profile: store.profile, badges: store.badges, registrations: store.myEvents)
@@ -14594,11 +15058,17 @@ struct RegistrationCheckoutSheet: View {
                 }
             }
             .onAppear {
+                promoNow = Date()
                 selectDefaultPriceOptionIfNeeded()
             }
-            .sheet(isPresented: $showMembershipProfileEditor) {
+            .onReceive(Timer.publish(every: 60, on: .main, in: .common).autoconnect()) { now in
+                promoNow = now
+            }
+            .sheet(isPresented: $showMembershipProfileEditor, onDismiss: {
+                membershipProfileEditorFocus = nil
+            }) {
                 if let profile = store.profile {
-                    ProfileEditSheet(profile: profile)
+                    ProfileEditSheet(profile: profile, initialFocus: membershipProfileEditorFocus)
                         .presentationDetents([.fraction(0.86), .large])
                         .presentationDragIndicator(.hidden)
                 }
@@ -14749,7 +15219,7 @@ struct RegistrationCheckoutSheet: View {
             CheckoutSectionTitle("Prezzo e tessera")
 
             if let singlePriceOption {
-                CheckoutSinglePriceOptionRow(option: singlePriceOption, event: event)
+                CheckoutSinglePriceOptionRow(option: singlePriceOption, event: event, now: promoNow)
             } else if !eligiblePriceOptions.isEmpty {
                 Text("Scegli la formula *")
                     .font(.headline.weight(.bold))
@@ -14760,9 +15230,10 @@ struct RegistrationCheckoutSheet: View {
                         CheckoutPriceOptionRow(
                             option: option,
                             selected: selectedPriceOptionId == option.id,
-                            event: event
+                            event: event,
+                            now: promoNow
                         ) {
-                            guard option.isBookable(in: event) || option.canJoinWaitlist(in: event) else { return }
+                            guard option.isBookable(in: event, now: promoNow) || option.canJoinWaitlist(in: event, now: promoNow) else { return }
                             selectedPriceOptionId = option.id
                             appliedDiscount = nil
                             discountMessage = nil
@@ -14828,6 +15299,7 @@ struct RegistrationCheckoutSheet: View {
                 }
 
                 Button {
+                    membershipProfileEditorFocus = profile.isMissingMembershipSex ? .membershipSex : .membership
                     showMembershipProfileEditor = true
                 } label: {
                     Label("Completa dati profilo", systemImage: "pencil")
@@ -15016,6 +15488,7 @@ struct RegistrationCheckoutSheet: View {
               !profile.hasCompleteMembershipProfile else {
             return true
         }
+        membershipProfileEditorFocus = profile.isMissingMembershipSex ? .membershipSex : .membership
         showMembershipProfileEditor = true
         return false
     }
@@ -15201,6 +15674,7 @@ struct CheckoutPriceOptionRow: View {
     let option: PriceOption
     let selected: Bool
     let event: Event
+    let now: Date
     let action: () -> Void
 
     private var price: Double {
@@ -15216,7 +15690,15 @@ struct CheckoutPriceOptionRow: View {
     }
 
     private var isDisabled: Bool {
-        !option.isBookable(in: event) && !option.canJoinWaitlist(in: event)
+        !option.isBookable(in: event, now: now) && !option.canJoinWaitlist(in: event, now: now)
+    }
+
+    private var showsPromoBadge: Bool {
+        option.showsPromoBadge(now: now)
+    }
+
+    private var promoIsActive: Bool {
+        option.hasActivePromo(now: now)
     }
 
     var body: some View {
@@ -15232,16 +15714,16 @@ struct CheckoutPriceOptionRow: View {
                             .font(.subheadline.weight(.bold))
                             .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.foreground)
                             .lineLimit(2)
-                        if option.showsPromoBadge {
-                            Text("Promo")
+                        if showsPromoBadge {
+                            Text(option.promoBadgeText(now: now))
                                 .font(.system(size: 10, weight: .bold, design: .rounded))
-                                .foregroundStyle(Brand.destructive)
+                                .foregroundStyle(promoIsActive ? Brand.destructive : Brand.mutedForeground)
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 4)
-                                .background(Brand.destructive.opacity(0.10), in: Capsule())
+                                .background((promoIsActive ? Brand.destructive : Brand.mutedForeground).opacity(0.10), in: Capsule())
                         }
                     }
-                    if !option.detailText.isEmpty, !option.showsPromoBadge {
+                    if !option.detailText.isEmpty, !showsPromoBadge {
                         Text(option.detailText)
                             .font(.caption.weight(.medium))
                             .foregroundStyle(Brand.mutedForeground)
@@ -15251,9 +15733,9 @@ struct CheckoutPriceOptionRow: View {
                             .font(.caption.weight(.medium))
                             .foregroundStyle(Brand.mutedForeground)
                     }
-                    Label(option.availabilityText(in: event), systemImage: option.isBookable(in: event) ? "person.2" : (option.canJoinWaitlist(in: event) ? "list.bullet" : "xmark.circle"))
+                    Label(option.availabilityText(in: event, now: now), systemImage: option.isBookable(in: event, now: now) ? "person.2" : (option.canJoinWaitlist(in: event, now: now) ? "list.bullet" : "xmark.circle"))
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(option.isBookable(in: event) ? Brand.success : (option.canJoinWaitlist(in: event) ? Brand.warning : Brand.destructive))
+                        .foregroundStyle(option.isBookable(in: event, now: now) ? Brand.success : (option.canJoinWaitlist(in: event, now: now) ? Brand.warning : Brand.destructive))
                 }
 
                 Spacer(minLength: 8)
@@ -15267,7 +15749,7 @@ struct CheckoutPriceOptionRow: View {
                     }
                     Text(priceLabel)
                         .font(.headline.weight(.bold))
-                        .foregroundStyle(isDisabled ? Brand.mutedForeground : (option.showsPromoBadge ? Brand.success : Brand.primary))
+                        .foregroundStyle(isDisabled ? Brand.mutedForeground : (promoIsActive ? Brand.success : Brand.primary))
                 }
             }
             .padding()
@@ -15282,6 +15764,7 @@ struct CheckoutPriceOptionRow: View {
 struct CheckoutSinglePriceOptionRow: View {
     let option: PriceOption
     let event: Event
+    let now: Date
 
     private var price: Double {
         option.totalPrice(fallback: event)
@@ -15296,11 +15779,19 @@ struct CheckoutSinglePriceOptionRow: View {
     }
 
     private var isDisabled: Bool {
-        !option.isBookable(in: event) && !option.canJoinWaitlist(in: event)
+        !option.isBookable(in: event, now: now) && !option.canJoinWaitlist(in: event, now: now)
     }
 
     private var title: String {
         option.checkoutSingleOptionTitle()
+    }
+
+    private var showsPromoBadge: Bool {
+        option.showsPromoBadge(now: now)
+    }
+
+    private var promoIsActive: Bool {
+        option.hasActivePromo(now: now)
     }
 
     var body: some View {
@@ -15311,9 +15802,20 @@ struct CheckoutSinglePriceOptionRow: View {
                 .frame(width: 28)
 
             VStack(alignment: .leading, spacing: 5) {
-                Text(title)
-                    .font(.subheadline.weight(.bold))
-                    .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.foreground)
+                HStack(spacing: 8) {
+                    Text(title)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.foreground)
+
+                    if showsPromoBadge {
+                        Text(option.promoBadgeText(now: now))
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .foregroundStyle(promoIsActive ? Brand.destructive : Brand.mutedForeground)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 4)
+                            .background((promoIsActive ? Brand.destructive : Brand.mutedForeground).opacity(0.10), in: Capsule())
+                    }
+                }
 
                 if !isFree {
                     Text(option.paymentSummary(in: event))
@@ -15321,9 +15823,9 @@ struct CheckoutSinglePriceOptionRow: View {
                         .foregroundStyle(Brand.mutedForeground)
                 }
 
-                Label(option.availabilityText(in: event), systemImage: option.isBookable(in: event) ? "person.2" : (option.canJoinWaitlist(in: event) ? "list.bullet" : "xmark.circle"))
+                Label(option.availabilityText(in: event, now: now), systemImage: option.isBookable(in: event, now: now) ? "person.2" : (option.canJoinWaitlist(in: event, now: now) ? "list.bullet" : "xmark.circle"))
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(option.isBookable(in: event) ? Brand.success : (option.canJoinWaitlist(in: event) ? Brand.warning : Brand.destructive))
+                    .foregroundStyle(option.isBookable(in: event, now: now) ? Brand.success : (option.canJoinWaitlist(in: event, now: now) ? Brand.warning : Brand.destructive))
             }
 
             Spacer(minLength: 8)
@@ -15337,7 +15839,7 @@ struct CheckoutSinglePriceOptionRow: View {
                 }
                 Text(priceLabel)
                     .font(.headline.weight(.bold))
-                    .foregroundStyle(isDisabled ? Brand.mutedForeground : (option.showsPromoBadge ? Brand.success : Brand.primary))
+                    .foregroundStyle(isDisabled ? Brand.mutedForeground : (promoIsActive ? Brand.success : Brand.primary))
             }
         }
         .padding()
@@ -16350,6 +16852,11 @@ private extension OrganizerEditorRoute.Mode {
         if case .duplicate = self { return true }
         return false
     }
+
+    var existingEventId: String? {
+        if case .edit(let eventId) = self { return eventId }
+        return nil
+    }
 }
 
 private enum OrganizerEventBoardFilter: String, CaseIterable, Identifiable {
@@ -16517,7 +17024,7 @@ struct OrganizerDashboardView: View {
                 }
             }
             .navigationDestination(item: $selectedEvent) { event in
-                OrganizerEventManageView(eventId: event.id)
+                OrganizerEventManageView(eventId: event.id, showAuth: $showAuth)
             }
             .navigationDestination(item: $editorRoute) { route in
                 OrganizerEventEditorView(route: route)
@@ -18895,6 +19402,7 @@ struct OrganizerEventManageView: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
     let eventId: String
+    @Binding var showAuth: Bool
     @State private var event: Event?
     @State private var registrations: [OrganizerRegistration] = []
     @State private var meetingPoints: [MeetingPoint] = []
@@ -18913,6 +19421,7 @@ struct OrganizerEventManageView: View {
     @State private var sharePayload: SharePayload?
     @State private var exportingCSV = false
     @State private var selectedParticipantProfile: OrganizerRegistration?
+    @State private var publicEventTarget: EventNavigationTarget?
 
     private var activeRegistrations: [OrganizerRegistration] {
         registrations.filter(\.isActive)
@@ -18964,6 +19473,9 @@ struct OrganizerEventManageView: View {
         .navigationBarTitleDisplayMode(.inline)
         .navigationDestination(item: $editorRoute) { route in
             OrganizerEventEditorView(route: route)
+        }
+        .navigationDestination(item: $publicEventTarget) { target in
+            EventDetailView(eventId: target.eventId, showAuth: $showAuth)
         }
         .sheet(isPresented: $showAddParticipant) {
             OrganizerAddParticipantSheet(eventId: eventId, meetingPoints: meetingPoints, priceOptions: priceOptions) {
@@ -19028,7 +19540,9 @@ struct OrganizerEventManageView: View {
     @ViewBuilder
     private func eventManagementContent(event: Event, width: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 16) {
-            OrganizerManageHero(event: event)
+            OrganizerManageHero(event: event) {
+                publicEventTarget = EventNavigationTarget(id: event.id)
+            }
 
             OrganizerManageQuickActions(
                 onEdit: { editorRoute = OrganizerEditorRoute(mode: .edit(eventId)) },
@@ -19468,6 +19982,7 @@ private enum OrganizerParticipantCSVExporter {
 
 struct OrganizerManageHero: View {
     let event: Event
+    let onOpenPublicEvent: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -19482,9 +19997,22 @@ struct OrganizerManageHero: View {
                         .font(.caption.weight(.bold))
                         .foregroundStyle(Brand.mutedForeground)
                 }
-                Text(event.title)
-                    .font(.system(.title2, design: .rounded, weight: .bold))
-                    .foregroundStyle(Brand.foreground)
+                Button(action: onOpenPublicEvent) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(event.title)
+                            .font(.system(.title2, design: .rounded, weight: .bold))
+                            .foregroundStyle(Brand.foreground)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(Brand.primary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Apri evento nell'app")
                 Text("\(formatLongDate(event.date)) · \(timeRange(event)) · \(event.displayLocation)")
                     .font(.subheadline)
                     .foregroundStyle(Brand.mutedForeground)
@@ -19727,6 +20255,10 @@ struct OrganizerParticipationOptionsBreakdown: View {
         }
     }
 
+    private var activeRegistrations: [OrganizerRegistration] {
+        registrations.filter(\.isActive)
+    }
+
     var body: some View {
         if !sortedOptions.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
@@ -19738,6 +20270,7 @@ struct OrganizerParticipationOptionsBreakdown: View {
                         event: event,
                         option: option,
                         activeCount: count(for: option, matching: \.isActive),
+                        eventActiveCount: activeRegistrations.count,
                         waitlistCount: registrations.filter { $0.priceOption?.id == option.id && $0.normalizedStatus == "waitlist" }.count
                     )
                 }
@@ -19754,6 +20287,7 @@ struct OrganizerParticipationOptionRow: View {
     let event: Event
     let option: PriceOption
     let activeCount: Int
+    let eventActiveCount: Int
     let waitlistCount: Int
 
     private var capacity: Int? {
@@ -19763,6 +20297,14 @@ struct OrganizerParticipationOptionRow: View {
     private var progress: Double? {
         guard let capacity, capacity > 0 else { return nil }
         return min(Double(activeCount) / Double(capacity), 1)
+    }
+
+    private var availabilityText: String {
+        option.availabilityText(in: event, eventSpotsTaken: eventActiveCount, optionSpotsTaken: activeCount)
+    }
+
+    private var isBookable: Bool {
+        option.isBookable(in: event, eventSpotsTaken: eventActiveCount, optionSpotsTaken: activeCount)
     }
 
     var body: some View {
@@ -19781,9 +20323,9 @@ struct OrganizerParticipationOptionRow: View {
                     Text(capacity.map { "\(activeCount)/\($0)" } ?? "\(activeCount)")
                         .font(.caption.weight(.bold))
                         .foregroundStyle(Brand.foreground)
-                    Text(option.availabilityText(in: event))
+                    Text(availabilityText)
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(option.isBookable(in: event) ? Brand.success : Brand.warning)
+                        .foregroundStyle(isBookable ? Brand.success : Brand.warning)
                 }
             }
             if let progress {
@@ -22064,6 +22606,7 @@ struct OrganizerEventEditorView: View {
     @State private var uploadingImages = false
     @State private var keyboardInset: CGFloat = 0
     @State private var validationMessage: String?
+    @State private var showPreview = false
 
     var body: some View {
         ZStack {
@@ -22127,28 +22670,14 @@ struct OrganizerEventEditorView: View {
                                 }
                             }
 
-                        OrganizerEditorSection(title: "Galleria") {
+                        OrganizerEditorSection(title: "Immagini") {
                             if draft.imageUrl.nilIfBlank != nil {
-                                RemoteImage(urlString: draft.imageUrl)
-                                    .aspectRatio(1, contentMode: .fit)
-                                    .clipShape(RoundedRectangle(cornerRadius: 14))
-                                HStack(spacing: 12) {
-                                    RemoteImage(urlString: draft.homeCardImageUrl.nilIfBlank ?? draft.imageUrl)
-                                        .frame(width: 86, height: 86)
-                                        .clipShape(RoundedRectangle(cornerRadius: 14))
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text("Anteprima home")
-                                            .font(.caption.weight(.bold))
-                                            .foregroundStyle(Brand.foreground)
-                                        Text("Riquadro 1:1 usato nelle card evento.")
-                                            .font(.caption2)
-                                            .foregroundStyle(Brand.mutedForeground)
-                                    }
-                                    Spacer()
-                                }
+                                OrganizerImagePreviewRow(
+                                    title: "Copertina evento",
+                                    subtitle: "Usata nel dettaglio evento e nelle card.",
+                                    urlString: draft.imageUrl
+                                )
                             }
-                            Field("URL immagine", text: $draft.imageUrl, keyboard: .URL)
-                                .textInputAutocapitalization(.never)
                             PhotosPicker(selection: $selectedPhoto, matching: .images) {
                                 Label("Carica immagine evento", systemImage: "photo.badge.plus")
                                     .frame(maxWidth: .infinity)
@@ -22446,7 +22975,12 @@ struct OrganizerEventEditorView: View {
         .animation(.easeOut(duration: 0.22), value: keyboardInset)
         .roundedInlineNavigationTitle(route.title)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button("Anteprima") {
+                    showPreview = true
+                }
+                .disabled(saving || loading || uploadingImages)
+
                 Button(saveButtonTitle) {
                     Task { await save() }
                 }
@@ -22458,6 +22992,14 @@ struct OrganizerEventEditorView: View {
                     dismissKeyboard()
                 }
             }
+        }
+        .sheet(isPresented: $showPreview) {
+            OrganizerEventDraftPreviewSheet(
+                draft: draft,
+                categories: store.categories,
+                directURL: route.mode.existingEventId.flatMap { URL(string: "\(ScampagnateConfig.stripeOrigin)/event/\($0)") }
+            )
+            .presentationDetents([.large])
         }
         .task { await load() }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notification in
@@ -22626,9 +23168,6 @@ struct OrganizerEventEditorView: View {
             case .coverHero:
                 draft.imageUrl = url
                 draft.homeCardImageUrl = ""
-                activeImageCrop = OrganizerImageCropDraft(image: crop.image, kind: .coverHome)
-            case .coverHome:
-                draft.homeCardImageUrl = url
             }
         }
     }
@@ -22686,6 +23225,349 @@ struct OrganizerEventEditorView: View {
             guard let index = draft.additionalFields.firstIndex(where: { $0.id == id }) else { return }
             draft.additionalFields[index] = updated
         }
+    }
+}
+
+private struct OrganizerEventDraftPreviewSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let draft: OrganizerEventDraft
+    let categories: [EventCategory]
+    let directURL: URL?
+    @State private var descriptionExpanded = false
+
+    private var category: EventCategory? {
+        categories.first { $0.id == draft.categoryId }
+    }
+
+    private var manualBadgeLabels: [String] {
+        draft.manualBadges.map { badgeId in
+            OrganizerEventDraft.manualBadgeOptions.first { $0.id == badgeId }?.label ?? badgeId
+        }
+    }
+
+    private var allBadgeLabels: [String] {
+        manualBadgeLabels + [draft.customBadge.nilIfBlank].compactMap { $0 }
+    }
+
+    private var descriptionPreviewText: String {
+        EventDescriptionHTML.cleanStoredHTML(from: draft.description).htmlPlainText.nilIfBlank ?? "Nessuna descrizione disponibile"
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(alignment: .center, spacing: 12) {
+                    Text("Anteprima evento")
+                        .font(.system(.title3, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                    Spacer(minLength: 12)
+                    Button("Chiudi") {
+                        dismiss()
+                    }
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Brand.primary)
+                }
+
+                hero
+                quickFacts
+                previewDescription
+                meetingPoints
+                equipment
+                pricing
+                registrationFields
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(Brand.background)
+    }
+
+    @ViewBuilder
+    private var titleBlock: some View {
+        let title = draft.title.nilIfBlank ?? "Titolo evento"
+        if let directURL {
+            Button {
+                UIApplication.shared.open(directURL)
+            } label: {
+                HStack(alignment: .top, spacing: 8) {
+                    Text(title)
+                        .font(.system(.title3, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                        .lineLimit(3)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Image(systemName: "arrow.up.forward")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.primary)
+                        .padding(.top, 5)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Apri link diretto evento")
+        } else {
+            Text(title)
+                .font(.system(.title3, design: .rounded, weight: .bold))
+                .foregroundStyle(Brand.foreground)
+                .lineLimit(3)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var hero: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            RemoteImage(urlString: draft.imageUrl)
+                .frame(maxWidth: .infinity)
+                .frame(height: 190)
+                .clipShape(RoundedRectangle(cornerRadius: 20))
+                .overlay(alignment: .topLeading) {
+                    HStack(spacing: 6) {
+                        BadgeLabel(text: statusLabel, color: statusColor.opacity(0.16), foreground: statusColor)
+                        BadgeLabel(text: draft.visibility == "private" ? "Solo link" : "Pubblico", color: Brand.muted, foreground: Brand.mutedForeground)
+                    }
+                    .padding(12)
+                }
+
+            VStack(alignment: .leading, spacing: 8) {
+                titleBlock
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("\(formatLongDate(draft.date)) · \(draft.time.nilIfBlank ?? "Ora da definire")", systemImage: "calendar")
+                    Label(draft.locationLabel.nilIfBlank ?? draft.location.nilIfBlank ?? "Luogo da definire", systemImage: "mappin.and.ellipse")
+                    Label(categoryLabel(category), systemImage: "tag")
+                }
+                .font(.subheadline)
+                .foregroundStyle(Brand.mutedForeground)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+
+                if !allBadgeLabels.isEmpty {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 6)], alignment: .leading, spacing: 6) {
+                        ForEach(allBadgeLabels, id: \.self) { badge in
+                            BadgeLabel(text: badge, color: Brand.primary.opacity(0.12), foreground: Brand.primary)
+                        }
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var quickFacts: some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+            OrganizerDraftPreviewFact(icon: "person.2", title: "Posti", value: "\(draft.spotsTotal)")
+            if let difficulty = draft.difficulty.nilIfBlank {
+                OrganizerDraftPreviewFact(icon: "mountain.2", title: "Difficoltà", value: "Livello \(difficulty)")
+            }
+            if let duration = draft.duration.nilIfBlank {
+                OrganizerDraftPreviewFact(icon: "clock", title: "Durata", value: duration)
+            }
+            if let distance = draft.distance.nilIfBlank {
+                OrganizerDraftPreviewFact(icon: "figure.hiking", title: "Distanza", value: distance.lowercased().contains("km") ? distance : "\(distance) km")
+            }
+            if let elevation = draft.elevation.nilIfBlank {
+                OrganizerDraftPreviewFact(icon: "arrow.up.right", title: "Dislivello", value: elevation.lowercased().contains("m") ? elevation : "\(elevation) m")
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var previewDescription: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionTitle("L'esperienza")
+            Text(descriptionPreviewText)
+                .font(.subheadline)
+                .foregroundStyle(Brand.mutedForeground)
+                .lineLimit(descriptionExpanded ? nil : 10)
+                .fixedSize(horizontal: false, vertical: true)
+            if descriptionPreviewText.count > 700 {
+                Button(descriptionExpanded ? "Mostra meno" : "Leggi tutto") {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        descriptionExpanded.toggle()
+                    }
+                }
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(Brand.primary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Brand.muted, lineWidth: 1))
+    }
+
+    @ViewBuilder
+    private var meetingPoints: some View {
+        let visiblePoints = draft.meetingPoints.filter { $0.name.nilIfBlank != nil || $0.location.nilIfBlank != nil }
+        if !visiblePoints.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle("Ritrovi")
+                ForEach(visiblePoints) { point in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(point.name.nilIfBlank ?? "Punto di ritrovo")
+                            .font(.subheadline.weight(.bold))
+                            .foregroundStyle(Brand.foreground)
+                        Text("\(point.time.nilIfBlank ?? draft.time) · \(point.location.nilIfBlank ?? draft.location)")
+                            .font(.caption)
+                            .foregroundStyle(Brand.mutedForeground)
+                        if let notes = point.notes.nilIfBlank {
+                            Text(notes)
+                                .font(.caption2)
+                                .foregroundStyle(Brand.mutedForeground)
+                        }
+                    }
+                    .padding(12)
+                    .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var equipment: some View {
+        let visibleItems = draft.equipmentItems.filter { $0.name.nilIfBlank != nil }
+        if !visibleItems.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle("Attrezzatura")
+                ForEach(visibleItems) { item in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: item.isMandatory ? "checkmark.seal.fill" : "circle")
+                            .foregroundStyle(item.isMandatory ? Brand.primary : Brand.mutedForeground)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.name.nilIfBlank ?? "Oggetto")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(Brand.foreground)
+                            if let notes = item.notes.nilIfBlank {
+                                Text(notes)
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.mutedForeground)
+                            }
+                        }
+                    }
+                    .padding(12)
+                    .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                    .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+                }
+            }
+        }
+    }
+
+    private var pricing: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionTitle("Formule")
+            ForEach(Array(draft.priceOptions.enumerated()), id: \.element.id) { index, option in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(option.name.nilIfBlank ?? "Formula \(index + 1)")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                    Text(paymentSummary(for: option))
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                    if option.eligibleGroup != "all" {
+                        Text(eligibilityLabel(for: option.eligibleGroup))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(Brand.primary)
+                    }
+                }
+                .padding(12)
+                .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var registrationFields: some View {
+        let visibleFields = draft.additionalFields.filter { $0.label.nilIfBlank != nil }
+        if !visibleFields.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle("Domande iscrizione")
+                ForEach(visibleFields) { field in
+                    Text("\(field.required ? "* " : "")\(field.label)")
+                        .font(.subheadline)
+                        .foregroundStyle(Brand.foreground)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+                }
+            }
+        }
+    }
+
+    private var statusLabel: String {
+        switch draft.status {
+        case "draft": return "Non pubblicato"
+        case "upcoming": return "In arrivo"
+        case "closed": return "Chiuso"
+        case "full": return "Sold out"
+        case "cancelled": return "Annullato"
+        default: return "Aperto"
+        }
+    }
+
+    private var statusColor: Color {
+        switch draft.status {
+        case "cancelled", "closed": return Brand.destructive
+        case "draft": return Brand.mutedForeground
+        case "upcoming", "full": return Brand.warning
+        default: return Brand.success
+        }
+    }
+
+    private func paymentSummary(for option: OrganizerPriceOptionDraft) -> String {
+        switch option.paymentType {
+        case "free":
+            return "Gratis"
+        case "location":
+            return "€\(money(option.price)) sul posto"
+        case "deposit":
+            let balance = max(0, option.price - option.depositAmount)
+            let balanceMode = option.balancePaymentMode == "on_site" ? "sul posto" : "online"
+            return "Acconto €\(money(option.depositAmount)) + saldo €\(money(balance)) \(balanceMode)"
+        default:
+            return "€\(money(option.price)) online"
+        }
+    }
+
+    private func eligibilityLabel(for group: String) -> String {
+        if group == "members" { return "Soci" }
+        if group == "new_users" { return "Nuovi utenti" }
+        if group == "experienced" { return "Esperti" }
+        if group == "loyal" { return "Fedeli" }
+        if group.hasPrefix("badge:") { return "Promo riservata" }
+        if group.hasPrefix("trekking_gt:") || group.hasPrefix("events_gt:") { return "Promo riservata" }
+        return group
+    }
+}
+
+private struct OrganizerDraftPreviewFact: View {
+    let icon: String
+    let title: String
+    let value: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Image(systemName: icon)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Brand.primary)
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Brand.mutedForeground)
+            Text(value)
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(Brand.foreground)
+                .lineLimit(2)
+                .minimumScaleFactor(0.78)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
     }
 }
 
@@ -23051,6 +23933,16 @@ struct OrganizerEventTimePickerField: View {
 
 private struct OrganizerRichTextEditor: View {
     @Binding var html: String
+    @State private var showingEditor = false
+    @State private var previewHeight: CGFloat = 1
+
+    private var cleanHTML: String {
+        EventDescriptionHTML.cleanStoredHTML(from: html)
+    }
+
+    private var hasContent: Bool {
+        cleanHTML.htmlPlainText.nilIfBlank != nil || cleanHTML.contains("<img")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -23058,35 +23950,761 @@ private struct OrganizerRichTextEditor: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(Brand.foreground)
 
-            ZStack(alignment: .topLeading) {
-                OrganizerRichTextTextView(html: $html)
-                    .frame(maxWidth: .infinity, minHeight: 230, alignment: .leading)
-                    .padding(10)
+            Button {
+                dismissKeyboard()
+                showingEditor = true
+            } label: {
+                VStack(alignment: .leading, spacing: 12) {
+                    if hasContent {
+                        ZStack(alignment: .bottom) {
+                            EventDescriptionHTMLView(html: cleanHTML, height: $previewHeight)
+                                .frame(height: min(max(previewHeight, 92), 240))
+                                .clipped()
+                                .allowsHitTesting(false)
 
-                if html.htmlPlainText.nilIfBlank == nil {
-                    Text("Inizia a scrivere...")
-                        .font(.body)
-                        .foregroundStyle(Brand.inputMutedForeground)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 10)
-                        .allowsHitTesting(false)
+                            if previewHeight > 240 {
+                                LinearGradient(
+                                    colors: [Brand.inputBackground.opacity(0), Brand.inputBackground],
+                                    startPoint: .top,
+                                    endPoint: .bottom
+                                )
+                                .frame(height: 44)
+                            }
+                        }
+                    } else {
+                        Text("Inizia a scrivere...")
+                            .font(.body)
+                            .foregroundStyle(Brand.inputMutedForeground)
+                            .frame(maxWidth: .infinity, minHeight: 112, alignment: .topLeading)
+                    }
+
+                    HStack(spacing: 8) {
+                        Image(systemName: "textformat")
+                            .font(.subheadline.weight(.semibold))
+                        Text(hasContent ? "Modifica descrizione formattata" : "Aggiungi descrizione formattata")
+                            .font(.subheadline.weight(.bold))
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.bold))
+                    }
+                    .foregroundStyle(Brand.primary)
                 }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .buttonStyle(.plain)
             .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 14))
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.inputBorder, lineWidth: 1))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .fullScreenCover(isPresented: $showingEditor) {
+            OrganizerRichTextEditorSheet(html: $html)
+        }
     }
 }
 
-private struct OrganizerRichTextTextView: UIViewRepresentable {
+private struct OrganizerRichTextEditorSheet: View {
+    @Binding var html: String
+    @Environment(\.dismiss) private var dismiss
+    @State private var draftHTML: String
+
+    init(html: Binding<String>) {
+        self._html = html
+        self._draftHTML = State(initialValue: EventDescriptionHTML.cleanStoredHTML(from: html.wrappedValue))
+    }
+
+    var body: some View {
+        NavigationStack {
+            OrganizerRichTextTextView(html: $draftHTML)
+                .background(Brand.inputBackground)
+                .navigationTitle("Descrizione")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Annulla") {
+                            dismiss()
+                        }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Fine") {
+                            html = EventDescriptionHTML.cleanStoredHTML(from: draftHTML)
+                            dismiss()
+                        }
+                        .fontWeight(.semibold)
+                    }
+                }
+        }
+        .presentationBackground(Brand.background)
+    }
+}
+
+private struct OrganizerWebRichTextEditor: UIViewRepresentable {
     @Binding var html: String
 
-    func makeUIView(context: Context) -> UITextView {
-        let textView = UITextView()
-        textView.delegate = context.coordinator
-        textView.backgroundColor = .clear
+    func makeUIView(context: Context) -> WKWebView {
+        let userContentController = WKUserContentController()
+        userContentController.add(context.coordinator, name: "editorBridge")
+
+        let configuration = WKWebViewConfiguration()
+        configuration.userContentController = userContentController
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.navigationDelegate = context.coordinator
+        webView.uiDelegate = context.coordinator
+        webView.isOpaque = false
+        webView.backgroundColor = .clear
+        webView.scrollView.backgroundColor = .clear
+        webView.scrollView.keyboardDismissMode = .interactive
+        webView.scrollView.alwaysBounceVertical = true
+        context.coordinator.webView = webView
+        context.coordinator.latestHTML = EventDescriptionHTML.cleanStoredHTML(from: html)
+        webView.loadHTMLString(Self.editorDocument(initialHTML: context.coordinator.latestHTML), baseURL: nil)
+        return webView
+    }
+
+    func updateUIView(_ webView: WKWebView, context: Context) {
+        let cleanHTML = EventDescriptionHTML.cleanStoredHTML(from: html)
+        guard !context.coordinator.isUpdatingFromWeb,
+              cleanHTML != context.coordinator.latestHTML else {
+            return
+        }
+        context.coordinator.latestHTML = cleanHTML
+        context.coordinator.setHTML(cleanHTML)
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(html: $html)
+    }
+
+    static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
+        uiView.configuration.userContentController.removeScriptMessageHandler(forName: "editorBridge")
+        coordinator.webView = nil
+    }
+
+    private static func editorDocument(initialHTML: String) -> String {
+        let initialHTMLBase64 = Data(initialHTML.utf8).base64EncodedString()
+        return #"""
+        <!doctype html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+        <style>
+        :root { color-scheme: light dark; }
+        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        html, body {
+          margin: 0;
+          padding: 0;
+          min-height: 100%;
+          background: transparent;
+          color: #15281F;
+          font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+          -webkit-font-smoothing: antialiased;
+        }
+        body {
+          overflow: auto;
+          -webkit-overflow-scrolling: touch;
+        }
+        .shell {
+          display: flex;
+          flex-direction: column;
+          min-height: 100dvh;
+          background: #FFFFFF;
+        }
+        .toolbar {
+          position: sticky;
+          top: 0;
+          z-index: 5;
+          display: flex;
+          gap: 6px;
+          flex-wrap: wrap;
+          padding: 10px 12px;
+          background: rgba(246, 244, 239, 0.98);
+          border-bottom: 1px solid #DAD5C9;
+          backdrop-filter: blur(16px);
+          -webkit-backdrop-filter: blur(16px);
+          -webkit-user-select: none;
+          user-select: none;
+        }
+        .tool {
+          appearance: none;
+          border: 1px solid #DAD5C9;
+          border-radius: 10px;
+          min-width: 34px;
+          height: 34px;
+          padding: 0 9px;
+          color: #15281F;
+          background: #FFFFFF;
+          font: 700 14px/1 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+          -webkit-user-select: none;
+          user-select: none;
+        }
+        .tool.icon {
+          width: 34px;
+          padding: 0;
+          font-size: 15px;
+        }
+        .tool.active {
+          color: #224E38;
+          border-color: rgba(34, 78, 56, 0.42);
+          background: rgba(34, 78, 56, 0.13);
+        }
+        .divider {
+          width: 1px;
+          height: 34px;
+          margin: 0 2px;
+          background: #DAD5C9;
+        }
+        .editor-wrap {
+          flex: 1;
+          overflow: visible;
+        }
+        #editor {
+          min-height: calc(100dvh - 58px);
+          padding: 18px 18px 48vh;
+          outline: none;
+          color: #15281F;
+          font-size: 16px;
+          line-height: 1.55;
+          overflow-wrap: anywhere;
+          caret-color: #224E38;
+          -webkit-touch-callout: default;
+          -webkit-user-select: text;
+          user-select: text;
+        }
+        #editor * {
+          -webkit-touch-callout: default;
+          -webkit-user-select: text;
+          user-select: text;
+        }
+        #editor[data-empty="true"]::before {
+          content: attr(data-placeholder);
+          color: #657064;
+          pointer-events: none;
+          position: absolute;
+        }
+        h1 {
+          font-size: 26px;
+          font-weight: 800;
+          line-height: 1.16;
+          margin: 28px 0 14px;
+        }
+        h2 {
+          font-size: 22px;
+          font-weight: 800;
+          line-height: 1.22;
+          margin: 26px 0 12px;
+        }
+        h3 {
+          font-size: 18px;
+          font-weight: 760;
+          line-height: 1.32;
+          margin: 22px 0 8px;
+        }
+        p {
+          margin: 0 0 14px;
+          line-height: 1.55;
+        }
+        ul, ol {
+          margin: 8px 0 18px;
+          padding-left: 24px;
+        }
+        li {
+          margin: 0 0 8px;
+          padding-left: 2px;
+        }
+        blockquote {
+          margin: 18px 0;
+          padding: 4px 0 4px 16px;
+          border-left: 3px solid #DAD5C9;
+          color: #657064;
+        }
+        strong, b { font-weight: 800; }
+        em, i { font-style: italic; }
+        a {
+          color: #224E38;
+          font-weight: 700;
+          text-decoration-thickness: 1px;
+          text-underline-offset: 3px;
+        }
+        img {
+          display: block;
+          max-width: 100%;
+          height: auto;
+          border-radius: 16px;
+          margin: 18px 0;
+        }
+        h1:first-child, h2:first-child, h3:first-child, p:first-child, ul:first-child, ol:first-child, blockquote:first-child, img:first-child { margin-top: 0; }
+        @media (prefers-color-scheme: dark) {
+          .shell { background: #1E2823; }
+          body, #editor, .tool { color: #EBE7E0; }
+          .toolbar { background: rgba(26, 36, 31, 0.98); border-bottom-color: #39473F; }
+          .tool { background: #24312A; border-color: #39473F; }
+          .tool.active { color: #64B48C; border-color: rgba(100, 180, 140, 0.46); background: rgba(100, 180, 140, 0.16); }
+          .divider { background: #39473F; }
+          a { color: #64B48C; }
+          blockquote { color: #B8B0A4; border-left-color: #47443F; }
+          #editor[data-empty="true"]::before { color: #B8B0A4; }
+        }
+        </style>
+        </head>
+        <body>
+          <div class="shell">
+            <div class="toolbar" id="toolbar" aria-label="Toolbar editor">
+              <button type="button" class="tool icon" data-command="bold" title="Grassetto"><b>B</b></button>
+              <button type="button" class="tool icon" data-command="italic" title="Corsivo"><i>I</i></button>
+              <button type="button" class="tool icon" data-command="underline" title="Sottolineato"><u>U</u></button>
+              <button type="button" class="tool icon" data-command="strikeThrough" title="Barrato"><s>S</s></button>
+              <span class="divider"></span>
+              <button type="button" class="tool" data-command="formatBlock" data-value="p" title="Paragrafo">P</button>
+              <button type="button" class="tool" data-command="formatBlock" data-value="h1" title="Titolo 1">H1</button>
+              <button type="button" class="tool" data-command="formatBlock" data-value="h2" title="Titolo 2">H2</button>
+              <button type="button" class="tool" data-command="formatBlock" data-value="h3" title="Titolo 3">H3</button>
+              <span class="divider"></span>
+              <button type="button" class="tool icon" data-command="insertUnorderedList" title="Elenco puntato">•</button>
+              <button type="button" class="tool icon" data-command="insertOrderedList" title="Elenco numerato">1.</button>
+              <span class="divider"></span>
+              <button type="button" class="tool icon" data-command="createLink" title="Inserisci link">↗</button>
+              <button type="button" class="tool icon" data-command="insertImage" title="Inserisci immagine">▧</button>
+              <span class="divider"></span>
+              <button type="button" class="tool icon" data-command="undo" title="Annulla">↶</button>
+              <button type="button" class="tool icon" data-command="redo" title="Ripristina">↷</button>
+            </div>
+            <div class="editor-wrap">
+              <main id="editor" contenteditable="true" spellcheck="true" autocapitalize="sentences" data-placeholder="Inizia a scrivere..."></main>
+            </div>
+          </div>
+        <script>
+        (() => {
+          const bridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.editorBridge;
+          const editor = document.getElementById('editor');
+          const toolbar = document.getElementById('toolbar');
+          const initialHTMLBase64 = "\#(initialHTMLBase64)";
+          let lastRange = null;
+          let suppressPost = false;
+          let touchClickGuardMs = 450;
+          let formatBlocks = ['p', 'h1', 'h2', 'h3'];
+          let handledTouchEvents = new WeakMap();
+
+          function decodeBase64(value) {
+            if (!value) return '';
+            const binary = atob(value);
+            const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+            return new TextDecoder('utf-8').decode(bytes);
+          }
+
+          function post(message) {
+            if (bridge) bridge.postMessage(message);
+          }
+
+          function selectionInsideEditor() {
+            const selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0) return false;
+            const node = selection.anchorNode;
+            return !!node && (node === editor || editor.contains(node));
+          }
+
+          function saveSelection() {
+            const selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0 || !selectionInsideEditor()) return;
+            lastRange = selection.getRangeAt(0).cloneRange();
+            updateToolbarState();
+          }
+
+          function restoreSelection() {
+            editor.focus({ preventScroll: true });
+            if (!lastRange) return;
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(lastRange);
+          }
+
+          function normalizeURL(raw, imageOnly = false) {
+            let value = (raw || '').trim();
+            if (!value) return '';
+            if (!/^(https?:\/\/|mailto:)/i.test(value)) {
+              value = imageOnly ? `https://${value}` : `https://${value}`;
+            }
+            if (imageOnly && !/^https?:\/\//i.test(value)) return '';
+            return value;
+          }
+
+          function escapeAttribute(value) {
+            return value
+              .replaceAll('&', '&amp;')
+              .replaceAll('"', '&quot;')
+              .replaceAll('<', '&lt;')
+              .replaceAll('>', '&gt;');
+          }
+
+          function selectedText() {
+            const selection = window.getSelection();
+            return selection ? selection.toString().trim() : '';
+          }
+
+          function runCommand(command, value) {
+            restoreSelection();
+            if (command === 'createLink') {
+              const url = normalizeURL(window.prompt("Inserisci l'URL", 'https://'));
+              if (!url) return;
+              if (!selectedText()) {
+                const label = window.prompt('Testo del link', url.replace(/^https?:\/\//i, '')) || url;
+                document.execCommand('insertHTML', false, `<a href="${escapeAttribute(url)}">${escapeAttribute(label)}</a>`);
+              } else {
+                document.execCommand('createLink', false, url);
+              }
+            } else if (command === 'insertImage') {
+              const url = normalizeURL(window.prompt("Inserisci l'URL dell'immagine", 'https://'), true);
+              if (!url) return;
+              document.execCommand('insertHTML', false, `<p><img src="${escapeAttribute(url)}"></p><p><br></p>`);
+            } else if (command === 'formatBlock') {
+              document.execCommand('formatBlock', false, formatBlocks.includes(value) ? value : 'p');
+            } else {
+              document.execCommand(command, false, value || null);
+            }
+            saveSelection();
+            postContent();
+          }
+
+          function setHTML(html) {
+            suppressPost = true;
+            editor.innerHTML = html || '';
+            togglePlaceholder();
+            suppressPost = false;
+            updateToolbarState();
+          }
+
+          function getBlockTag() {
+            const selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0) return 'p';
+            let node = selection.anchorNode;
+            if (node && node.nodeType === Node.TEXT_NODE) node = node.parentElement;
+            while (node && node !== editor) {
+              const tag = node.tagName ? node.tagName.toLowerCase() : '';
+              if (['p', 'h1', 'h2', 'h3', 'li', 'blockquote'].includes(tag)) return tag;
+              node = node.parentElement;
+            }
+            return 'p';
+          }
+
+          function setActive(command, active, value) {
+            const selector = value ? `[data-command="${command}"][data-value="${value}"]` : `[data-command="${command}"]`;
+            const button = toolbar.querySelector(selector);
+            if (button) button.classList.toggle('active', !!active);
+          }
+
+          function updateToolbarState() {
+            setActive('bold', document.queryCommandState('bold'));
+            setActive('italic', document.queryCommandState('italic'));
+            setActive('underline', document.queryCommandState('underline'));
+            setActive('strikeThrough', document.queryCommandState('strikeThrough'));
+            setActive('insertUnorderedList', document.queryCommandState('insertUnorderedList'));
+            setActive('insertOrderedList', document.queryCommandState('insertOrderedList'));
+            const block = getBlockTag();
+            ['p', 'h1', 'h2', 'h3'].forEach(tag => setActive('formatBlock', block === tag, tag));
+          }
+
+          function togglePlaceholder() {
+            const text = editor.innerText.replace(/\u00a0/g, ' ').trim();
+            const hasImage = !!editor.querySelector('img');
+            editor.dataset.empty = (!text && !hasImage) ? 'true' : 'false';
+          }
+
+          function postContent() {
+            if (suppressPost) return;
+            togglePlaceholder();
+            updateToolbarState();
+            post({ type: 'content', html: editor.innerHTML });
+          }
+
+          function handleToolbarAction(button, event) {
+            event.preventDefault();
+            const now = Date.now();
+            if (event.type === 'touchend') {
+              handledTouchEvents.set(button, now);
+            } else if (event.type === 'click' && now - (handledTouchEvents.get(button) || 0) < touchClickGuardMs) {
+              return;
+            }
+            runCommand(button.dataset.command, button.dataset.value || null);
+          }
+
+          document.execCommand('defaultParagraphSeparator', false, 'p');
+          setHTML(decodeBase64(initialHTMLBase64));
+          togglePlaceholder();
+
+          editor.addEventListener('input', postContent);
+          editor.addEventListener('keyup', () => { saveSelection(); postContent(); });
+          editor.addEventListener('mouseup', saveSelection);
+          editor.addEventListener('touchend', () => setTimeout(saveSelection, 0));
+          editor.addEventListener('focus', saveSelection);
+          document.addEventListener('selectionchange', saveSelection);
+
+          toolbar.querySelectorAll('button[data-command]').forEach(button => {
+            button.addEventListener('mousedown', event => event.preventDefault());
+            button.addEventListener('touchstart', event => event.preventDefault(), { passive: false });
+            button.addEventListener('touchend', event => handleToolbarAction(button, event), { passive: false });
+            button.addEventListener('click', event => handleToolbarAction(button, event));
+          });
+
+          window.ScampagnateRichTextEditor = {
+            setHTML,
+            focus: () => editor.focus()
+          };
+
+          post({ type: 'ready', html: editor.innerHTML });
+          setTimeout(() => editor.focus(), 120);
+        })();
+        </script>
+        </body>
+        </html>
+        """#
+    }
+
+    private static func javaScriptArgument(_ value: String) -> String {
+        guard let data = try? JSONEncoder().encode(value),
+              let string = String(data: data, encoding: .utf8) else {
+            return "\"\""
+        }
+        return string
+    }
+
+    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
+        @Binding private var html: String
+        weak var webView: WKWebView?
+        var latestHTML = ""
+        var isUpdatingFromWeb = false
+        private var ready = false
+        private var pendingHTML: String?
+
+        init(html: Binding<String>) {
+            self._html = html
+        }
+
+        func setHTML(_ html: String) {
+            guard ready, let webView else {
+                pendingHTML = html
+                return
+            }
+            let argument = OrganizerWebRichTextEditor.javaScriptArgument(html)
+            webView.evaluateJavaScript("window.ScampagnateRichTextEditor && window.ScampagnateRichTextEditor.setHTML(\(argument));")
+        }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            DispatchQueue.main.async { [weak self] in
+                self?.handleMessage(message.body)
+            }
+        }
+
+        private func handleMessage(_ body: Any) {
+            guard let payload = body as? [String: Any],
+                  let type = payload["type"] as? String else {
+                return
+            }
+
+            if type == "ready" {
+                ready = true
+                if let rawHTML = payload["html"] as? String {
+                    latestHTML = EventDescriptionHTML.cleanStoredHTML(from: rawHTML)
+                }
+                if let pendingHTML {
+                    self.pendingHTML = nil
+                    setHTML(pendingHTML)
+                }
+                return
+            }
+
+            guard type == "content", let rawHTML = payload["html"] as? String else {
+                return
+            }
+
+            let cleanHTML = EventDescriptionHTML.cleanStoredHTML(from: rawHTML)
+            latestHTML = cleanHTML
+            guard html != cleanHTML else { return }
+            isUpdatingFromWeb = true
+            html = cleanHTML
+            DispatchQueue.main.async { [weak self] in
+                self?.isUpdatingFromWeb = false
+            }
+        }
+
+        @MainActor
+        func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping @MainActor @Sendable (String?) -> Void) {
+            guard let presenter = UIApplication.shared.scampagnateTopViewController else {
+                completionHandler(nil)
+                return
+            }
+
+            let alert = UIAlertController(title: prompt, message: nil, preferredStyle: .alert)
+            alert.addTextField { textField in
+                textField.text = defaultText
+                textField.keyboardType = .URL
+                textField.autocapitalizationType = .none
+                textField.autocorrectionType = .no
+            }
+            alert.addAction(UIAlertAction(title: "Annulla", style: .cancel) { _ in
+                Task { @MainActor in
+                    completionHandler(nil)
+                }
+            })
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+                Task { @MainActor in
+                    completionHandler(alert.textFields?.first?.text)
+                }
+            })
+            presenter.present(alert, animated: true)
+        }
+    }
+}
+
+private extension UIApplication {
+    var scampagnateTopViewController: UIViewController? {
+        let keyWindow = connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .first { $0.isKeyWindow }
+        var controller = keyWindow?.rootViewController
+        while let presented = controller?.presentedViewController {
+            controller = presented
+        }
+        if let navigation = controller as? UINavigationController {
+            return navigation.visibleViewController ?? navigation
+        }
+        if let tab = controller as? UITabBarController {
+            return tab.selectedViewController ?? tab
+        }
+        return controller
+    }
+}
+
+private enum OrganizerRichTextNativeCommand: String, CaseIterable {
+    case bold
+    case italic
+    case underline
+    case strikethrough
+    case paragraph
+    case decreaseFontSize
+    case increaseFontSize
+    case bulletList
+    case orderedList
+    case link
+    case undo
+    case redo
+
+    var accessibilityLabel: String {
+        switch self {
+        case .bold: "Grassetto"
+        case .italic: "Corsivo"
+        case .underline: "Sottolineato"
+        case .strikethrough: "Barrato"
+        case .paragraph: "Paragrafo"
+        case .decreaseFontSize: "Riduci dimensione testo"
+        case .increaseFontSize: "Aumenta dimensione testo"
+        case .bulletList: "Elenco puntato"
+        case .orderedList: "Elenco numerato"
+        case .link: "Inserisci link"
+        case .undo: "Annulla"
+        case .redo: "Ripristina"
+        }
+    }
+}
+
+private final class OrganizerRichTextUITextView: UITextView {
+    var customPasteHandler: ((UITextView) -> Bool)?
+
+    override func paste(_ sender: Any?) {
+        if customPasteHandler?(self) == true {
+            return
+        }
+        super.paste(sender)
+    }
+}
+
+private final class OrganizerRichTextUIKitEditorView: UIView {
+    let textView = OrganizerRichTextUITextView()
+
+    private let toolbarScrollView = UIScrollView()
+    private let toolbarStack = UIStackView()
+    private var buttons: [OrganizerRichTextNativeCommand: UIButton] = [:]
+    private var activeCommands: Set<OrganizerRichTextNativeCommand> = []
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        setup()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+
+    func configureToolbar(target: Any, action: Selector) {
+        guard toolbarStack.arrangedSubviews.isEmpty else { return }
+        addButton(title: "B", command: .bold, target: target, action: action)
+        addButton(title: "I", command: .italic, target: target, action: action)
+        addButton(title: "U", command: .underline, target: target, action: action)
+        addButton(title: "S", command: .strikethrough, target: target, action: action)
+        addDivider()
+        addButton(title: "P", command: .paragraph, target: target, action: action)
+        addButton(title: "A-", command: .decreaseFontSize, target: target, action: action)
+        addButton(title: "A+", command: .increaseFontSize, target: target, action: action)
+        addDivider()
+        addButton(title: "•", command: .bulletList, target: target, action: action)
+        addButton(title: "1.", command: .orderedList, target: target, action: action)
+        addDivider()
+        addButton(systemImage: "link", command: .link, target: target, action: action)
+        addDivider()
+        addButton(systemImage: "arrow.uturn.backward", command: .undo, target: target, action: action)
+        addButton(systemImage: "arrow.uturn.forward", command: .redo, target: target, action: action)
+        applyPalette()
+    }
+
+    func setActive(_ active: Bool, for command: OrganizerRichTextNativeCommand) {
+        if active {
+            activeCommands.insert(command)
+        } else {
+            activeCommands.remove(command)
+        }
+        style(buttons[command], active: active)
+    }
+
+    func setEnabled(_ enabled: Bool, for command: OrganizerRichTextNativeCommand) {
+        buttons[command]?.isEnabled = enabled
+        buttons[command]?.alpha = enabled ? 1 : 0.42
+    }
+
+    func applyPalette() {
+        backgroundColor = UIColor(Brand.inputBackground)
+        toolbarScrollView.backgroundColor = UIColor(Brand.background)
+        textView.backgroundColor = UIColor(Brand.inputBackground)
+        textView.textColor = UIColor(Brand.inputForeground)
+        textView.tintColor = UIColor(Brand.primary)
+        textView.linkTextAttributes = [
+            .foregroundColor: UIColor(Brand.primary),
+            .underlineStyle: NSUnderlineStyle.single.rawValue
+        ]
+        for (command, button) in buttons {
+            style(button, active: activeCommands.contains(command))
+        }
+    }
+
+    private func setup() {
+        autoresizingMask = [.flexibleWidth, .flexibleHeight]
+
+        toolbarScrollView.translatesAutoresizingMaskIntoConstraints = false
+        toolbarScrollView.alwaysBounceHorizontal = true
+        toolbarScrollView.showsHorizontalScrollIndicator = false
+        toolbarScrollView.backgroundColor = UIColor(Brand.background)
+
+        toolbarStack.translatesAutoresizingMaskIntoConstraints = false
+        toolbarStack.axis = .horizontal
+        toolbarStack.alignment = .center
+        toolbarStack.spacing = 6
+        toolbarStack.isLayoutMarginsRelativeArrangement = true
+        toolbarStack.directionalLayoutMargins = NSDirectionalEdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12)
+
+        textView.translatesAutoresizingMaskIntoConstraints = false
+        textView.backgroundColor = UIColor(Brand.inputBackground)
         textView.isOpaque = false
         textView.isEditable = true
         textView.isSelectable = true
@@ -23094,27 +24712,117 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
         textView.keyboardDismissMode = .interactive
         textView.alwaysBounceVertical = true
         textView.showsHorizontalScrollIndicator = false
-        textView.contentInset = .zero
-        textView.textContainerInset = .zero
+        textView.contentInsetAdjustmentBehavior = .never
+        textView.textContainerInset = UIEdgeInsets(top: 18, left: 18, bottom: 36, right: 18)
         textView.textContainer.lineFragmentPadding = 0
-        textView.font = .systemFont(ofSize: 16)
+        textView.font = .systemFont(ofSize: EventDescriptionHTML.bodyFontSize)
         textView.textColor = UIColor(Brand.inputForeground)
         textView.tintColor = UIColor(Brand.primary)
         textView.typingAttributes = EventDescriptionHTML.editorTypingAttributes()
-        context.coordinator.apply(html, to: textView)
-        return textView
+        textView.autocapitalizationType = .sentences
+        textView.autocorrectionType = .default
+        textView.smartDashesType = .default
+        textView.smartQuotesType = .default
+
+        addSubview(toolbarScrollView)
+        toolbarScrollView.addSubview(toolbarStack)
+        addSubview(textView)
+
+        NSLayoutConstraint.activate([
+            toolbarScrollView.topAnchor.constraint(equalTo: topAnchor),
+            toolbarScrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            toolbarScrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            toolbarScrollView.heightAnchor.constraint(equalToConstant: 58),
+
+            toolbarStack.topAnchor.constraint(equalTo: toolbarScrollView.contentLayoutGuide.topAnchor),
+            toolbarStack.leadingAnchor.constraint(equalTo: toolbarScrollView.contentLayoutGuide.leadingAnchor),
+            toolbarStack.trailingAnchor.constraint(equalTo: toolbarScrollView.contentLayoutGuide.trailingAnchor),
+            toolbarStack.bottomAnchor.constraint(equalTo: toolbarScrollView.contentLayoutGuide.bottomAnchor),
+            toolbarStack.heightAnchor.constraint(equalTo: toolbarScrollView.frameLayoutGuide.heightAnchor),
+
+            textView.topAnchor.constraint(equalTo: toolbarScrollView.bottomAnchor),
+            textView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            textView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            textView.bottomAnchor.constraint(equalTo: keyboardLayoutGuide.topAnchor)
+        ])
+
+        applyPalette()
     }
 
-    func updateUIView(_ textView: UITextView, context: Context) {
+    private func addButton(title: String? = nil, systemImage: String? = nil, command: OrganizerRichTextNativeCommand, target: Any, action: Selector) {
+        let button = UIButton(type: .system)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.accessibilityIdentifier = command.rawValue
+        button.accessibilityLabel = command.accessibilityLabel
+        button.layer.cornerRadius = 10
+        button.layer.borderWidth = 1
+        button.titleLabel?.font = .systemFont(ofSize: 14, weight: .bold)
+        if let title {
+            button.setTitle(title, for: .normal)
+        } else if let systemImage {
+            let configuration = UIImage.SymbolConfiguration(pointSize: 15, weight: .bold)
+            button.setImage(UIImage(systemName: systemImage, withConfiguration: configuration), for: .normal)
+        }
+        button.addTarget(target, action: action, for: .touchUpInside)
+        NSLayoutConstraint.activate([
+            button.heightAnchor.constraint(equalToConstant: 34),
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: 34)
+        ])
+        buttons[command] = button
+        toolbarStack.addArrangedSubview(button)
+    }
+
+    private func addDivider() {
+        let divider = UIView()
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        divider.backgroundColor = UIColor(Brand.inputBorder)
+        NSLayoutConstraint.activate([
+            divider.widthAnchor.constraint(equalToConstant: 1),
+            divider.heightAnchor.constraint(equalToConstant: 32)
+        ])
+        toolbarStack.addArrangedSubview(divider)
+    }
+
+    private func style(_ button: UIButton?, active: Bool) {
+        guard let button else { return }
+        button.layer.borderColor = active ? UIColor(Brand.primary).withAlphaComponent(0.42).cgColor : UIColor(Brand.inputBorder).cgColor
+        button.backgroundColor = active ? UIColor(Brand.primary).withAlphaComponent(0.13) : UIColor(Brand.inputBackground)
+        button.tintColor = active ? UIColor(Brand.primary) : UIColor(Brand.inputForeground)
+        button.setTitleColor(active ? UIColor(Brand.primary) : UIColor(Brand.inputForeground), for: .normal)
+    }
+}
+
+private struct OrganizerRichTextTextView: UIViewRepresentable {
+    @Binding var html: String
+
+    func makeUIView(context: Context) -> OrganizerRichTextUIKitEditorView {
+        let editorView = OrganizerRichTextUIKitEditorView()
+        editorView.configureToolbar(target: context.coordinator, action: #selector(Coordinator.toolbarButtonTapped(_:)))
+        editorView.textView.delegate = context.coordinator
+        let coordinator = context.coordinator
+        editorView.textView.customPasteHandler = { [weak coordinator] textView in
+            coordinator?.pasteFromClipboard(in: textView) ?? false
+        }
+        context.coordinator.editorView = editorView
+        context.coordinator.apply(html, to: editorView.textView)
+        return editorView
+    }
+
+    func updateUIView(_ editorView: OrganizerRichTextUIKitEditorView, context: Context) {
         let cleanHTML = EventDescriptionHTML.cleanStoredHTML(from: html)
-        textView.textColor = UIColor(Brand.inputForeground)
-        textView.tintColor = UIColor(Brand.primary)
-        textView.typingAttributes = EventDescriptionHTML.editorTypingAttributes()
+        editorView.applyPalette()
         guard !context.coordinator.isUpdatingFromTextView,
               context.coordinator.lastSyncedHTML != cleanHTML else {
+            context.coordinator.updateToolbarState(editorView.textView)
             return
         }
-        context.coordinator.apply(cleanHTML, to: textView)
+        context.coordinator.apply(cleanHTML, to: editorView.textView)
+    }
+
+    static func dismantleUIView(_ uiView: OrganizerRichTextUIKitEditorView, coordinator: Coordinator) {
+        uiView.textView.delegate = nil
+        uiView.textView.customPasteHandler = nil
+        coordinator.editorView = nil
     }
 
     func makeCoordinator() -> Coordinator {
@@ -23123,6 +24831,7 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
 
     final class Coordinator: NSObject, UITextViewDelegate {
         @Binding private var html: String
+        weak var editorView: OrganizerRichTextUIKitEditorView?
         var lastSyncedHTML = ""
         var isUpdatingFromTextView = false
 
@@ -23130,11 +24839,53 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             self._html = html
         }
 
+        @objc func toolbarButtonTapped(_ sender: UIButton) {
+            guard let identifier = sender.accessibilityIdentifier,
+                  let command = OrganizerRichTextNativeCommand(rawValue: identifier),
+                  let textView = editorView?.textView else {
+                return
+            }
+
+            textView.becomeFirstResponder()
+            switch command {
+            case .bold:
+                toggleFontTrait(.traitBold, in: textView)
+            case .italic:
+                toggleFontTrait(.traitItalic, in: textView)
+            case .underline:
+                toggleTextAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, in: textView)
+            case .strikethrough:
+                toggleTextAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, in: textView)
+            case .paragraph:
+                applyBlockStyle(pointSize: EventDescriptionHTML.bodyFontSize, bold: false, in: textView)
+            case .decreaseFontSize:
+                adjustFontSize(by: -EventDescriptionHTML.fontSizeStep, in: textView)
+            case .increaseFontSize:
+                adjustFontSize(by: EventDescriptionHTML.fontSizeStep, in: textView)
+            case .bulletList:
+                toggleList(kind: .unordered, in: textView)
+            case .orderedList:
+                toggleList(kind: .ordered, in: textView)
+            case .link:
+                promptForLink(in: textView)
+            case .undo:
+                textView.undoManager?.undo()
+                syncHTML(from: textView)
+            case .redo:
+                textView.undoManager?.redo()
+                syncHTML(from: textView)
+            }
+            updateToolbarState(textView)
+        }
+
         func apply(_ rawHTML: String, to textView: UITextView) {
             let cleanHTML = EventDescriptionHTML.cleanStoredHTML(from: rawHTML)
             lastSyncedHTML = cleanHTML
             let selectedRange = textView.selectedRange
-            textView.attributedText = EventDescriptionHTML.attributedStringForEditing(from: cleanHTML)
+            let attributed = cleanHTML.isEmpty
+                ? NSMutableAttributedString(string: "", attributes: EventDescriptionHTML.editorTypingAttributes())
+                : EventDescriptionHTML.attributedStringForEditing(from: cleanHTML)
+            textView.attributedText = attributed
             textView.typingAttributes = EventDescriptionHTML.editorTypingAttributes()
             if selectedRange.location <= textView.attributedText.length {
                 textView.selectedRange = NSRange(
@@ -23142,9 +24893,45 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
                     length: min(selectedRange.length, textView.attributedText.length - selectedRange.location)
                 )
             }
+            updateToolbarState(textView)
         }
 
         func textViewDidChange(_ textView: UITextView) {
+            syncHTML(from: textView)
+        }
+
+        func textViewDidChangeSelection(_ textView: UITextView) {
+            updateToolbarState(textView)
+        }
+
+        func updateToolbarState(_ textView: UITextView) {
+            guard let editorView else { return }
+            editorView.setActive(fontTraitActive(.traitBold, in: textView), for: .bold)
+            editorView.setActive(fontTraitActive(.traitItalic, in: textView), for: .italic)
+            editorView.setActive(textAttributeActive(.underlineStyle, in: textView), for: .underline)
+            editorView.setActive(textAttributeActive(.strikethroughStyle, in: textView), for: .strikethrough)
+
+            let currentSize = currentFontSize(in: textView)
+            editorView.setActive(abs(currentSize - EventDescriptionHTML.bodyFontSize) < 0.75, for: .paragraph)
+            editorView.setEnabled(currentSize > EventDescriptionHTML.minFontSize + 0.25, for: .decreaseFontSize)
+            editorView.setEnabled(currentSize < EventDescriptionHTML.maxFontSize - 0.25, for: .increaseFontSize)
+            editorView.setActive(currentParagraphHasListPrefix(.unordered, in: textView), for: .bulletList)
+            editorView.setActive(currentParagraphHasListPrefix(.ordered, in: textView), for: .orderedList)
+            editorView.setEnabled(textView.undoManager?.canUndo ?? false, for: .undo)
+            editorView.setEnabled(textView.undoManager?.canRedo ?? false, for: .redo)
+        }
+
+        func pasteFromClipboard(in textView: UITextView) -> Bool {
+            guard let cleanHTML = EventDescriptionHTML.cleanHTMLFromPasteboard(.general) else {
+                return false
+            }
+            let attributed = EventDescriptionHTML.attributedStringForEditing(from: cleanHTML)
+            guard attributed.length > 0 else { return false }
+            insert(attributed, in: textView)
+            return true
+        }
+
+        private func syncHTML(from textView: UITextView) {
             let cleanHTML = EventDescriptionHTML.cleanHTML(from: textView.attributedText)
             lastSyncedHTML = cleanHTML
             guard html != cleanHTML else { return }
@@ -23153,6 +24940,356 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             DispatchQueue.main.async { [weak self] in
                 self?.isUpdatingFromTextView = false
             }
+        }
+
+        private func toggleFontTrait(_ trait: UIFontDescriptor.SymbolicTraits, in textView: UITextView) {
+            let shouldEnable = !fontTraitActive(trait, in: textView)
+            let selectedRange = clampedSelection(in: textView)
+            if selectedRange.length == 0 {
+                var attributes = effectiveTypingAttributes(in: textView)
+                let currentFont = attributes[.font] as? UIFont ?? UIFont.systemFont(ofSize: EventDescriptionHTML.bodyFontSize)
+                attributes[.font] = font(currentFont, setting: trait, enabled: shouldEnable)
+                textView.typingAttributes = attributes
+                return
+            }
+
+            let storage = textView.textStorage
+            var replacements: [(NSRange, UIFont)] = []
+            storage.enumerateAttribute(.font, in: selectedRange) { value, range, _ in
+                let currentFont = value as? UIFont ?? UIFont.systemFont(ofSize: EventDescriptionHTML.bodyFontSize)
+                replacements.append((range, font(currentFont, setting: trait, enabled: shouldEnable)))
+            }
+            storage.beginEditing()
+            for replacement in replacements {
+                storage.addAttribute(.font, value: replacement.1, range: replacement.0)
+            }
+            storage.endEditing()
+            syncHTML(from: textView)
+        }
+
+        private func toggleTextAttribute(_ key: NSAttributedString.Key, value: Any, in textView: UITextView) {
+            let shouldEnable = !textAttributeActive(key, in: textView)
+            let selectedRange = clampedSelection(in: textView)
+            if selectedRange.length == 0 {
+                var attributes = effectiveTypingAttributes(in: textView)
+                if shouldEnable {
+                    attributes[key] = value
+                } else {
+                    attributes.removeValue(forKey: key)
+                }
+                textView.typingAttributes = attributes
+                return
+            }
+
+            if shouldEnable {
+                textView.textStorage.addAttribute(key, value: value, range: selectedRange)
+            } else {
+                textView.textStorage.removeAttribute(key, range: selectedRange)
+            }
+            syncHTML(from: textView)
+        }
+
+        private func insert(_ attributed: NSAttributedString, in textView: UITextView) {
+            let selectedRange = clampedSelection(in: textView)
+            let storage = textView.textStorage
+            storage.beginEditing()
+            storage.replaceCharacters(in: selectedRange, with: attributed)
+            storage.endEditing()
+            textView.selectedRange = NSRange(location: selectedRange.location + attributed.length, length: 0)
+            textView.typingAttributes = effectiveTypingAttributes(in: textView)
+            syncHTML(from: textView)
+            updateToolbarState(textView)
+        }
+
+        private func adjustFontSize(by delta: CGFloat, in textView: UITextView) {
+            let selectedRange = clampedSelection(in: textView)
+            if selectedRange.length == 0 {
+                var attributes = effectiveTypingAttributes(in: textView)
+                let currentFont = attributes[.font] as? UIFont ?? UIFont.systemFont(ofSize: EventDescriptionHTML.bodyFontSize)
+                attributes[.font] = font(currentFont, pointSize: currentFont.pointSize + delta)
+                textView.typingAttributes = attributes
+                return
+            }
+
+            let storage = textView.textStorage
+            var replacements: [(range: NSRange, font: UIFont)] = []
+            storage.enumerateAttribute(.font, in: selectedRange) { value, range, _ in
+                let currentFont = value as? UIFont ?? UIFont.systemFont(ofSize: EventDescriptionHTML.bodyFontSize)
+                replacements.append((range, font(currentFont, pointSize: currentFont.pointSize + delta)))
+            }
+            storage.beginEditing()
+            for replacement in replacements {
+                storage.addAttribute(.font, value: replacement.font, range: replacement.range)
+            }
+            storage.endEditing()
+            syncHTML(from: textView)
+        }
+
+        private func applyBlockStyle(pointSize: CGFloat, bold: Bool, in textView: UITextView) {
+            let paragraphRange = selectedParagraphRange(in: textView)
+            var typingAttributes = effectiveTypingAttributes(in: textView)
+            typingAttributes[.font] = blockFont(from: typingAttributes[.font] as? UIFont, pointSize: pointSize, bold: bold)
+            typingAttributes[.paragraphStyle] = EventDescriptionHTML.editorTypingAttributes()[.paragraphStyle]
+            textView.typingAttributes = typingAttributes
+            guard paragraphRange.length > 0 else { return }
+
+            let storage = textView.textStorage
+            var replacements: [(NSRange, UIFont)] = []
+            storage.enumerateAttribute(.font, in: paragraphRange) { value, range, _ in
+                replacements.append((range, blockFont(from: value as? UIFont, pointSize: pointSize, bold: bold)))
+            }
+            storage.beginEditing()
+            for replacement in replacements {
+                storage.addAttribute(.font, value: replacement.1, range: replacement.0)
+            }
+            if let paragraphStyle = EventDescriptionHTML.editorTypingAttributes()[.paragraphStyle] {
+                storage.addAttribute(.paragraphStyle, value: paragraphStyle, range: paragraphRange)
+            }
+            storage.endEditing()
+            syncHTML(from: textView)
+        }
+
+        private enum ListKind {
+            case unordered
+            case ordered
+        }
+
+        private func toggleList(kind: ListKind, in textView: UITextView) {
+            let attributed = NSMutableAttributedString(attributedString: textView.attributedText)
+            let originalSelection = textView.selectedRange
+            let paragraphRanges = selectedParagraphRanges(in: textView)
+            guard !paragraphRanges.isEmpty else { return }
+
+            let shouldRemove = paragraphRanges.allSatisfy { listPrefixRange(kind: kind, paragraphRange: $0, text: attributed.string as NSString) != nil }
+            var selectionDelta = 0
+            var orderedIndex = paragraphRanges.count
+
+            for paragraphRange in paragraphRanges.reversed() {
+                let nsText = attributed.string as NSString
+                if let prefixRange = listPrefixRange(kind: kind, paragraphRange: paragraphRange, text: nsText), shouldRemove {
+                    attributed.deleteCharacters(in: prefixRange)
+                    if prefixRange.location <= originalSelection.location {
+                        selectionDelta -= prefixRange.length
+                    }
+                } else if !shouldRemove {
+                    let prefix = kind == .unordered ? "• " : "\(orderedIndex). "
+                    let attributes = attributesForInsertion(at: paragraphRange.location, in: textView)
+                    attributed.insert(NSAttributedString(string: prefix, attributes: attributes), at: paragraphRange.location)
+                    if paragraphRange.location <= originalSelection.location {
+                        selectionDelta += (prefix as NSString).length
+                    }
+                }
+                orderedIndex -= 1
+            }
+
+            textView.attributedText = attributed
+            textView.selectedRange = NSRange(
+                location: min(max(originalSelection.location + selectionDelta, 0), attributed.length),
+                length: min(originalSelection.length, max(attributed.length - min(max(originalSelection.location + selectionDelta, 0), attributed.length), 0))
+            )
+            textView.typingAttributes = effectiveTypingAttributes(in: textView)
+            syncHTML(from: textView)
+        }
+
+        private func promptForLink(in textView: UITextView) {
+            guard let presenter = UIApplication.shared.scampagnateTopViewController else { return }
+            let alert = UIAlertController(title: "Inserisci link", message: nil, preferredStyle: .alert)
+            alert.addTextField { textField in
+                textField.placeholder = "https://"
+                textField.text = "https://"
+                textField.keyboardType = .URL
+                textField.autocapitalizationType = .none
+                textField.autocorrectionType = .no
+            }
+            alert.addAction(UIAlertAction(title: "Annulla", style: .cancel))
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { [weak self, weak textView] _ in
+                guard let self,
+                      let textView,
+                      let rawURL = alert.textFields?.first?.text,
+                      let url = normalizedURL(rawURL) else {
+                    return
+                }
+                applyLink(url, in: textView)
+            })
+            presenter.present(alert, animated: true)
+        }
+
+        private func applyLink(_ url: URL, in textView: UITextView) {
+            let selectedRange = clampedSelection(in: textView)
+            if selectedRange.length > 0 {
+                textView.textStorage.addAttributes([
+                    .link: url,
+                    .underlineStyle: NSUnderlineStyle.single.rawValue
+                ], range: selectedRange)
+                syncHTML(from: textView)
+                return
+            }
+
+            let label = url.host?.nilIfBlank ?? url.absoluteString
+            var attributes = effectiveTypingAttributes(in: textView)
+            attributes[.link] = url
+            attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            textView.textStorage.insert(NSAttributedString(string: label, attributes: attributes), at: selectedRange.location)
+            textView.selectedRange = NSRange(location: selectedRange.location + (label as NSString).length, length: 0)
+            syncHTML(from: textView)
+        }
+
+        private func normalizedURL(_ rawValue: String) -> URL? {
+            var value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { return nil }
+            if !value.lowercased().hasPrefix("http://"),
+               !value.lowercased().hasPrefix("https://"),
+               !value.lowercased().hasPrefix("mailto:") {
+                value = "https://\(value)"
+            }
+            return URL(string: value)
+        }
+
+        private func fontTraitActive(_ trait: UIFontDescriptor.SymbolicTraits, in textView: UITextView) -> Bool {
+            let range = activeAttributeRange(in: textView)
+            guard range.length > 0 else {
+                let font = effectiveTypingAttributes(in: textView)[.font] as? UIFont
+                return font?.fontDescriptor.symbolicTraits.contains(trait) ?? false
+            }
+            var isActive = true
+            textView.attributedText.enumerateAttribute(.font, in: range) { value, _, stop in
+                let font = value as? UIFont ?? UIFont.systemFont(ofSize: EventDescriptionHTML.bodyFontSize)
+                if !font.fontDescriptor.symbolicTraits.contains(trait) {
+                    isActive = false
+                    stop.pointee = true
+                }
+            }
+            return isActive
+        }
+
+        private func textAttributeActive(_ key: NSAttributedString.Key, in textView: UITextView) -> Bool {
+            let range = activeAttributeRange(in: textView)
+            guard range.length > 0 else {
+                return effectiveTypingAttributes(in: textView)[key] != nil
+            }
+            var isActive = true
+            textView.attributedText.enumerateAttribute(key, in: range) { value, _, stop in
+                if value == nil {
+                    isActive = false
+                    stop.pointee = true
+                }
+            }
+            return isActive
+        }
+
+        private func currentFontSize(in textView: UITextView) -> CGFloat {
+            let font = effectiveTypingAttributes(in: textView)[.font] as? UIFont
+            return font?.pointSize ?? EventDescriptionHTML.bodyFontSize
+        }
+
+        private func currentParagraphHasListPrefix(_ kind: ListKind, in textView: UITextView) -> Bool {
+            let paragraphRange = selectedParagraphRange(in: textView)
+            guard paragraphRange.length > 0 else { return false }
+            return listPrefixRange(kind: kind, paragraphRange: paragraphRange, text: textView.text as NSString) != nil
+        }
+
+        private func effectiveTypingAttributes(in textView: UITextView) -> [NSAttributedString.Key: Any] {
+            var attributes = EventDescriptionHTML.editorTypingAttributes()
+            let range = activeAttributeRange(in: textView)
+            if range.length > 0, range.location < textView.attributedText.length {
+                attributes.merge(textView.attributedText.attributes(at: range.location, effectiveRange: nil)) { _, new in new }
+            }
+            if textView.selectedRange.length == 0 {
+                attributes.merge(textView.typingAttributes) { _, new in new }
+            }
+            return attributes
+        }
+
+        private func attributesForInsertion(at location: Int, in textView: UITextView) -> [NSAttributedString.Key: Any] {
+            var attributes = EventDescriptionHTML.editorTypingAttributes()
+            let length = textView.attributedText.length
+            if length > 0 {
+                let index = min(max(location, 0), length - 1)
+                attributes.merge(textView.attributedText.attributes(at: index, effectiveRange: nil)) { _, new in new }
+            }
+            return attributes
+        }
+
+        private func activeAttributeRange(in textView: UITextView) -> NSRange {
+            let length = textView.attributedText.length
+            guard length > 0 else { return NSRange(location: 0, length: 0) }
+            let selectedRange = clampedSelection(in: textView)
+            if selectedRange.length > 0 { return selectedRange }
+            return NSRange(location: min(max(selectedRange.location - 1, 0), length - 1), length: 1)
+        }
+
+        private func clampedSelection(in textView: UITextView) -> NSRange {
+            let length = textView.attributedText.length
+            let location = min(max(textView.selectedRange.location, 0), length)
+            let rangeLength = min(textView.selectedRange.length, max(length - location, 0))
+            return NSRange(location: location, length: rangeLength)
+        }
+
+        private func selectedParagraphRange(in textView: UITextView) -> NSRange {
+            let nsText = textView.text as NSString
+            guard nsText.length > 0 else { return NSRange(location: 0, length: 0) }
+            let selectedRange = clampedSelection(in: textView)
+            let location = min(max(selectedRange.location, 0), nsText.length - 1)
+            let length = selectedRange.length == 0 ? 1 : min(selectedRange.length, nsText.length - location)
+            return nsText.paragraphRange(for: NSRange(location: location, length: length))
+        }
+
+        private func selectedParagraphRanges(in textView: UITextView) -> [NSRange] {
+            let fullRange = selectedParagraphRange(in: textView)
+            guard fullRange.length > 0 else { return [] }
+            let nsText = textView.text as NSString
+            var ranges: [NSRange] = []
+            var location = fullRange.location
+            let upperBound = NSMaxRange(fullRange)
+            while location < upperBound {
+                let paragraphRange = nsText.paragraphRange(for: NSRange(location: min(location, max(nsText.length - 1, 0)), length: 0))
+                ranges.append(paragraphRange)
+                let nextLocation = NSMaxRange(paragraphRange)
+                guard nextLocation > location else { break }
+                location = nextLocation
+            }
+            return ranges
+        }
+
+        private func listPrefixRange(kind: ListKind, paragraphRange: NSRange, text: NSString) -> NSRange? {
+            guard paragraphRange.location < text.length else { return nil }
+            let paragraph = text.substring(with: NSRange(location: paragraphRange.location, length: min(paragraphRange.length, text.length - paragraphRange.location)))
+            let pattern = kind == .unordered ? #"^\s*(?:•|-|\*)\s+"# : #"^\s*\d+[\.)]\s+"#
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(in: paragraph, range: NSRange(location: 0, length: (paragraph as NSString).length)) else {
+                return nil
+            }
+            return NSRange(location: paragraphRange.location + match.range.location, length: match.range.length)
+        }
+
+        private func font(_ source: UIFont, setting trait: UIFontDescriptor.SymbolicTraits, enabled: Bool) -> UIFont {
+            var traits = source.fontDescriptor.symbolicTraits
+            if enabled {
+                traits.insert(trait)
+            } else {
+                traits.remove(trait)
+            }
+            let descriptor = source.fontDescriptor.withSymbolicTraits(traits) ?? source.fontDescriptor
+            return UIFont(descriptor: descriptor, size: source.pointSize)
+        }
+
+        private func font(_ source: UIFont, pointSize: CGFloat) -> UIFont {
+            let size = min(max((pointSize * 2).rounded() / 2, EventDescriptionHTML.minFontSize), EventDescriptionHTML.maxFontSize)
+            let baseFont = UIFont.systemFont(ofSize: size)
+            let descriptor = baseFont.fontDescriptor.withSymbolicTraits(source.fontDescriptor.symbolicTraits) ?? baseFont.fontDescriptor
+            return UIFont(descriptor: descriptor, size: size)
+        }
+
+        private func blockFont(from source: UIFont?, pointSize: CGFloat, bold: Bool) -> UIFont {
+            let source = source ?? UIFont.systemFont(ofSize: pointSize)
+            var traits = UIFontDescriptor.SymbolicTraits()
+            if bold { traits.insert(.traitBold) }
+            if source.fontDescriptor.symbolicTraits.contains(.traitItalic) {
+                traits.insert(.traitItalic)
+            }
+            let base = UIFont.systemFont(ofSize: pointSize, weight: bold ? .bold : .regular)
+            let descriptor = base.fontDescriptor.withSymbolicTraits(traits) ?? base.fontDescriptor
+            return UIFont(descriptor: descriptor, size: pointSize)
         }
     }
 }
@@ -23355,8 +25492,7 @@ struct OrganizerVisibilityPickerField: View {
 
     private static let options = [
         OrganizerVisibilityOption(id: "public", label: "🌍 Pubblico — Visibile a tutti", description: "Tutti possono trovare e visualizzare questo evento."),
-        OrganizerVisibilityOption(id: "private", label: "🔗 Privato — Solo link diretto", description: "Non visibile nella scoperta. Accessibile solo tramite link diretto o invito."),
-        OrganizerVisibilityOption(id: "hidden", label: "👁️ Nascosto — Solo organizzatori e admin", description: "Visibile solo agli organizzatori e agli admin.")
+        OrganizerVisibilityOption(id: "private", label: "🔗 Privato — Solo link diretto", description: "Non visibile nella scoperta. Accessibile solo tramite link diretto o invito.")
     ]
 
     var body: some View {
@@ -23415,7 +25551,6 @@ struct OrganizerRegistrationRulesSummary: View {
         switch visibility {
         case "public": return "Visibile a tutti"
         case "private": return "Solo link diretto"
-        case "hidden": return "Nascosto"
         default: return "Visibilità personalizzata"
         }
     }
@@ -24719,6 +26854,35 @@ struct OrganizerStringListEditor: View {
     }
 }
 
+struct OrganizerImagePreviewRow: View {
+    let title: String
+    let subtitle: String
+    let urlString: String?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            RemoteImage(urlString: urlString)
+                .frame(width: 74, height: 74)
+                .background(Brand.muted, in: RoundedRectangle(cornerRadius: 12))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(Brand.foreground)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundStyle(Brand.mutedForeground)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(10)
+        .background(Brand.background, in: RoundedRectangle(cornerRadius: 14))
+    }
+}
+
 struct OrganizerGalleryEditor: View {
     @Binding var urls: [String]
 
@@ -24733,53 +26897,37 @@ struct OrganizerGalleryEditor: View {
                     .foregroundStyle(Brand.mutedForeground)
             }
             ForEach(Array(urls.indices), id: \.self) { index in
-                HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 8) {
                     let currentURL = urls.indices.contains(index) ? urls[index] : ""
-                    if currentURL.nilIfBlank != nil {
-                        RemoteImage(urlString: currentURL, contentMode: .fit)
-                            .frame(width: 58, height: 58)
-                            .background(Brand.muted, in: RoundedRectangle(cornerRadius: 10))
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    } else {
-                        RoundedRectangle(cornerRadius: 10)
-                            .fill(Brand.muted)
-                            .frame(width: 58, height: 58)
-                            .overlay(Image(systemName: "photo").foregroundStyle(Brand.mutedForeground))
-                    }
-                    TextField("URL immagine", text: safeURLBinding(for: index))
-                    .textInputAutocapitalization(.never)
-                    .keyboardType(.URL)
-                    .editableTextInput(cornerRadius: 10)
-                    VStack(spacing: 4) {
-                        Button {
-                            move(index, by: -1)
-                        } label: {
-                            Image(systemName: "chevron.up")
+                    HStack(spacing: 10) {
+                        galleryThumbnail(for: currentURL)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Immagine \(index + 1)")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(Brand.foreground)
+                            Text(currentURL.nilIfBlank == nil ? "Immagine non impostata" : "Foto galleria")
+                                .font(.caption2)
+                                .foregroundStyle(Brand.mutedForeground)
+                                .lineLimit(1)
                         }
-                        .disabled(index == 0)
-                        Button {
-                            move(index, by: 1)
-                        } label: {
-                            Image(systemName: "chevron.down")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                        HStack(spacing: 6) {
+                            galleryActionButton(systemName: "chevron.up", disabled: index == 0) {
+                                move(index, by: -1)
+                            }
+                            galleryActionButton(systemName: "chevron.down", disabled: index == urls.count - 1) {
+                                move(index, by: 1)
+                            }
+                            galleryActionButton(systemName: "trash", role: .destructive) {
+                                guard urls.indices.contains(index) else { return }
+                                urls.remove(at: index)
+                            }
                         }
-                        .disabled(index == urls.count - 1)
-                    }
-                    .font(.caption.weight(.bold))
-                    Button(role: .destructive) {
-                        guard urls.indices.contains(index) else { return }
-                        urls.remove(at: index)
-                    } label: {
-                        Image(systemName: "trash")
                     }
                 }
                 .padding(10)
                 .background(Brand.background, in: RoundedRectangle(cornerRadius: 14))
-            }
-            if urls.count < 5 {
-                Button("Aggiungi URL") {
-                    urls.append("")
-                }
-                .font(.footnote.weight(.bold))
             }
         }
     }
@@ -24790,45 +26938,66 @@ struct OrganizerGalleryEditor: View {
         urls.swapAt(index, target)
     }
 
-    private func safeURLBinding(for index: Int) -> Binding<String> {
-        Binding {
-            urls.indices.contains(index) ? urls[index] : ""
-        } set: { value in
-            guard urls.indices.contains(index) else { return }
-            urls[index] = value
+    @ViewBuilder
+    private func galleryThumbnail(for url: String) -> some View {
+        if url.nilIfBlank != nil {
+            RemoteImage(urlString: url, contentMode: .fit)
+                .frame(width: 58, height: 58)
+                .background(Brand.muted, in: RoundedRectangle(cornerRadius: 10))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+        } else {
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Brand.muted)
+                .frame(width: 58, height: 58)
+                .overlay(Image(systemName: "photo").foregroundStyle(Brand.mutedForeground))
         }
     }
+
+    private func galleryActionButton(
+        systemName: String,
+        role: ButtonRole? = nil,
+        disabled: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(role: role, action: action) {
+            Image(systemName: systemName)
+                .font(.caption.weight(.bold))
+                .frame(width: 30, height: 30)
+                .background(Brand.card, in: Circle())
+                .overlay(Circle().stroke(Brand.muted, lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(role == .destructive ? Brand.destructive : Brand.primary)
+        .opacity(disabled ? 0.35 : 1)
+        .disabled(disabled)
+    }
+
 }
 
 enum OrganizerImageCropKind {
     case coverHero
-    case coverHome
 
     var title: String {
         switch self {
         case .coverHero: "Immagine evento"
-        case .coverHome: "Anteprima home"
         }
     }
 
     var subtitle: String {
         switch self {
-        case .coverHero: "Ritaglio 1:1 per il dettaglio evento"
-        case .coverHome: "Ritaglio 1:1 mostrato nelle card della home"
+        case .coverHero: "Ritaglio 1:1 mostrato nell'evento e nelle card"
         }
     }
 
     var aspectRatio: CGFloat {
         switch self {
         case .coverHero: 1
-        case .coverHome: 1
         }
     }
 
     var outputSize: CGSize {
         switch self {
         case .coverHero: CGSize(width: 1200, height: 1200)
-        case .coverHome: CGSize(width: 1200, height: 1200)
         }
     }
 }
@@ -25103,6 +27272,7 @@ struct ProfileView: View {
     @Binding var openRewards: Bool
     @Binding var routedMission: MissionNavigationTarget?
     @State private var showEdit = false
+    @State private var profileEditInitialFocus: ProfileEditInitialFocus?
     @State private var showHealthSafetyEdit = false
     @State private var showPointsInfo = false
     @State private var showRoutedRewards = false
@@ -25147,7 +27317,10 @@ struct ProfileView: View {
                                                 .buttonStyle(.plain)
                                             }
                                             Spacer()
-                                            Button { showEdit = true } label: {
+                                            Button {
+                                                profileEditInitialFocus = nil
+                                                showEdit = true
+                                            } label: {
                                                 Image(systemName: "pencil")
                                                     .font(.system(size: 18, weight: .semibold))
                                                     .foregroundStyle(Brand.mutedForeground)
@@ -25167,7 +27340,14 @@ struct ProfileView: View {
                                         }
 
                                         ProfileCompletenessCard(profile: profile) {
+                                            profileEditInitialFocus = nil
                                             showEdit = true
+                                        }
+                                        if !profile.hasCompleteMembershipProfile {
+                                            MembershipProfileCallout {
+                                                profileEditInitialFocus = profile.isMissingMembershipSex ? .membershipSex : .membership
+                                                showEdit = true
+                                            }
                                         }
                                         if profile.healthSafetyStatus != "none" && profile.healthSafetyStatus != "has_info" {
                                             HealthSafetyProfileCallout {
@@ -25203,8 +27383,10 @@ struct ProfileView: View {
                                 scrollToProfileTarget(with: scrollProxy)
                             }
                         }
-                        .sheet(isPresented: $showEdit) {
-                            ProfileEditSheet(profile: profile)
+                        .sheet(isPresented: $showEdit, onDismiss: {
+                            profileEditInitialFocus = nil
+                        }) {
+                            ProfileEditSheet(profile: profile, initialFocus: profileEditInitialFocus)
                                 .presentationDetents([.fraction(0.86), .large])
                                 .presentationDragIndicator(.hidden)
                         }
@@ -25445,6 +27627,41 @@ struct HealthSafetyProfileCallout: View {
         .padding(14)
         .background(Brand.secondary.opacity(0.055), in: RoundedRectangle(cornerRadius: 16))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.secondary.opacity(0.18), lineWidth: 1))
+    }
+}
+
+struct MembershipProfileCallout: View {
+    let action: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "person.text.rectangle.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(Brand.primary)
+                    .frame(width: 34, height: 34)
+                    .background(Brand.primary.opacity(0.12), in: Circle())
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Completa dati per tessera e assicurazione")
+                        .font(.system(.subheadline, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                    Text("Ci servono data di nascita, sesso anagrafico e residenza per completare tessera associativa e copertura assicurativa.")
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Button(action: action) {
+                Label("Completa ora", systemImage: "chevron.right")
+                    .labelStyle(.titleAndIcon)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(SecondaryButtonStyle())
+        }
+        .padding(14)
+        .background(Brand.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.primary.opacity(0.18), lineWidth: 1))
     }
 }
 
@@ -25862,10 +28079,36 @@ struct MissionsSection: View {
     let missions: [MissionCardModel]
     @Binding var routedMission: MissionNavigationTarget?
     @State private var selectedMission: MissionCardModel?
+    @State private var showAdditionalActiveMissions = false
     @State private var showCompletedMissions = false
 
+    private static let visibleActiveMissionLimit = 3
+
     private var activeMissions: [MissionCardModel] {
-        missions.filter { !$0.isCompleted }
+        missions.enumerated()
+            .filter { !$0.element.isCompleted }
+            .sorted { lhs, rhs in
+                let lhsRatio = lhs.element.completionRatio
+                let rhsRatio = rhs.element.completionRatio
+                if lhsRatio != rhsRatio {
+                    return lhsRatio > rhsRatio
+                }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
+    }
+
+    private var visibleActiveMissions: [MissionCardModel] {
+        Array(activeMissions.prefix(Self.visibleActiveMissionLimit))
+    }
+
+    private var additionalActiveMissions: [MissionCardModel] {
+        Array(activeMissions.dropFirst(Self.visibleActiveMissionLimit))
+    }
+
+    private var additionalActiveMissionTriggerText: String {
+        let count = additionalActiveMissions.count
+        return count == 1 ? "Mostra 1 altra missione" : "Mostra altre \(count) missioni"
     }
 
     private var completedMissions: [MissionCardModel] {
@@ -25893,9 +28136,39 @@ struct MissionsSection: View {
                         .background(Brand.card, in: RoundedRectangle(cornerRadius: 12))
                         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Brand.muted, lineWidth: 1))
                 } else {
-                    ForEach(activeMissions) { mission in
+                    ForEach(visibleActiveMissions) { mission in
                         MissionRow(mission: mission) {
                             selectedMission = mission
+                        }
+                    }
+
+                    if !additionalActiveMissions.isEmpty {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                showAdditionalActiveMissions.toggle()
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Text(showAdditionalActiveMissions ? "Nascondi missioni" : additionalActiveMissionTriggerText)
+                                    .font(.caption.weight(.bold))
+                                    .foregroundStyle(Brand.foreground)
+                                Spacer()
+                                Image(systemName: showAdditionalActiveMissions ? "chevron.up" : "chevron.down")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(Brand.mutedForeground)
+                            }
+                            .padding(.horizontal, 12)
+                            .frame(height: 42)
+                            .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+                        }
+                        .buttonStyle(.plain)
+
+                        if showAdditionalActiveMissions {
+                            ForEach(additionalActiveMissions) { mission in
+                                MissionRow(mission: mission) {
+                                    selectedMission = mission
+                                }
+                            }
                         }
                     }
                 }
@@ -25970,6 +28243,8 @@ struct MissionsSection: View {
         guard let mission else { return }
         if mission.isCompleted {
             showCompletedMissions = true
+        } else if additionalActiveMissions.contains(where: { $0.id == mission.id }) {
+            showAdditionalActiveMissions = true
         }
         selectedMission = mission
         routedMission = nil
@@ -26579,9 +28854,11 @@ struct RewardDetailItem: Identifiable {
     let copyCode: String?
 
     init(reward: Reward) {
+        let subtitle = reward.summaryDescription
+
         self.id = "reward-\(reward.id)"
         self.title = reward.displayTitle
-        self.subtitle = reward.summaryDescription
+        self.subtitle = subtitle
         self.iconName = reward.badgeIconValue == nil ? reward.iconName : nil
         self.badgeIcon = reward.badgeIconValue
         self.accentColor = reward.accentColor
@@ -26594,16 +28871,18 @@ struct RewardDetailItem: Identifiable {
         case .points:
             self.valueLabel = "Valore"
             self.valueText = reward.pointValueLabel
-            self.sourceLabel = "Ottenuti grazie a"
-            self.sourceText = reward.earnedDescription
+            let source = Self.nonDuplicateSourceRow(label: "Ottenuti grazie a", text: reward.earnedDescription, visibleSubtitle: subtitle)
+            self.sourceLabel = source.label
+            self.sourceText = source.text
             self.helpLabel = "Nota"
             self.helpText = nil
             self.copyCode = nil
         case .badge:
             self.valueLabel = nil
             self.valueText = nil
-            self.sourceLabel = "Sbloccato con"
-            self.sourceText = reward.earnedDescription
+            let source = Self.nonDuplicateSourceRow(label: "Sbloccato con", text: reward.earnedDescription, visibleSubtitle: subtitle)
+            self.sourceLabel = source.label
+            self.sourceText = source.text
             self.helpLabel = "Nota"
             self.helpText = "Resta visibile nel profilo e contribuisce alla tua progressione nella community."
             self.copyCode = nil
@@ -26611,8 +28890,9 @@ struct RewardDetailItem: Identifiable {
             let code = reward.value?.nilIfBlank
             self.valueLabel = "Codice"
             self.valueText = code
-            self.sourceLabel = "Ottenuto grazie a"
-            self.sourceText = reward.earnedDescription
+            let source = Self.nonDuplicateSourceRow(label: "Ottenuto grazie a", text: reward.earnedDescription, visibleSubtitle: subtitle)
+            self.sourceLabel = source.label
+            self.sourceText = source.text
             let expiry = reward.expiryDate?.shortDateLabel.map { " Scade il \($0)." } ?? ""
             self.helpLabel = "Nota"
             self.helpText = "Inserisci il codice in fase di pagamento.\(expiry)"
@@ -26620,8 +28900,9 @@ struct RewardDetailItem: Identifiable {
         case .physical:
             self.valueLabel = "Premio"
             self.valueText = reward.physicalRewardConfig?.rewardName?.nilIfBlank
-            self.sourceLabel = "Ottenuto grazie a"
-            self.sourceText = reward.earnedDescription
+            let source = Self.nonDuplicateSourceRow(label: "Ottenuto grazie a", text: reward.earnedDescription, visibleSubtitle: subtitle)
+            self.sourceLabel = source.label
+            self.sourceText = source.text
             let claimInstructions = reward.physicalClaimInstructions
             self.helpLabel = claimInstructions == nil ? "Nota" : "Istruzioni di riscatto"
             self.helpText = claimInstructions ?? (reward.effectiveStatus == "pending" ? "Potrai ritirarlo al prossimo evento." : nil)
@@ -26629,8 +28910,9 @@ struct RewardDetailItem: Identifiable {
         case .other:
             self.valueLabel = nil
             self.valueText = reward.value?.nilIfBlank
-            self.sourceLabel = "Ottenuta grazie a"
-            self.sourceText = reward.earnedDescription
+            let source = Self.nonDuplicateSourceRow(label: "Ottenuta grazie a", text: reward.earnedDescription, visibleSubtitle: subtitle)
+            self.sourceLabel = source.label
+            self.sourceText = source.text
             self.helpLabel = "Nota"
             self.helpText = nil
             self.copyCode = nil
@@ -26638,9 +28920,11 @@ struct RewardDetailItem: Identifiable {
     }
 
     init(badge: UserBadge) {
+        let subtitle = badge.displayDescription.nilIfBlank ?? "Badge ottenuto"
+
         self.id = "badge-\(badge.id)"
         self.title = badge.displayName
-        self.subtitle = badge.displayDescription.nilIfBlank ?? "Badge ottenuto"
+        self.subtitle = subtitle
         self.iconName = nil
         self.badgeIcon = badge.displayIcon
         self.accentColor = Brand.accent
@@ -26649,12 +28933,40 @@ struct RewardDetailItem: Identifiable {
         self.categoryText = badge.badges?.category?.nilIfBlank?.replacingOccurrences(of: "_", with: " ").capitalized ?? "Badge"
         self.valueLabel = nil
         self.valueText = nil
-        self.sourceLabel = "Ottenuto grazie a"
-        self.sourceText = badge.displayDescription.nilIfBlank ?? "Obiettivo completato nella community."
+        let source = Self.nonDuplicateSourceRow(label: "Ottenuto grazie a", text: badge.displayDescription.nilIfBlank ?? "Obiettivo completato nella community.", visibleSubtitle: subtitle)
+        self.sourceLabel = source.label
+        self.sourceText = source.text
         self.dateText = badge.earnedAt?.shortDateLabel ?? badge.completedAt?.shortDateLabel
         self.helpLabel = "Nota"
         self.helpText = "Resta visibile nel profilo e racconta un traguardo raggiunto."
         self.copyCode = nil
+    }
+
+    private static func nonDuplicateSourceRow(label: String, text: String, visibleSubtitle: String?) -> (label: String?, text: String?) {
+        guard let cleanText = text.nilIfBlank else { return (nil, nil) }
+        guard !isDuplicateSourceText(cleanText, visibleSubtitle: visibleSubtitle) else { return (nil, nil) }
+        return (label, cleanText)
+    }
+
+    private static func isDuplicateSourceText(_ sourceText: String, visibleSubtitle: String?) -> Bool {
+        guard let visibleSubtitle = visibleSubtitle?.nilIfBlank else { return false }
+
+        let source = normalizedDetailText(sourceText)
+        let subtitle = normalizedDetailText(visibleSubtitle)
+        if source == subtitle {
+            return true
+        }
+
+        let missionPrefix = "missione completata: "
+        guard source.hasPrefix(missionPrefix) else { return false }
+        return String(source.dropFirst(missionPrefix.count)) == subtitle
+    }
+
+    private static func normalizedDetailText(_ text: String) -> String {
+        text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
     }
 }
 
@@ -29158,6 +31470,7 @@ struct ProfileEditSheet: View {
     @EnvironmentObject private var store: AppStore
     @Environment(\.dismiss) private var dismiss
     let profile: Profile
+    var initialFocus: ProfileEditInitialFocus? = nil
     @State private var input = ProfileEditInput()
     @State private var saving = false
     @State private var selectedAvatarItem: PhotosPickerItem?
@@ -29173,41 +31486,47 @@ struct ProfileEditSheet: View {
     @State private var updatingAccount = false
     @State private var deleteDialog: DeleteAccountDialog?
     @State private var isDeletingAccount = false
+    @State private var highlightedFocus: ProfileEditInitialFocus?
 
     var body: some View {
         NavigationStack {
             ZStack(alignment: .bottom) {
                 Brand.background.ignoresSafeArea()
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 22) {
-                        sheetHeader
-                        profileFields
-                        membershipFields
+                ScrollViewReader { scrollProxy in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 22) {
+                            sheetHeader
+                            profileFields
+                            membershipFields
 
-                        if hasChanges {
-                            Button {
-                                Task { await saveProfile() }
-                            } label: {
-                                HStack {
-                                    if saving {
-                                        ProgressView()
-                                            .tint(.white)
+                            if hasChanges {
+                                Button {
+                                    Task { await saveProfile() }
+                                } label: {
+                                    HStack {
+                                        if saving {
+                                            ProgressView()
+                                                .tint(.white)
+                                        }
+                                        Text(saving ? "Salvataggio..." : "Salva modifiche")
                                     }
-                                    Text(saving ? "Salvataggio..." : "Salva modifiche")
+                                    .frame(maxWidth: .infinity)
                                 }
-                                .frame(maxWidth: .infinity)
+                                .buttonStyle(PrimaryButtonStyle())
+                                .disabled(saving)
                             }
-                            .buttonStyle(PrimaryButtonStyle())
-                            .disabled(saving)
-                        }
 
-                        preferencesSection
-                        accountSection
+                            preferencesSection
+                            accountSection
+                        }
+                        .padding(.horizontal, 22)
+                        .padding(.top, 22)
+                        .padding(.bottom, 42)
                     }
-                    .padding(.horizontal, 22)
-                    .padding(.top, 22)
-                    .padding(.bottom, 42)
+                    .onAppear {
+                        scheduleInitialFocus(with: scrollProxy)
+                    }
                 }
 
                 if let deleteDialog {
@@ -29329,20 +31648,27 @@ struct ProfileEditSheet: View {
 
     private var membershipFields: some View {
         VStack(alignment: .leading, spacing: 14) {
-            ProfileSheetLabel("Dati per tesseramento")
-            Text("Questi dati sono richiesti solo per la gestione della tessera associativa della ASD Gruppo Scampagnate.")
+            ProfileSheetLabel("Dati per tessera e assicurazione")
+            Text("Ci servono solo per completare la tessera associativa e la copertura assicurativa. Sono visibili allo staff quando necessario.")
                 .font(.caption)
                 .foregroundStyle(Brand.mutedForeground)
                 .fixedSize(horizontal: false, vertical: true)
 
-            BirthDatePickerField(
-                "Data di nascita",
-                dateString: $input.birthDate,
-                showsClearButton: true,
-                labelFont: ProfileSheetFieldStyle.labelFont,
-                labelSpacing: ProfileSheetFieldStyle.labelSpacing,
-                borderWidth: ProfileSheetFieldStyle.inputBorderWidth
-            )
+            HStack(alignment: .top, spacing: 14) {
+                BirthDatePickerField(
+                    "Data di nascita",
+                    dateString: $input.birthDate,
+                    labelFont: ProfileSheetFieldStyle.labelFont,
+                    labelSpacing: ProfileSheetFieldStyle.labelSpacing,
+                    borderWidth: ProfileSheetFieldStyle.inputBorderWidth,
+                    help: "Inserisci la tua data di nascita"
+                )
+                .frame(maxWidth: .infinity)
+
+                ProfileSheetSexField(sex: $input.sex, highlighted: highlightedFocus == .membershipSex)
+                    .frame(maxWidth: .infinity)
+                    .id(ProfileEditInitialFocus.membershipSex)
+            }
             HStack(alignment: .top, spacing: 14) {
                 ProfileSheetField(
                     "Luogo di nascita",
@@ -29376,6 +31702,7 @@ struct ProfileEditSheet: View {
         .padding(16)
         .background(Brand.background, in: RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).stroke(Brand.muted, lineWidth: 1))
+        .id(ProfileEditInitialFocus.membership)
     }
 
     private var preferencesSection: some View {
@@ -29433,6 +31760,7 @@ struct ProfileEditSheet: View {
         input.phone != profile.phone ||
         input.instagramHandle != (profile.instagramHandle ?? "") ||
         input.birthDate != (profile.birthDate ?? "") ||
+        input.sex != (profile.sex ?? "") ||
         input.birthPlace != (profile.birthPlace ?? "") ||
         input.provinceOfBirth != (profile.provinceOfBirth ?? "") ||
         input.residentialAddress != (profile.residentialAddress ?? "") ||
@@ -29448,6 +31776,7 @@ struct ProfileEditSheet: View {
             phone: profile.phone,
             instagramHandle: profile.instagramHandle ?? "",
             birthDate: profile.birthDate ?? "",
+            sex: profile.sex ?? "",
             birthPlace: profile.birthPlace ?? "",
             provinceOfBirth: profile.provinceOfBirth ?? "",
             residentialAddress: profile.residentialAddress ?? "",
@@ -29456,6 +31785,27 @@ struct ProfileEditSheet: View {
             bio: profile.bio ?? ""
         )
         input.normalizeProvinceFields()
+    }
+
+    private func scheduleInitialFocus(with proxy: ScrollViewProxy) {
+        guard let initialFocus else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            withAnimation(.snappy) {
+                proxy.scrollTo(initialFocus, anchor: initialFocus == .membershipSex ? .center : .top)
+            }
+
+            if initialFocus == .membershipSex {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    highlightedFocus = .membershipSex
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                    guard highlightedFocus == .membershipSex else { return }
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        highlightedFocus = nil
+                    }
+                }
+            }
+        }
     }
 
     private func saveProfile() async {
@@ -29473,6 +31823,11 @@ struct ProfileEditSheet: View {
         let hasBirthData = !input.birthDate.isEmpty || !input.birthPlace.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !input.provinceOfBirth.isEmpty
         if hasBirthData, input.provinceOfBirth.count != 2 {
             store.errorMessage = "Inserisci la provincia di nascita con due lettere maiuscole."
+            return false
+        }
+
+        if !input.sex.isEmpty && input.sex != "M" && input.sex != "F" {
+            store.errorMessage = "Seleziona M o F per il sesso anagrafico."
             return false
         }
 
@@ -30207,6 +32562,58 @@ struct ProfileSheetField: View {
     }
 }
 
+struct ProfileSheetSexField: View {
+    @Binding var sex: String
+    var highlighted = false
+    private let options = ["M", "F"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: ProfileSheetFieldStyle.labelSpacing) {
+            HStack(spacing: 6) {
+                ProfileSheetInputLabel("Sesso")
+                InfoTooltipButton(text: "Richiesto come valore M/F per tessera associativa e copertura assicurativa.")
+            }
+            Menu {
+                Button("Non selezionato") {
+                    sex = ""
+                }
+                Divider()
+                ForEach(options, id: \.self) { option in
+                    Button(option) {
+                        sex = option
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Text(sex.isEmpty ? "Seleziona" : sex)
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(sex.isEmpty ? Brand.inputMutedForeground : Brand.inputForeground)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Brand.primary)
+                }
+                .padding(.horizontal, 12)
+                .frame(height: ProfileSheetFieldStyle.inputHeight)
+                .background(
+                    highlighted ? Brand.primary.opacity(0.08) : Brand.inputBackground,
+                    in: RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius)
+                        .stroke(highlighted ? Brand.primary : Brand.inputBorder, lineWidth: highlighted ? 2 : ProfileSheetFieldStyle.inputBorderWidth)
+                )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Sesso")
+            .accessibilityValue(sex.isEmpty ? "Non selezionato" : sex)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(.easeInOut(duration: 0.18), value: highlighted)
+    }
+}
+
 struct ProfileSheetTextArea: View {
     let title: String
     let placeholder: String
@@ -30603,15 +33010,21 @@ struct OnboardingView: View {
                     text: $input.instagramHandle
                 )
 
-                OnboardingBirthDateField(
-                    title: "Data di nascita",
-                    required: true,
-                    dateString: $input.birthDate
-                )
+                HStack(alignment: .top, spacing: 12) {
+                    OnboardingBirthDateField(
+                        title: "Data di nascita",
+                        required: true,
+                        dateString: $input.birthDate
+                    )
+                    .layoutPriority(1)
+
+                    OnboardingSexField(sex: $input.sex)
+                        .frame(width: 118)
+                }
 
                 OnboardingInfoBox(
                     title: "Usiamo questi dati solo quando serve",
-                    text: "Il numero di telefono serve solo per comunicazioni legate agli eventi. La data di nascita è visibile solo agli organizzatori per motivi di sicurezza e assicurazione."
+                    text: "Telefono, data di nascita e sesso anagrafico sono visibili solo allo staff quando servono per eventi, tessera e assicurazione."
                 )
             }
         }
@@ -30777,7 +33190,7 @@ struct OnboardingView: View {
 
     private var canContinue: Bool {
         switch step {
-        case 1: return Self.isValidPhone(input.phone) && !input.birthDate.isEmpty && OnboardingInput.isValidInstagramHandle(input.normalizedInstagramHandle)
+        case 1: return Self.isValidPhone(input.phone) && !input.birthDate.isEmpty && (input.sex == "M" || input.sex == "F") && OnboardingInput.isValidInstagramHandle(input.normalizedInstagramHandle)
         case 2: return !input.trekkingExperience.isEmpty && !input.selfLevel.isEmpty && !input.activityFrequency.isEmpty
         case 3: return input.healthSafetyIsValid
         default: return (2...4).contains(input.interests.count) && !input.motivation.isEmpty
@@ -30924,6 +33337,7 @@ struct OnboardingView: View {
         guard !didPrefill, let profile = store.profile else { return }
         input.phone = profile.phone
         input.birthDate = profile.birthDate ?? ""
+        input.sex = profile.sex ?? ""
         input.instagramHandle = profile.instagramHandle ?? ""
         input.trekkingExperience = profile.trekkingExperience ?? ""
         input.selfLevel = profile.selfLevel ?? ""
@@ -31157,7 +33571,11 @@ struct OnboardingBirthDateField: View {
                     Text(displayText)
                         .font(.body)
                         .foregroundStyle(dateString.isEmpty ? Brand.inputMutedForeground : Brand.inputForeground)
-                    Spacer(minLength: 8)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                        .allowsTightening(true)
+                        .layoutPriority(1)
+                    Spacer(minLength: 4)
                     Image(systemName: "calendar")
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(Brand.primary)
@@ -31236,6 +33654,46 @@ struct OnboardingBirthDateField: View {
 
     private static var defaultBirthDate: Date {
         Calendar(identifier: .gregorian).date(byAdding: .year, value: -25, to: Date()) ?? Date()
+    }
+}
+
+struct OnboardingSexField: View {
+    @Binding var sex: String
+    private let options = ["M", "F"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            OnboardingFieldLabel(title: "Sesso", required: true)
+            Menu {
+                Button("Non selezionato") {
+                    sex = ""
+                }
+                Divider()
+                ForEach(options, id: \.self) { option in
+                    Button(option) {
+                        sex = option
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Text(sex.isEmpty ? "Seleziona" : sex)
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(sex.isEmpty ? Brand.inputMutedForeground : Brand.inputForeground)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Brand.primary)
+                }
+                .padding(.horizontal, 12)
+                .frame(height: 54)
+                .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.inputBorder, lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Sesso")
+            .accessibilityValue(sex.isEmpty ? "Non selezionato" : sex)
+        }
     }
 }
 
@@ -32884,6 +35342,7 @@ struct BirthDatePickerField: View {
     let labelFont: Font
     let labelSpacing: CGFloat
     let borderWidth: CGFloat
+    let help: String?
     @State private var pickerDate = defaultBirthDate
     @State private var isPickerPresented = false
 
@@ -32894,7 +35353,8 @@ struct BirthDatePickerField: View {
         showsClearButton: Bool = false,
         labelFont: Font = .subheadline.weight(.semibold),
         labelSpacing: CGFloat = 6,
-        borderWidth: CGFloat = 1
+        borderWidth: CGFloat = 1,
+        help: String? = nil
     ) {
         self.title = title
         self._dateString = dateString
@@ -32903,25 +35363,37 @@ struct BirthDatePickerField: View {
         self.labelFont = labelFont
         self.labelSpacing = labelSpacing
         self.borderWidth = borderWidth
+        self.help = help
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: labelSpacing) {
-            Text(title)
-                .font(labelFont)
-                .foregroundStyle(Brand.foreground)
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(labelFont)
+                    .foregroundStyle(Brand.foreground)
+                    .lineLimit(1)
+                if let help {
+                    InfoTooltipButton(text: help)
+                }
+            }
 
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Button {
                     syncPickerDate()
                     isPickerPresented = true
                 } label: {
-                    HStack(spacing: 10) {
+                    HStack(spacing: 8) {
                         Text(displayText)
                             .font(.body)
                             .foregroundStyle(dateString.isEmpty ? Brand.inputMutedForeground : Brand.inputForeground)
-                        Spacer(minLength: 8)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.82)
+                            .allowsTightening(true)
+                            .layoutPriority(1)
+                        Spacer(minLength: 4)
                         Image(systemName: "calendar")
+                            .font(.system(size: 16, weight: .semibold))
                             .foregroundStyle(Brand.primary)
                     }
                     .contentShape(Rectangle())
@@ -32936,7 +35408,7 @@ struct BirthDatePickerField: View {
                         pickerDate = Self.defaultBirthDate
                     } label: {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 18, weight: .semibold))
+                            .font(.system(size: 16, weight: .semibold))
                             .foregroundStyle(Brand.mutedForeground)
                     }
                     .buttonStyle(.plain)
@@ -33718,7 +36190,7 @@ private extension Event {
             let noun = spotsLeft == 1 ? "posto" : "posti"
             return ("Solo \(spotsLeft) \(noun) rimasti", "info.circle.fill", Brand.destructive)
         }
-        if Double(taken) / Double(total) >= 0.8 {
+        if capacityFillRatio >= EventAvailabilityRules.lastSpotsFillRatio {
             return ("Quasi pieno", "flame.fill", Brand.warning)
         }
         return nil
@@ -33825,6 +36297,36 @@ private extension Event {
         }
     }
 
+    var difficultyLevel: Int? {
+        guard let raw = difficulty?.nilIfBlank?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else { return nil }
+        if let numeric = Int(raw), (1...5).contains(numeric) {
+            return numeric
+        }
+        if let numericText = raw.firstRegexCapture(#"\b([1-5])(?:\s*/\s*5)?\b"#),
+           let numeric = Int(numericText) {
+            return numeric
+        }
+        return [
+            "beginner": 1,
+            "easy": 1,
+            "facile": 1,
+            "introduzione": 1,
+            "esploratore": 2,
+            "intermedio": 3,
+            "escursionista": 3,
+            "impegnativo": 4,
+            "intrepido": 4,
+            "advanced": 5,
+            "hard": 5,
+            "expert": 5,
+            "avanzato": 5
+        ][raw]
+    }
+
+    var isLongerThan24Hours: Bool {
+        (durationHours ?? 0) > 24
+    }
+
     var isThisWeek: Bool {
         guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return false }
         let calendar = Self.quickFilterCalendar
@@ -33869,8 +36371,8 @@ private extension Event {
 
     var isDemanding: Bool {
         guard let raw = difficulty?.nilIfBlank?.lowercased() else { return false }
-        if let numeric = Int(raw) {
-            return numeric >= 4
+        if let difficultyLevel {
+            return difficultyLevel >= 4
         }
         return ["advanced", "hard", "expert", "difficult"].contains(raw)
     }
@@ -33893,11 +36395,26 @@ private extension Event {
     }
 
     private var durationMinutes: Int? {
-        guard let duration else { return nil }
-        let hours = duration.firstRegexCapture(#"(\d+)\s*h"#).flatMap(Int.init) ?? 0
-        let minutes = duration.firstRegexCapture(#"(\d+)\s*m"#).flatMap(Int.init) ?? 0
-        let total = hours * 60 + minutes
+        guard let durationHours else { return nil }
+        let total = Int((durationHours * 60).rounded())
         return total > 0 ? total : nil
+    }
+
+    private var durationHours: Double? {
+        guard let duration = duration?.nilIfBlank?.lowercased() else { return nil }
+        let days = durationComponent(in: duration, matching: #"(\d+(?:[,.]\d+)?)\s*(?:giorn(?:o|i)?|gg|g|days?|d)\b"#)
+        let hours = durationComponent(in: duration, matching: #"(\d+(?:[,.]\d+)?)\s*(?:h|ore?|hours?)\b"#)
+        let minutes = durationComponent(in: duration, matching: #"(\d+(?:[,.]\d+)?)\s*(?:m|min|mins|minuti?)\b"#)
+        let total = days * 24 + hours + minutes / 60
+        return total > 0 ? total : nil
+    }
+
+    private func durationComponent(in duration: String, matching pattern: String) -> Double {
+        duration
+            .firstRegexCapture(pattern)?
+            .replacingOccurrences(of: ",", with: ".")
+            .nilIfBlank
+            .flatMap(Double.init) ?? 0
     }
 
     private static let managedEventBadgeIds: Set<String> = [
