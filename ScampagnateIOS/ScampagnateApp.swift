@@ -10943,7 +10943,7 @@ struct EventDetailView: View {
                             Button {
                                 presentDirectionsOptions(for: point.location ?? point.name ?? event.displayLocation)
                             } label: {
-                                EventInfoActionRow(icon: "mappin", title: point.name ?? "Ritrovo", subtitle: meetingPointSubtitle(point), tint: Brand.secondary, compactIcon: true)
+                                EventMeetingPointActionRow(point: point, tint: Brand.secondary)
                             }
                             .buttonStyle(.plain)
                         }
@@ -11288,11 +11288,6 @@ struct EventDetailView: View {
         return destination.nilIfBlank?.addingPercentEncoding(withAllowedCharacters: allowedCharacters)
     }
 
-    private func meetingPointSubtitle(_ point: MeetingPoint) -> String {
-        [point.location?.nilIfBlank, point.time.map { String($0.prefix(5)) }]
-            .compactMap { $0 }
-            .joined(separator: " · ")
-    }
 }
 
 struct DetailMetric: Identifiable {
@@ -35833,6 +35828,73 @@ struct EventInfoActionRow: View {
                 }
             }
             Spacer()
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(Brand.mutedForeground)
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+struct EventMeetingPointActionRow: View {
+    let point: MeetingPoint
+    let tint: Color
+
+    private var title: String {
+        point.name?.nilIfBlank ?? "Ritrovo"
+    }
+
+    private var locationText: String {
+        point.location?.nilIfBlank ?? ""
+    }
+
+    private var noteText: String? {
+        point.notes?.nilIfBlank
+    }
+
+    private var timeText: String? {
+        point.time.map { String($0.prefix(5)) }?.nilIfBlank
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "mappin")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 34, height: 34)
+                .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 11))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(.subheadline, design: .rounded, weight: .semibold))
+                    .foregroundStyle(Brand.foreground)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Text(locationText)
+                    .font(.system(.caption, design: .rounded))
+                    .foregroundStyle(Brand.mutedForeground)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                if let noteText {
+                    Text(noteText)
+                        .font(.system(.caption, design: .rounded))
+                        .foregroundStyle(Brand.mutedForeground.opacity(0.92))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: 54, alignment: .leading)
+
+            if let timeText {
+                Text(timeText)
+                    .font(.system(.headline, design: .rounded, weight: .bold))
+                    .foregroundStyle(Brand.foreground)
+                    .monospacedDigit()
+                    .frame(minWidth: 52, alignment: .trailing)
+            }
+
             Image(systemName: "chevron.right")
                 .font(.caption.weight(.bold))
                 .foregroundStyle(Brand.mutedForeground)
