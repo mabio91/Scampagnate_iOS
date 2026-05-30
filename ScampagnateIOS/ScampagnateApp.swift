@@ -4750,8 +4750,7 @@ struct PriceOption: Codable, Identifiable, Hashable {
 
     func showsPromoBadge(now: Date = Date()) -> Bool {
         guard isPromotional == true else { return false }
-        let status = promoStatus(now: now)
-        return status == .active || status == .expired
+        return promoStatus(now: now) == .active
     }
 
     func hasActivePromo(now: Date = Date()) -> Bool {
