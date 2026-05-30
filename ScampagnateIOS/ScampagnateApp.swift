@@ -25,6 +25,7 @@ enum IssueMediaLimits {
 }
 
 enum EventAvailabilityRules {
+    static let warningFillRatio = 0.50
     static let lastSpotsFillRatio = 0.70
 }
 
@@ -4200,6 +4201,15 @@ struct Event: Codable, Identifiable, Hashable {
         let total = spotsTotal ?? 0
         guard total > 0 else { return 0 }
         return min(1, max(0, Double(attendeeSpotsTaken) / Double(total)))
+    }
+    var capacityFillColor: Color {
+        if isSoldOut || capacityFillRatio >= EventAvailabilityRules.lastSpotsFillRatio {
+            return Brand.destructive
+        }
+        if capacityFillRatio >= EventAvailabilityRules.warningFillRatio {
+            return Brand.warning
+        }
+        return Brand.success
     }
     var hasLastSpots: Bool {
         (spotsTotal ?? 0) > 0
@@ -9976,7 +9986,7 @@ struct EventCard: View {
                         GeometryReader { proxy in
                             ZStack(alignment: .leading) {
                                 Capsule().fill(Brand.muted)
-                                Capsule().fill(event.isSoldOut ? Brand.destructive : (event.hasLastSpots ? Brand.destructive : Brand.success))
+                                Capsule().fill(event.capacityFillColor)
                                     .frame(width: proxy.size.width * fillPercent)
                             }
                         }
