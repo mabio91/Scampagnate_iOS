@@ -4157,6 +4157,14 @@ struct Event: Codable, Identifiable, Hashable {
     var hasEquipment: Bool { !equipmentItems.isEmpty }
     var hasEventTopBadge: Bool { featured == true || (eventBadges ?? []).contains("evento_top") }
     var hasActivePromo: Bool { priceOptions.contains { $0.hasActivePromo() } }
+    var manualBadgeTexts: [String] {
+        (eventBadges ?? []).compactMap { badge -> String? in
+            let cleanBadge = badge.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard cleanBadge != "evento_top" else { return nil }
+            return Self.manualEventBadgeLabels[cleanBadge]
+        }
+        .removingDuplicates()
+    }
     var customBadgeText: String? {
         (eventBadges ?? []).compactMap { badge -> String? in
             let cleanBadge = badge.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5775,7 +5783,8 @@ struct OrganizerEventDraft: Equatable {
         ("best_seller", "Best seller"),
         ("consigliato", "Consigliato"),
         ("prezzo_speciale", "Prezzo speciale"),
-        ("early_bird", "Early bird")
+        ("early_bird", "Early bird"),
+        ("pet_friendly", "🐶 Friendly")
     ]
 
     static let cancellationPolicies: [(id: String, label: String, description: String)] = [
@@ -11361,6 +11370,10 @@ struct EventPillsRow: View {
 
             if event.hasEventTopBadge {
                 CompactEventPill(text: "⭐ Evento Top", color: Color(hue: 38.0 / 360.0, saturation: 0.60, brightness: 0.75), foreground: Brand.foreground)
+            }
+
+            ForEach(event.manualBadgeTexts, id: \.self) { badge in
+                CompactEventPill(text: badge, color: Brand.primary.opacity(0.14), foreground: Brand.primary)
             }
 
             if event.price == 0 {
@@ -36514,7 +36527,16 @@ private extension Event {
         "best_seller",
         "consigliato",
         "prezzo_speciale",
-        "early_bird"
+        "early_bird",
+        "pet_friendly"
+    ]
+
+    private static let manualEventBadgeLabels: [String: String] = [
+        "best_seller": "Best seller",
+        "consigliato": "Consigliato",
+        "prezzo_speciale": "Prezzo speciale",
+        "early_bird": "Early bird",
+        "pet_friendly": "🐶 Friendly"
     ]
 }
 
