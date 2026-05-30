@@ -10029,7 +10029,7 @@ struct EventCardPillLabel: View {
 struct EventPromoBadge: View {
     var body: some View {
         EventCardPillLabel(
-            text: "PROMO",
+            text: "Promo",
             color: Brand.destructive.opacity(0.16),
             foreground: Brand.destructive
         )
