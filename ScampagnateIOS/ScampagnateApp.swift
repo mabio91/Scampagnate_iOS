@@ -11316,6 +11316,12 @@ struct EventPillsRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
+            CompactEventPill(text: categoryLabel(event.category), color: Brand.muted, foreground: Brand.mutedForeground)
+
+            if let difficulty = event.difficultyLabel {
+                CompactEventPill(text: difficulty.text, color: difficulty.background, foreground: difficulty.foreground)
+            }
+
             if shouldShowStatusPill {
                 CompactEventPill(text: event.statusStyle.label, color: event.statusStyle.background, foreground: event.statusStyle.foreground)
             }
@@ -11324,15 +11330,9 @@ struct EventPillsRow: View {
                 CompactEventPill(text: "🔥 Ultimi posti", color: Brand.destructive.opacity(0.14), foreground: Brand.destructive)
             }
 
-            if let difficulty = event.difficultyLabel {
-                CompactEventPill(text: difficulty.text, color: difficulty.background, foreground: difficulty.foreground)
-            }
-
             if let customBadge = event.customBadgeText {
                 CompactEventPill(text: customBadge, color: Brand.accent.opacity(0.16), foreground: Brand.accent)
             }
-
-            CompactEventPill(text: categoryLabel(event.category), color: Brand.muted, foreground: Brand.mutedForeground)
 
             if event.hasEventTopBadge {
                 CompactEventPill(text: "⭐ Evento Top", color: Color(hue: 38.0 / 360.0, saturation: 0.60, brightness: 0.75), foreground: Brand.foreground)
