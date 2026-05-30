@@ -36252,6 +36252,7 @@ private extension Event {
     }
 
     var organizerIsPastByDate: Bool {
+        if ["past", "completed"].contains(normalizedStatus) { return true }
         guard let organizerDate else { return false }
         return organizerDate < Calendar.current.startOfDay(for: Date())
     }
@@ -36265,7 +36266,7 @@ private extension Event {
     }
 
     var organizerIsPublishedUpcoming: Bool {
-        !organizerIsPastByDate && !["draft", "cancelled", "archived", "past"].contains(normalizedStatus)
+        !organizerIsPastByDate && !["draft", "cancelled", "archived", "past", "completed"].contains(normalizedStatus)
     }
 
     var organizerIsHistoric: Bool {
