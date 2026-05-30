@@ -10496,10 +10496,7 @@ struct EventDetailView: View {
     }
 
     var attendeeParticipants: [EventParticipant] {
-        participants.filter { participant in
-            guard let organizerId = event?.organizerId else { return participant.isParticipant }
-            return participant.isParticipant && participant.userId != organizerId
-        }
+        participants.filter(\.isParticipant)
     }
 
     var organizerProfile: PublicProfile? {
@@ -12618,10 +12615,7 @@ struct ParticipantsSheet: View {
     }
 
     private var attendeeParticipants: [EventParticipant] {
-        participants.filter { participant in
-            guard let organizerId = event?.organizerId else { return participant.isParticipant }
-            return participant.isParticipant && participant.userId != organizerId
-        }
+        participants.filter(\.isParticipant)
     }
 
     private var attendeeCount: Int {
