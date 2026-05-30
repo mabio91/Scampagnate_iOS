@@ -165,8 +165,7 @@ enum PromoPricing {
     }
 
     static func badgeLabel(end: String?, now: Date = Date()) -> String {
-        guard let countdown = countdownLabel(end: end, now: now) else { return "Promo" }
-        return countdown == "Promo scaduta" ? countdown : "Promo · \(countdown)"
+        countdownLabel(end: end, now: now) ?? "Promo"
     }
 }
 
