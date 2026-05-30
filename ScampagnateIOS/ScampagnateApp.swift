@@ -4157,6 +4157,7 @@ struct Event: Codable, Identifiable, Hashable {
     var staffMembers: [EventStaffMember] { (eventStaff ?? []).sorted { ($0.sortOrder ?? 0) < ($1.sortOrder ?? 0) } }
     var hasEquipment: Bool { !equipmentItems.isEmpty }
     var hasEventTopBadge: Bool { featured == true || (eventBadges ?? []).contains("evento_top") }
+    var hasActivePromo: Bool { priceOptions.contains { $0.hasActivePromo() } }
     var customBadgeText: String? {
         (eventBadges ?? []).compactMap { badge -> String? in
             let cleanBadge = badge.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -9435,10 +9436,18 @@ struct EventCalendarEventRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            RemoteImage(urlString: event.imageUrl)
-                .frame(width: 58, height: 58)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Brand.muted, lineWidth: 1))
+            ZStack(alignment: .topLeading) {
+                RemoteImage(urlString: event.imageUrl)
+                    .frame(width: 58, height: 58)
+                    .saturation(event.isSoldOut ? 0 : 1)
+                if !event.isSoldOut && event.hasActivePromo {
+                    EventPromoBadge(compact: true)
+                        .padding(4)
+                }
+            }
+            .frame(width: 58, height: 58)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(Brand.muted, lineWidth: 1))
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(event.title)
@@ -9821,7 +9830,10 @@ struct FeaturedEventCard: View {
                             .padding(.vertical, 7)
                             .background(.black.opacity(0.50), in: UnevenRoundedRectangle(topLeadingRadius: 20, bottomTrailingRadius: 16))
                         Spacer()
-                        if event.featured == true {
+                        if !event.isSoldOut && event.hasActivePromo {
+                            EventPromoBadge()
+                                .padding(10)
+                        } else if event.featured == true {
                             Text("Evento top")
                                 .font(.caption.weight(.bold))
                                 .foregroundStyle(.white)
@@ -9918,7 +9930,7 @@ struct EventCard: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                ZStack {
+                ZStack(alignment: .topLeading) {
                     RemoteImage(urlString: event.cardImageUrl)
                         .frame(width: 86, height: 86)
                         .clipShape(RoundedRectangle(cornerRadius: 14))
@@ -9926,6 +9938,9 @@ struct EventCard: View {
                     if event.isSoldOut {
                         SoldOutRibbon(fontSize: 8)
                             .clipShape(RoundedRectangle(cornerRadius: 14))
+                    } else if event.hasActivePromo {
+                        EventPromoBadge(compact: true)
+                            .padding(6)
                     }
                 }
                 .frame(width: 86, height: 86)
@@ -10010,6 +10025,23 @@ struct EventCardPillLabel: View {
             .padding(.vertical, 4)
             .background(color, in: Capsule())
             .foregroundStyle(foreground)
+    }
+}
+
+struct EventPromoBadge: View {
+    var compact = false
+
+    var body: some View {
+        Text("PROMO")
+            .font(.system(size: compact ? 7.5 : 10, weight: .black, design: .rounded))
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+            .padding(.horizontal, compact ? 5 : 8)
+            .padding(.vertical, compact ? 3 : 5)
+            .background(Brand.warning.opacity(0.94), in: Capsule())
+            .shadow(color: .black.opacity(0.18), radius: 5, y: 2)
+            .accessibilityLabel("Promo")
     }
 }
 
@@ -10205,6 +10237,15 @@ struct RecommendedEventCard: View {
                     .saturation(event.isSoldOut ? 0 : 1)
                 if event.isSoldOut {
                     SoldOutRibbon(fontSize: 10)
+                } else if event.hasActivePromo {
+                    VStack {
+                        HStack {
+                            EventPromoBadge(compact: true)
+                            Spacer()
+                        }
+                        Spacer()
+                    }
+                    .padding(10)
                 }
                 EventCardPillLabel(text: status.label, color: status.background, foreground: status.foreground)
                     .padding(10)
