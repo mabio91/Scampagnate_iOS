@@ -12,6 +12,8 @@ import MapKit
 import PassKit
 import WebKit
 
+private let instagramHandleHelpText = "Inserisci il tuo username Instagram, cioè la parte dopo la @. Esempio: gruppo_scampagnate."
+
 enum ScampagnateConfig {
     static let supabaseURL = URL(string: "https://istotjnoqtrtthnyreyv.supabase.co")!
     static let publishableKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlzdG90am5vcXRydHRobnlyZXl2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg2ODIxMzMsImV4cCI6MjA5NDI1ODEzM30.GcrdLFBW1oDW9-hQ960eqpOtfGb0k_XsQhT2juFuwWc"
@@ -31768,7 +31770,13 @@ struct ProfileEditSheet: View {
                 ProfileSheetField("Cognome", text: $input.lastName)
             }
             ProfileSheetField("Telefono", text: $input.phone, keyboard: .phonePad)
-            ProfileSheetField("Instagram", placeholder: "@nomeutente", text: $input.instagramHandle, keyboard: .default)
+            ProfileSheetField(
+                "Instagram",
+                placeholder: "gruppo_scampagnate",
+                text: $input.instagramHandle,
+                keyboard: .default,
+                supportingText: instagramHandleHelpText
+            )
             ProfileSheetTextArea("Bio", placeholder: "Parlaci di te...", text: $input.bio)
         }
     }
@@ -32658,13 +32666,15 @@ struct ProfileSheetField: View {
     @Binding var text: String
     let keyboard: UIKeyboardType
     let help: String?
+    let supportingText: String?
 
-    init(_ title: String, placeholder: String? = nil, text: Binding<String>, keyboard: UIKeyboardType = .default, help: String? = nil) {
+    init(_ title: String, placeholder: String? = nil, text: Binding<String>, keyboard: UIKeyboardType = .default, help: String? = nil, supportingText: String? = nil) {
         self.title = title
         self.placeholder = placeholder ?? title
         self._text = text
         self.keyboard = keyboard
         self.help = help
+        self.supportingText = supportingText
     }
 
     var body: some View {
@@ -32684,6 +32694,12 @@ struct ProfileSheetField: View {
                 .frame(height: ProfileSheetFieldStyle.inputHeight)
                 .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius))
                 .overlay(RoundedRectangle(cornerRadius: ProfileSheetFieldStyle.cornerRadius).stroke(Brand.inputBorder, lineWidth: ProfileSheetFieldStyle.inputBorderWidth))
+            if let supportingText {
+                Text(supportingText)
+                    .font(.caption)
+                    .foregroundStyle(Brand.mutedForeground)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -33133,8 +33149,9 @@ struct OnboardingView: View {
 
                 OnboardingTextField(
                     title: "Profilo Instagram",
-                    placeholder: "@nomeutente",
-                    text: $input.instagramHandle
+                    placeholder: "gruppo_scampagnate",
+                    text: $input.instagramHandle,
+                    supportingText: instagramHandleHelpText
                 )
 
                 HStack(alignment: .top, spacing: 12) {
@@ -33661,6 +33678,7 @@ struct OnboardingTextField: View {
     let placeholder: String
     @Binding var text: String
     var keyboard: UIKeyboardType = .default
+    var supportingText: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -33676,6 +33694,12 @@ struct OnboardingTextField: View {
                 .frame(height: 54)
                 .background(Brand.inputBackground, in: RoundedRectangle(cornerRadius: 14))
                 .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.inputBorder, lineWidth: 1))
+            if let supportingText {
+                Text(supportingText)
+                    .font(.caption)
+                    .foregroundStyle(Brand.mutedForeground)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }
