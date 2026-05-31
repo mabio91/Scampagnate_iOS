@@ -3192,7 +3192,7 @@ struct SupabaseAPI {
             eventId = inserted.id
         }
 
-        try await replaceMeetingPoints(eventId: eventId, points: draft.meetingPoints, session: session)
+        try await replaceMeetingPoints(eventId: eventId, points: draft.meetingPointsEnsuringPrimary(), session: session)
         try await replacePriceOptions(eventId: eventId, options: draft.priceOptions, session: session)
         try await replaceSpecialBadges(eventId: eventId, badgeIds: draft.specialBadgeIds, session: session)
         try await replaceEventStaffIfAvailable(eventId: eventId, staff: draft.staffMembers, session: session)
@@ -5393,6 +5393,13 @@ struct OrganizerMeetingPointDraft: Identifiable, Equatable {
 
     init() {}
 
+    init(name: String, location: String, time: String, notes: String = "") {
+        self.name = name
+        self.location = location
+        self.time = time
+        self.notes = notes
+    }
+
     init(point: MeetingPoint, duplicate: Bool = false) {
         serverId = duplicate ? nil : point.id
         name = point.name ?? ""
@@ -5666,6 +5673,9 @@ struct OrganizerEventDraft: Equatable {
     private var originalAdditionalFields: [String: JSONValue] = [:]
     private var originalAccessRules: [String: JSONValue] = [:]
     private var originalCustomBadge = ""
+    private var originalLocation = ""
+    private var originalLocationLabel = ""
+    private var originalTime = ""
     private var preservedEventBadges: [String] = []
 
     init() {}
@@ -5677,6 +5687,9 @@ struct OrganizerEventDraft: Equatable {
         time = duplicate ? "" : String((event.time ?? "09:00").prefix(5))
         location = event.location ?? ""
         locationLabel = event.locationLabel ?? ""
+        originalLocation = event.location ?? ""
+        originalLocationLabel = event.locationLabel ?? ""
+        originalTime = String((event.time ?? "09:00").prefix(5))
         categoryId = event.categoryId ?? event.category?.id ?? ""
         spotsTotal = event.spotsTotal ?? 20
         reservedSpots = duplicate ? 0 : (event.reservedSpots ?? 0)
@@ -5855,6 +5868,58 @@ struct OrganizerEventDraft: Equatable {
         if validOptions.contains(where: { $0.paymentType == "deposit" && ($0.price - $0.depositAmount) <= 0 }) { messages.append("Saldo per le opzioni con acconto") }
         if validOptions.contains(where: { $0.hasDedicatedSpots && $0.dedicatedSpots < 1 }) { messages.append("Posti dedicati per le opzioni con limite attivo") }
         return messages
+    }
+
+    private var primaryMeetingPointName: String {
+        locationLabel.nilIfBlank ?? "Luogo di ritrovo"
+    }
+
+    private var primaryMeetingPointLocation: String {
+        location.nilIfBlank ?? "Da definire"
+    }
+
+    private var primaryMeetingPointTime: String {
+        String((time.nilIfBlank ?? "09:00").prefix(5))
+    }
+
+    private func matchesPrimaryMeetingPoint(_ point: OrganizerMeetingPointDraft, name: String, location: String, time: String) -> Bool {
+        (point.name.nilIfBlank ?? "") == name &&
+        (point.location.nilIfBlank ?? "") == location &&
+        String((point.time.nilIfBlank ?? "09:00").prefix(5)) == String(time.prefix(5))
+    }
+
+    func meetingPointsEnsuringPrimary() -> [OrganizerMeetingPointDraft] {
+        let primaryName = primaryMeetingPointName
+        let primaryLocation = primaryMeetingPointLocation
+        let primaryTime = primaryMeetingPointTime
+        let previousName = originalLocationLabel.nilIfBlank ?? "Luogo di ritrovo"
+        let previousLocation = originalLocation.nilIfBlank
+        let previousTime = originalTime.nilIfBlank.map { String($0.prefix(5)) }
+        var points = meetingPoints
+
+        let existingPrimaryIndex = points.firstIndex { point in
+            if matchesPrimaryMeetingPoint(point, name: primaryName, location: primaryLocation, time: primaryTime) {
+                return true
+            }
+            guard let previousLocation, let previousTime else { return false }
+            return matchesPrimaryMeetingPoint(point, name: previousName, location: previousLocation, time: previousTime)
+        }
+
+        if let existingPrimaryIndex {
+            var primary = points.remove(at: existingPrimaryIndex)
+            primary.name = primaryName
+            primary.location = primaryLocation
+            primary.time = primaryTime
+            points.insert(primary, at: 0)
+        } else {
+            points.insert(OrganizerMeetingPointDraft(
+                name: primaryName,
+                location: primaryLocation,
+                time: primaryTime
+            ), at: 0)
+        }
+
+        return points
     }
 
     func eventPayload(organizerId: String, organizerName: String, includeOrganizerFields: Bool = true, preservedEvent: Event? = nil) -> [String: JSONValue] {
@@ -15106,6 +15171,7 @@ struct RegistrationCheckoutSheet: View {
             }
             .onAppear {
                 promoNow = Date()
+                selectDefaultMeetingPointIfNeeded()
                 selectDefaultPriceOptionIfNeeded()
             }
             .onReceive(Timer.publish(every: 60, on: .main, in: .common).autoconnect()) { now in
@@ -15547,6 +15613,15 @@ struct RegistrationCheckoutSheet: View {
         selectedPriceOptionId = eligiblePriceOptions.first(where: { $0.isBookable(in: event) })?.id
             ?? eligiblePriceOptions.first(where: { $0.canJoinWaitlist(in: event) })?.id
             ?? eligiblePriceOptions.first?.id
+    }
+
+    private func selectDefaultMeetingPointIfNeeded() {
+        if let selectedMeetingPointId, event.meetingPoints.contains(where: { $0.id == selectedMeetingPointId }) {
+            return
+        }
+        if event.meetingPoints.count == 1 {
+            selectedMeetingPointId = event.meetingPoints[0].id
+        }
     }
 
     private var todayLineTitle: String {
@@ -16579,7 +16654,9 @@ struct EditRegistrationDetailsSheet: View {
                 }
             }
             .onAppear {
-                selectedMeetingPointId = registration.meetingPointId ?? registration.meetingPoint?.id ?? ""
+                selectedMeetingPointId = registration.meetingPointId
+                    ?? registration.meetingPoint?.id
+                    ?? (event.meetingPoints.count == 1 ? event.meetingPoints[0].id : "")
                 selectedPriceOptionId = registration.priceOptionId ?? ""
                 carAvailability = registration.carAvailability ?? ""
                 customResponses = registration.additionalResponses ?? [:]
@@ -22332,6 +22409,9 @@ struct OrganizerAddParticipantSheet: View {
             .onAppear {
                 if priceOptionId.isEmpty, let firstOption = priceOptions.first {
                     priceOptionId = firstOption.id
+                }
+                if meetingPointId.isEmpty, meetingPoints.count == 1 {
+                    meetingPointId = meetingPoints[0].id
                 }
             }
         }
