@@ -7772,7 +7772,7 @@ struct RootView: View {
                     OrganizerDashboardView(showAuth: $showAuth, routedRoute: $routedOrganizerDashboardRoute)
                         .tabItem {
                             Label(AppTab.organizer.title, systemImage: AppTab.organizer.systemImage)
-                        }
+                    }
                         .tag(AppTab.organizer)
                 }
 
@@ -22856,7 +22856,6 @@ struct OrganizerEventEditorView: View {
     @State private var pendingGalleryPhotos: [PhotosPickerItem] = []
     @State private var activeImageCrop: OrganizerImageCropDraft?
     @State private var uploadingImages = false
-    @State private var keyboardInset: CGFloat = 0
     @State private var validationMessage: String?
     @State private var showPreview = false
 
@@ -23213,9 +23212,9 @@ struct OrganizerEventEditorView: View {
                             }
                             .buttonStyle(SecondaryButtonStyle())
                         }
-                    }
+                        }
                         .padding(16)
-                        .padding(.bottom, keyboardInset > 0 ? keyboardInset + 16 : 0)
+                        .padding(.bottom, 24)
                         .frame(width: proxy.size.width, alignment: .leading)
                     }
                     .clipped()
@@ -23223,9 +23222,8 @@ struct OrganizerEventEditorView: View {
                 }
             }
         }
-        .ignoresSafeArea(.keyboard, edges: .bottom)
-        .animation(.easeOut(duration: 0.22), value: keyboardInset)
         .roundedInlineNavigationTitle(route.title)
+        .toolbar(.hidden, for: .tabBar)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Button("Anteprima") {
@@ -23254,12 +23252,6 @@ struct OrganizerEventEditorView: View {
             .presentationDetents([.large])
         }
         .task { await load() }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notification in
-            keyboardInset = keyboardHeight(from: notification)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
-            keyboardInset = 0
-        }
         .onChange(of: selectedPhoto) { _, item in
             guard let item else { return }
             Task { await prepareCoverCrop(item) }
@@ -23317,13 +23309,6 @@ struct OrganizerEventEditorView: View {
             values.append(selected)
         }
         return values
-    }
-
-    private func keyboardHeight(from notification: Notification) -> CGFloat {
-        guard let frame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else {
-            return 0
-        }
-        return max(frame.height, 0)
     }
 
     private func load() async {
