@@ -15905,9 +15905,10 @@ struct PromoOptionLabel: View {
             } else {
                 HStack(spacing: 4) {
                     Text("Promo")
-                    Text("•")
-                    Image(systemName: "clock")
-                    Text(text)
+                    HStack(spacing: 0) {
+                        Image(systemName: "clock")
+                        Text(text)
+                    }
                 }
             }
         }
@@ -15947,6 +15948,10 @@ struct CheckoutPriceOptionRow: View {
 
     private var promoIsActive: Bool {
         option.hasActivePromo(now: now)
+    }
+
+    private var selectionStroke: Color {
+        selected && promoIsActive ? Brand.warning : (selected ? Brand.primary.opacity(0.35) : Brand.muted.opacity(0.72))
     }
 
     var body: some View {
@@ -15999,7 +16004,7 @@ struct CheckoutPriceOptionRow: View {
             }
             .padding()
             .background(selected ? Brand.primary.opacity(0.05) : (isDisabled ? Brand.muted.opacity(0.45) : Brand.card), in: RoundedRectangle(cornerRadius: 16))
-            .overlay(RoundedRectangle(cornerRadius: 16).stroke(selected ? Brand.primary.opacity(0.35) : Brand.muted.opacity(0.72), lineWidth: 1.2))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(selectionStroke, lineWidth: 1.2))
         }
         .buttonStyle(.plain)
         .disabled(isDisabled)
