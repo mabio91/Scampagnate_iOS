@@ -167,8 +167,33 @@ enum PromoPricing {
         return "scade tra \(totalMinutes)m"
     }
 
+    static func compactCountdownLabel(end: String?, now: Date = Date()) -> String? {
+        guard let endsAt = boundaryDate(from: end, boundary: .end) else { return nil }
+        let diff = endsAt.timeIntervalSince(now)
+        guard diff > 0 else { return "Promo scaduta" }
+
+        let totalMinutes = max(1, Int(ceil(diff / 60)))
+        if totalMinutes >= 1_440 {
+            let days = totalMinutes / 1_440
+            let hours = (totalMinutes % 1_440) / 60
+            return hours > 0 ? "-\(days)g \(hours)h" : "-\(days)g"
+        }
+
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        if hours > 0 {
+            return minutes > 0 ? "-\(hours)h \(minutes)m" : "-\(hours)h"
+        }
+
+        return "-\(totalMinutes)m"
+    }
+
     static func badgeLabel(end: String?, now: Date = Date()) -> String {
         countdownLabel(end: end, now: now) ?? "Promo"
+    }
+
+    static func compactBadgeLabel(end: String?, now: Date = Date()) -> String {
+        compactCountdownLabel(end: end, now: now) ?? "Promo"
     }
 }
 
@@ -4825,6 +4850,10 @@ struct PriceOption: Codable, Identifiable, Hashable {
 
     func promoBadgeText(now: Date = Date()) -> String {
         PromoPricing.badgeLabel(end: promoEnd, now: now)
+    }
+
+    func promoBadgeCountdownText(now: Date = Date()) -> String {
+        PromoPricing.compactBadgeLabel(end: promoEnd, now: now)
     }
 
     var usesDedicatedSpots: Bool {
@@ -15866,6 +15895,29 @@ struct CheckoutMeetingPointRow: View {
     }
 }
 
+struct PromoOptionLabel: View {
+    let text: String
+
+    var body: some View {
+        Group {
+            if text == "Promo" {
+                Text("Promo")
+            } else {
+                HStack(spacing: 4) {
+                    Text("Promo")
+                    Text("•")
+                    Image(systemName: "clock")
+                    Text(text)
+                }
+            }
+        }
+        .font(.system(size: 10, weight: .bold, design: .rounded))
+        .foregroundStyle(Brand.warning)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(text == "Promo" ? "Promo" : "Promo \(text)")
+    }
+}
+
 struct CheckoutPriceOptionRow: View {
     let option: PriceOption
     let selected: Bool
@@ -15905,20 +15957,17 @@ struct CheckoutPriceOptionRow: View {
                     .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.primary)
 
                 VStack(alignment: .leading, spacing: 5) {
+                    if showsPromoBadge {
+                        PromoOptionLabel(text: option.promoBadgeCountdownText(now: now))
+                    }
+
                     HStack(spacing: 8) {
                         Text(option.displayName)
                             .font(.subheadline.weight(.bold))
                             .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.foreground)
                             .lineLimit(2)
-                        if showsPromoBadge {
-                            Text(option.promoBadgeText(now: now))
-                                .font(.system(size: 10, weight: .bold, design: .rounded))
-                                .foregroundStyle(promoIsActive ? Brand.destructive : Brand.mutedForeground)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 4)
-                                .background((promoIsActive ? Brand.destructive : Brand.mutedForeground).opacity(0.10), in: Capsule())
-                        }
                     }
+
                     if !option.detailText.isEmpty, !showsPromoBadge {
                         Text(option.detailText)
                             .font(.caption.weight(.medium))
@@ -15998,19 +16047,14 @@ struct CheckoutSinglePriceOptionRow: View {
                 .frame(width: 28)
 
             VStack(alignment: .leading, spacing: 5) {
+                if showsPromoBadge {
+                    PromoOptionLabel(text: option.promoBadgeCountdownText(now: now))
+                }
+
                 HStack(spacing: 8) {
                     Text(title)
                         .font(.subheadline.weight(.bold))
                         .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.foreground)
-
-                    if showsPromoBadge {
-                        Text(option.promoBadgeText(now: now))
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                            .foregroundStyle(promoIsActive ? Brand.destructive : Brand.mutedForeground)
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 4)
-                            .background((promoIsActive ? Brand.destructive : Brand.mutedForeground).opacity(0.10), in: Capsule())
-                    }
                 }
 
                 if !isFree {
