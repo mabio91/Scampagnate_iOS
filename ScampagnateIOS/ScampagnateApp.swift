@@ -919,6 +919,24 @@ final class AppStore: ObservableObject {
         pendingPayment = nil
     }
 
+    func clearPendingPayment(sessionId: String? = nil, eventId: String? = nil, registrationId: String? = nil) {
+        guard let pendingPayment else { return }
+        let sessionMatches = sessionId.map { $0 == pendingPayment.sessionId } ?? true
+        let eventMatches = eventId.map { $0 == pendingPayment.eventId } ?? true
+        let registrationMatches = registrationId.map { $0 == pendingPayment.registrationId } ?? true
+        guard sessionMatches && eventMatches && registrationMatches else { return }
+        PendingPayment.clear()
+        self.pendingPayment = nil
+    }
+
+    func handleEventPaymentCancellation(sessionId: String? = nil, eventId: String? = nil, registrationId: String? = nil) async {
+        if sessionId != nil || eventId != nil || registrationId != nil {
+            clearPendingPayment(sessionId: sessionId, eventId: eventId, registrationId: registrationId)
+        }
+        guard let eventId, let registrationId else { return }
+        _ = await cancelRegistrationPriceChange(registrationId: registrationId, eventId: eventId)
+    }
+
     func updateRegistrationDetails(registrationId: String, event: Event, meetingPointId: String?, carAvailability: String?, additionalResponses: [String: String]) async -> Bool {
         do {
             guard event.calendarStartDate.map({ $0 > Date() }) != false else {
@@ -978,6 +996,22 @@ final class AppStore: ObservableObject {
         } catch {
             report(error)
             return nil
+        }
+    }
+
+    @discardableResult
+    func cancelRegistrationPriceChange(registrationId: String, eventId: String) async -> Bool {
+        do {
+            let authSession = try await authenticatedSession()
+            try await api.cancelRegistrationPriceOptionChange(
+                eventId: eventId,
+                registrationId: registrationId,
+                session: authSession
+            )
+            await refreshEventState(session: authSession, participantEventId: eventId)
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -3562,6 +3596,18 @@ struct SupabaseAPI {
             refunded: result.refunded,
             changeRequestId: result.changeRequestId,
             quote: result.quote
+        )
+    }
+
+    func cancelRegistrationPriceOptionChange(eventId: String, registrationId: String, session: AuthSession) async throws {
+        let _: RegistrationChangeFunctionResponse = try await function(
+            name: "change-registration-price-option",
+            body: [
+                "mode": .string("cancel"),
+                "eventId": .string(eventId),
+                "registrationId": .string(registrationId)
+            ],
+            session: session
         )
     }
 
@@ -7933,6 +7979,15 @@ struct RootView: View {
         guard url.scheme == "scampagnate" else { return }
 
         if url.isScampagnatePaymentCancellation {
+            let eventId = url.queryValue(named: "event_id") ?? url.queryValue(named: "eventId")
+            let registrationId = url.queryValue(named: "registration_id") ?? url.queryValue(named: "registrationId")
+            Task {
+                await store.handleEventPaymentCancellation(
+                    sessionId: url.stripeCheckoutSessionId,
+                    eventId: eventId,
+                    registrationId: registrationId
+                )
+            }
             paymentFeedback = AppFeedback(title: "Pagamento annullato", message: "Non è stato addebitato nulla. Puoi riprendere quando vuoi.", icon: "xmark.circle.fill", tone: .warning)
             return
         }
@@ -8416,11 +8471,12 @@ struct PaymentAuthenticationView: View {
     let onComplete: (AppFeedback?) -> Void
     @State private var completed = false
     @State private var isVerifying = false
+    @State private var isCancelling = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
             SafariCheckoutView(url: checkout.url) {
-                finish(AppFeedback(title: "Pagamento annullato", message: "Non è stato addebitato nulla. Puoi riprendere quando vuoi.", icon: "xmark.circle.fill", tone: .warning))
+                handleCancellation()
             }
             .ignoresSafeArea()
 
@@ -8450,7 +8506,7 @@ struct PaymentAuthenticationView: View {
     private func handleCallback(_ url: URL) {
         guard url.scheme == "scampagnate" else { return }
         if url.isScampagnatePaymentCancellation {
-            finish(AppFeedback(title: "Pagamento annullato", message: "Non è stato addebitato nulla. Puoi riprendere quando vuoi.", icon: "xmark.circle.fill", tone: .warning))
+            handleCancellation()
             return
         }
         guard url.host == "payment-success" || url.host == "membership-success" else { return }
@@ -8468,6 +8524,22 @@ struct PaymentAuthenticationView: View {
                 status = await store.verifyMembershipPayment(sessionId: sessionId)
             }
             finish(AppFeedback(paymentStatus: status))
+        }
+    }
+
+    private func handleCancellation() {
+        guard !completed && !isCancelling else { return }
+        isCancelling = true
+        isVerifying = true
+        Task {
+            if checkout.kind == .eventPayment {
+                await store.handleEventPaymentCancellation(
+                    sessionId: checkout.sessionId,
+                    eventId: checkout.eventId,
+                    registrationId: checkout.registrationId
+                )
+            }
+            finish(AppFeedback(title: "Pagamento annullato", message: "Non è stato addebitato nulla. Puoi riprendere quando vuoi.", icon: "xmark.circle.fill", tone: .warning))
         }
     }
 
@@ -16666,8 +16738,10 @@ struct EditRegistrationDetailsSheet: View {
             .fullScreenCover(item: $activeCheckout) { checkout in
                 PaymentAuthenticationView(checkout: checkout) { result in
                     feedback = result
-                    onSaved()
-                    dismiss()
+                    if result?.tone == .success {
+                        onSaved()
+                        dismiss()
+                    }
                 }
             }
             .sheet(item: $feedback) { feedback in
