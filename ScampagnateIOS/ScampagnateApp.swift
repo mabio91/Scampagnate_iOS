@@ -24258,16 +24258,18 @@ private struct OrganizerRichTextEditor: View {
 private struct OrganizerRichTextEditorSheet: View {
     @Binding var html: String
     @Environment(\.dismiss) private var dismiss
-    @State private var draftHTML: String
+    @State private var draftStore: OrganizerRichTextDraftStore
 
     init(html: Binding<String>) {
         self._html = html
-        self._draftHTML = State(initialValue: EventDescriptionHTML.cleanStoredHTML(from: html.wrappedValue))
+        self._draftStore = State(initialValue: OrganizerRichTextDraftStore(html: EventDescriptionHTML.cleanStoredHTML(from: html.wrappedValue)))
     }
 
     var body: some View {
         NavigationStack {
-            OrganizerRichTextTextView(html: $draftHTML)
+            OrganizerRichTextTextView(initialHTML: draftStore.html) { updatedHTML in
+                draftStore.html = updatedHTML
+            }
                 .background(Brand.inputBackground)
                 .navigationTitle("Descrizione")
                 .navigationBarTitleDisplayMode(.inline)
@@ -24279,7 +24281,7 @@ private struct OrganizerRichTextEditorSheet: View {
                     }
                     ToolbarItem(placement: .confirmationAction) {
                         Button("Fine") {
-                            html = EventDescriptionHTML.cleanStoredHTML(from: draftHTML)
+                            html = EventDescriptionHTML.cleanStoredHTML(from: draftStore.html)
                             dismiss()
                         }
                         .fontWeight(.semibold)
@@ -24287,6 +24289,14 @@ private struct OrganizerRichTextEditorSheet: View {
                 }
         }
         .presentationBackground(Brand.background)
+    }
+}
+
+private final class OrganizerRichTextDraftStore {
+    var html: String
+
+    init(html: String) {
+        self.html = html
     }
 }
 
@@ -25045,7 +25055,8 @@ private final class OrganizerRichTextUIKitEditorView: UIView {
 }
 
 private struct OrganizerRichTextTextView: UIViewRepresentable {
-    @Binding var html: String
+    let initialHTML: String
+    let onHTMLChange: (String) -> Void
 
     func makeUIView(context: Context) -> OrganizerRichTextUIKitEditorView {
         let editorView = OrganizerRichTextUIKitEditorView()
@@ -25056,19 +25067,13 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
             coordinator?.pasteFromClipboard(in: textView) ?? false
         }
         context.coordinator.editorView = editorView
-        context.coordinator.apply(html, to: editorView.textView)
+        context.coordinator.apply(initialHTML, to: editorView.textView)
         return editorView
     }
 
     func updateUIView(_ editorView: OrganizerRichTextUIKitEditorView, context: Context) {
-        let cleanHTML = EventDescriptionHTML.cleanStoredHTML(from: html)
         editorView.applyPalette()
-        guard !context.coordinator.isUpdatingFromTextView,
-              context.coordinator.lastSyncedHTML != cleanHTML else {
-            context.coordinator.updateToolbarState(editorView.textView)
-            return
-        }
-        context.coordinator.apply(cleanHTML, to: editorView.textView)
+        context.coordinator.updateToolbarState(editorView.textView)
     }
 
     static func dismantleUIView(_ uiView: OrganizerRichTextUIKitEditorView, coordinator: Coordinator) {
@@ -25078,17 +25083,16 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(html: $html)
+        Coordinator(onHTMLChange: onHTMLChange)
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {
-        @Binding private var html: String
+        private let onHTMLChange: (String) -> Void
         weak var editorView: OrganizerRichTextUIKitEditorView?
         var lastSyncedHTML = ""
-        var isUpdatingFromTextView = false
 
-        init(html: Binding<String>) {
-            self._html = html
+        init(onHTMLChange: @escaping (String) -> Void) {
+            self.onHTMLChange = onHTMLChange
         }
 
         @objc func toolbarButtonTapped(_ sender: UIButton) {
@@ -25185,13 +25189,9 @@ private struct OrganizerRichTextTextView: UIViewRepresentable {
 
         private func syncHTML(from textView: UITextView) {
             let cleanHTML = EventDescriptionHTML.cleanHTML(from: textView.attributedText)
+            guard lastSyncedHTML != cleanHTML else { return }
             lastSyncedHTML = cleanHTML
-            guard html != cleanHTML else { return }
-            isUpdatingFromTextView = true
-            html = cleanHTML
-            DispatchQueue.main.async { [weak self] in
-                self?.isUpdatingFromTextView = false
-            }
+            onHTMLChange(cleanHTML)
         }
 
         private func toggleFontTrait(_ trait: UIFontDescriptor.SymbolicTraits, in textView: UITextView) {
