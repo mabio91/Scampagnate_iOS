@@ -23506,31 +23506,48 @@ private struct OrganizerEventDraftPreviewSheet: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                HStack(alignment: .center, spacing: 12) {
-                    Text("Anteprima evento")
-                        .font(.system(.title3, design: .rounded, weight: .bold))
-                        .foregroundStyle(Brand.foreground)
-                    Spacer(minLength: 12)
-                    Button("Chiudi") {
-                        dismiss()
-                    }
+        VStack(spacing: 0) {
+            previewHeader
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    hero
+                    quickFacts
+                    previewDescription
+                    meetingPoints
+                    equipment
+                    pricing
+                    registrationFields
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .background(Brand.background)
+    }
+
+    private var previewHeader: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Text("Anteprima evento")
+                .font(.system(.title3, design: .rounded, weight: .bold))
+                .foregroundStyle(Brand.foreground)
+            Spacer(minLength: 12)
+            Button {
+                dismiss()
+            } label: {
+                Text("Chiudi")
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(Brand.primary)
-                }
-
-                hero
-                quickFacts
-                previewDescription
-                meetingPoints
-                equipment
-                pricing
-                registrationFields
+                    .padding(.horizontal, 10)
+                    .frame(minHeight: 44)
             }
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+            .accessibilityLabel("Chiudi anteprima evento")
         }
+        .padding(.horizontal, 16)
+        .padding(.top, 16)
+        .padding(.bottom, 10)
         .background(Brand.background)
     }
 
