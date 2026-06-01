@@ -15959,7 +15959,7 @@ struct CheckoutPriceOptionRow: View {
             HStack(alignment: .center, spacing: 12) {
                 Image(systemName: selected ? "largecircle.fill.circle" : "circle")
                     .font(.title3)
-                    .foregroundStyle(isDisabled ? Brand.mutedForeground : Brand.primary)
+                    .foregroundStyle(isDisabled ? Brand.mutedForeground : (promoIsActive ? Brand.warning : Brand.primary))
 
                 VStack(alignment: .leading, spacing: 5) {
                     if showsPromoBadge {
@@ -15999,7 +15999,7 @@ struct CheckoutPriceOptionRow: View {
                     }
                     Text(priceLabel)
                         .font(.headline.weight(.bold))
-                        .foregroundStyle(isDisabled ? Brand.mutedForeground : (promoIsActive ? Brand.success : Brand.primary))
+                        .foregroundStyle(isDisabled ? Brand.mutedForeground : (promoIsActive ? Brand.warning : Brand.primary))
                 }
             }
             .padding()
@@ -16084,7 +16084,7 @@ struct CheckoutSinglePriceOptionRow: View {
                 }
                 Text(priceLabel)
                     .font(.headline.weight(.bold))
-                    .foregroundStyle(isDisabled ? Brand.mutedForeground : (promoIsActive ? Brand.success : Brand.primary))
+                    .foregroundStyle(isDisabled ? Brand.mutedForeground : (promoIsActive ? Brand.warning : Brand.primary))
             }
         }
         .padding()
