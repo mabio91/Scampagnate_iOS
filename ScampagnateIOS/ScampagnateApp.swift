@@ -26133,18 +26133,19 @@ private func euroInputText(_ value: Double) -> String {
 }
 
 struct OrganizerAddressSuggestion: Identifiable, Hashable, Sendable {
-    let id = UUID()
+    let id: String
     let title: String
     let subtitle: String
     let placeId: String?
     let source: Source
 
-    enum Source: Hashable, Sendable {
+    enum Source: String, Hashable, Sendable {
         case google
         case mapKit
     }
 
     init(title: String, subtitle: String, placeId: String? = nil, source: Source) {
+        self.id = placeId ?? "\(source.rawValue):\(title.normalizedSearchKey)|\(subtitle.normalizedSearchKey)"
         self.title = title
         self.subtitle = subtitle
         self.placeId = placeId
@@ -26302,6 +26303,8 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
     private var searchTask: Task<Void, Never>?
     private var latestQuery = ""
     private var googleSessionToken = UUID().uuidString
+    private var googleResults: [OrganizerAddressSuggestion] = []
+    private var mapKitResults: [OrganizerAddressSuggestion] = []
 
     override init() {
         super.init()
@@ -26318,6 +26321,10 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
         }
 
         latestQuery = value
+        googleResults = []
+        mapKitResults = []
+        results = []
+        completer.queryFragment = value
         searchTask?.cancel()
         let sessionToken = googleSessionToken
         searchTask = Task { [weak self] in
@@ -26327,12 +26334,8 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
             let googleResults = await Self.fetchGoogleSuggestions(query: value, sessionToken: sessionToken)
             guard !Task.isCancelled, self.latestQuery == value else { return }
 
-            if googleResults.isEmpty {
-                self.completer.queryFragment = value
-            } else {
-                self.completer.queryFragment = ""
-                self.results = googleResults
-            }
+            self.googleResults = googleResults
+            self.publishMergedResults()
         }
     }
 
@@ -26342,6 +26345,8 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
         latestQuery = ""
         googleSessionToken = UUID().uuidString
         completer.queryFragment = ""
+        googleResults = []
+        mapKitResults = []
         results = []
     }
 
@@ -26350,14 +26355,38 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
             OrganizerAddressSuggestion(title: $0.title, subtitle: $0.subtitle, source: .mapKit)
         }
         Task { @MainActor [weak self] in
-            self?.results = suggestions
+            guard let self, !self.latestQuery.isEmpty else { return }
+            self.mapKitResults = suggestions
+            self.publishMergedResults()
         }
     }
 
     nonisolated func completer(_ completer: MKLocalSearchCompleter, didFailWithError error: Error) {
         Task { @MainActor [weak self] in
-            self?.results = []
+            guard let self else { return }
+            self.mapKitResults = []
+            self.publishMergedResults()
         }
+    }
+
+    private func publishMergedResults() {
+        guard !latestQuery.isEmpty else {
+            results = []
+            return
+        }
+        results = Self.dedupedSuggestions(googleResults + mapKitResults)
+    }
+
+    private static func dedupedSuggestions(_ suggestions: [OrganizerAddressSuggestion]) -> [OrganizerAddressSuggestion] {
+        var seen = Set<String>()
+        var deduped: [OrganizerAddressSuggestion] = []
+        for suggestion in suggestions {
+            let key = suggestion.query.normalizedSearchKey
+            guard !key.isEmpty, seen.insert(key).inserted else { continue }
+            deduped.append(suggestion)
+            if deduped.count == 6 { break }
+        }
+        return deduped
     }
 
     func resolve(_ suggestion: OrganizerAddressSuggestion) async -> OrganizerAddressSelection {
@@ -37124,6 +37153,12 @@ private extension String {
         folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "it_IT"))
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
+    }
+
+    var normalizedSearchKey: String {
+        normalizedSearchText
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"[^\p{L}\p{N} ]+"#, with: "", options: .regularExpression)
     }
 
     var sanitizedStorageFileName: String {
