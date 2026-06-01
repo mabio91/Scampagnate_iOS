@@ -1267,6 +1267,17 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func fetchOrganizerDashboardRegistrations(eventIds: [String], reportingErrors: Bool = true) async -> [OrganizerRegistration] {
+        guard !eventIds.isEmpty else { return [] }
+        do {
+            let authSession = try await authenticatedSession()
+            return try await api.fetchOrganizerDashboardRegistrations(eventIds: eventIds, session: authSession)
+        } catch {
+            report(error, when: reportingErrors)
+            return []
+        }
+    }
+
     func fetchParticipantRegistrationHistory(userIds: [String], reportingErrors: Bool = true) async -> [ParticipantRegistrationHistoryRow] {
         do {
             let authSession = try await authenticatedSession()
@@ -2325,6 +2336,7 @@ struct SupabaseAPI {
     private static let eventSelect = "id,title,date,time,location,location_label,category_id,status,price,deposit,payment_type,balance_payment_mode,image_url,difficulty,distance,elevation,duration,spots_total,spots_taken,reserved_spots,featured,event_badges,organizer_id,organizer_name,description,cancellation_policy,equipment_list,additional_fields,visibility,gallery_images,access_rules,event_categories(id,name,icon),event_meeting_points(id,name,location,time,notes),event_price_options(\(priceOptionSelect))"
     private static let registrationSelect = "*,events(\(eventSelect)),meeting_point:event_meeting_points(id,name,location,time)"
     private static let organizerRegistrationSelect = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,sport_level,amount_paid,refund_amount,last_balance_reminder_sent_at,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,instagram_handle,avatar_url,total_points,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade,interests,birth_date,health_safety_status,health_safety_notes,emergency_medication_has,emergency_medication_notes,health_safety_help_notes),price_option:event_price_options(\(priceOptionSelect))"
+    private static let organizerDashboardRegistrationSelect = "id,event_id,status,payment_status,checked_in,created_at,sport_level"
     private static let nonManualRegistrationFilter = "&or=(sport_level.is.null,sport_level.not.like.manual:%25)"
 
     private let decoder: JSONDecoder = {
@@ -2739,6 +2751,24 @@ struct SupabaseAPI {
         let ids = eventIds.map(\.urlEncoded).joined(separator: ",")
         let path = "/rest/v1/event_registrations?select=\(select.urlEncoded)&event_id=in.(\(ids))&order=created_at.asc"
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [OrganizerRegistration].self)
+    }
+
+    func fetchOrganizerDashboardRegistrations(eventIds: [String], session: AuthSession) async throws -> [OrganizerRegistration] {
+        let uniqueIds = Array(Set(eventIds.compactMap(\.nilIfBlank))).sorted()
+        guard !uniqueIds.isEmpty else { return [] }
+
+        var registrations: [OrganizerRegistration] = []
+        for chunk in uniqueIds.chunked(maxSize: 25) {
+            let ids = chunk.map(\.urlEncoded).joined(separator: ",")
+            let select = Self.organizerDashboardRegistrationSelect
+            let path = "/rest/v1/event_registrations?select=\(select.urlEncoded)&event_id=in.(\(ids))&order=created_at.asc"
+            let rows = try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [OrganizerRegistration].self)
+            registrations.append(contentsOf: rows)
+        }
+
+        return registrations.sorted {
+            ($0.createdAt ?? "") < ($1.createdAt ?? "")
+        }
     }
 
     func fetchParticipantRegistrationHistory(userIds: [String], session: AuthSession) async throws -> [ParticipantRegistrationHistoryRow] {
@@ -17189,6 +17219,14 @@ struct OrganizerDashboardView: View {
         store.organizerEvents.reduce(0) { $0 + ($1.spotsTaken ?? 0) }
     }
 
+    private var dashboardLoadKey: String {
+        [
+            store.session?.user.id ?? "anonymous",
+            store.isOrganizer ? "organizer" : "not-organizer",
+            store.isAdmin ? "admin" : "scoped"
+        ].joined(separator: "|")
+    }
+
     private var dashboardPastStats: [OrganizerDashboardPastEventStat] {
         OrganizerDashboardPastEventStat.stats(events: pastEvents, registrations: dashboardRegistrations)
     }
@@ -17302,7 +17340,8 @@ struct OrganizerDashboardView: View {
             } message: {
                 Text("L'evento verra eliminato definitivamente insieme ai dati gestionali collegati. Operazione non reversibile.")
             }
-            .task {
+            .task(id: dashboardLoadKey) {
+                guard store.isOrganizer else { return }
                 await loadDashboardData(reportingErrors: false)
                 openRoutedRouteIfNeeded()
             }
@@ -17339,7 +17378,7 @@ struct OrganizerDashboardView: View {
             return
         }
         loadingDashboardRegistrations = true
-        dashboardRegistrations = await store.fetchOrganizerRegistrations(eventIds: ids, reportingErrors: reportingErrors)
+        dashboardRegistrations = await store.fetchOrganizerDashboardRegistrations(eventIds: ids, reportingErrors: reportingErrors)
         loadingDashboardRegistrations = false
     }
 
@@ -37485,6 +37524,15 @@ private extension Array where Element: Hashable {
     func removingDuplicates() -> [Element] {
         var seen = Set<Element>()
         return filter { seen.insert($0).inserted }
+    }
+}
+
+private extension Array {
+    func chunked(maxSize: Int) -> [[Element]] {
+        guard maxSize > 0 else { return [self] }
+        return stride(from: 0, to: count, by: maxSize).map {
+            Array(self[$0..<Swift.min($0 + maxSize, count)])
+        }
     }
 }
 
