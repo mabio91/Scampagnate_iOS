@@ -10218,7 +10218,7 @@ struct EventPromoBadge: View {
         EventCardPillLabel(
             text: "Promo",
             color: Brand.destructive.opacity(0.16),
-            foreground: Brand.destructive
+            foreground: .white
         )
             .accessibilityLabel("Promo")
     }
