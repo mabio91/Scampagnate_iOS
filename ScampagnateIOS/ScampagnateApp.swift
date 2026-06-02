@@ -22211,7 +22211,7 @@ struct OrganizerParticipantRow: View {
         }
 
         if !specialRequests.isEmpty {
-            chips.append(.init(text: "Richiesta speciale", icon: "exclamationmark.bubble.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
+            chips.append(.init(text: "Rich. speciale", icon: "exclamationmark.bubble.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
         }
         return chips
     }
