@@ -3394,7 +3394,7 @@ struct SupabaseAPI {
             let resolvedBalance = max(0, resolvedPrice - option.depositAmount)
             let payload: [String: JSONValue] = [
                 "event_id": JSONValue.string(eventId),
-                "name": .string(option.name.nilIfBlank ?? "Formula \(index + 1)"),
+                "name": .string(option.name.nilIfBlank ?? ""),
                 "price": .number(resolvedPrice),
                 "sort_order": .number(Double(index)),
                 "eligible_group": .string(eligibleGroup),
@@ -4885,7 +4885,7 @@ struct PriceOption: Codable, Identifiable, Hashable {
     let waitlistEnabled: Bool?
 
     var displayName: String {
-        name?.nilIfBlank ?? "Formula"
+        name?.priceOptionDisplayName ?? "Partecipazione evento"
     }
 
     var detailText: String {
@@ -5033,10 +5033,7 @@ struct PriceOption: Codable, Identifiable, Hashable {
     }
 
     func checkoutSingleOptionTitle() -> String {
-        guard let cleanName = name?.nilIfBlank else { return "Partecipazione evento" }
-        return cleanName.range(of: #"^formula\s+\d+$"#, options: [.regularExpression, .caseInsensitive]) == nil
-            ? cleanName
-            : "Partecipazione evento"
+        displayName
     }
 
     func isCurrentlyAvailable(now: Date = Date()) -> Bool {
@@ -5983,12 +5980,12 @@ struct OrganizerEventDraft: Equatable {
         exclusivityLabel = event.accessRules?.string(at: "exclusivity_label") ?? ""
         restrictionMessage = event.accessRules?.string(at: "restriction_message") ?? ""
         self.meetingPoints = meetingPoints.map { OrganizerMeetingPointDraft(point: $0, duplicate: duplicate) }
-        let mappedPriceOptions = priceOptions.enumerated().map { index, option in
+        let mappedPriceOptions = priceOptions.map { option in
             var draft = OrganizerPriceOptionDraft(option: option)
             if duplicate {
                 draft.serverId = nil
             }
-            if draft.name.trimmingCharacters(in: .whitespacesAndNewlines) == "Formula \(index + 1)" {
+            if draft.name.isGeneratedPriceOptionName {
                 draft.name = ""
             }
             return draft
@@ -23826,9 +23823,9 @@ private struct OrganizerEventDraftPreviewSheet: View {
     private var pricing: some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionTitle("Formule")
-            ForEach(Array(draft.priceOptions.enumerated()), id: \.element.id) { index, option in
+            ForEach(draft.priceOptions) { option in
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(option.name.nilIfBlank ?? "Formula \(index + 1)")
+                    Text(option.name.priceOptionDisplayName)
                         .font(.subheadline.weight(.bold))
                         .foregroundStyle(Brand.foreground)
                     Text(paymentSummary(for: option))
@@ -37262,6 +37259,18 @@ private extension String {
     var nilIfBlank: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    var isGeneratedPriceOptionName: Bool {
+        trimmingCharacters(in: .whitespacesAndNewlines)
+            .range(of: #"^formula(?:\s+\d+)?$"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    var priceOptionDisplayName: String {
+        guard let cleanName = nilIfBlank, !cleanName.isGeneratedPriceOptionName else {
+            return "Partecipazione evento"
+        }
+        return cleanName
     }
 
     var normalizedSearchText: String {
