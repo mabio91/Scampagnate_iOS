@@ -5435,6 +5435,11 @@ struct SpecialRequestAnswer: Identifiable, Hashable {
     var id: String { "\(label)|\(response)" }
 }
 
+struct ParticipantPaymentBadgeInfo: Hashable {
+    let label: String
+    let needsAttention: Bool
+}
+
 struct OrganizerRegistration: Codable, Identifiable, Hashable {
     let id: String
     let eventId: String?
@@ -5520,15 +5525,53 @@ struct OrganizerRegistration: Codable, Identifiable, Hashable {
         return Brand.primary
     }
 
-    func webParticipantPaymentLabel(for event: Event) -> String? {
-        guard let payment = paymentStatus?.nilIfBlank, payment != "not_required" else { return nil }
-        if normalizedStatus == "deposit_paid" || payment == "deposit_paid" {
-            let balanceMode = priceOption?.effectiveBalancePaymentMode(fallback: event) ?? event.balancePaymentMode ?? "online"
-            return balanceMode == "on_site"
-                ? "Iscritto - Acconto pagato"
-                : "Iscritto - Da saldare"
+    func participantPaymentBadge(for event: Event) -> ParticipantPaymentBadgeInfo {
+        let payment = paymentStatus?.nilIfBlank?.lowercased()
+        let type = priceOption?.effectivePaymentType(fallback: event)
+            ?? event.paymentType?.nilIfBlank
+            ?? ((event.price ?? 0) > 0 ? "paid" : "free")
+        let totalPrice = priceOption?.totalPrice(fallback: event) ?? event.price ?? 0
+
+        if payment == "paid" || normalizedStatus == "paid" {
+            return ParticipantPaymentBadgeInfo(label: "Pagato", needsAttention: false)
         }
-        return payment
+
+        if type == "free" || totalPrice <= 0 {
+            return ParticipantPaymentBadgeInfo(label: "Gratis", needsAttention: false)
+        }
+
+        if payment == "not_required" {
+            return ParticipantPaymentBadgeInfo(label: "Non richiesto", needsAttention: false)
+        }
+
+        if payment == "deposit_paid" || normalizedStatus == "deposit_paid" {
+            let balanceMode = priceOption?.effectiveBalancePaymentMode(fallback: event) ?? event.balancePaymentMode ?? "online"
+            let balanceAmount = priceOption?.effectiveBalanceAmount(fallback: event) ?? max(0, (event.price ?? 0) - (event.deposit ?? 0))
+
+            if balanceMode == "on_site" {
+                return ParticipantPaymentBadgeInfo(label: "Saldo sul posto", needsAttention: false)
+            }
+
+            return balanceAmount > 0
+                ? ParticipantPaymentBadgeInfo(label: "Da saldare", needsAttention: true)
+                : ParticipantPaymentBadgeInfo(label: "Pagato", needsAttention: false)
+        }
+
+        if payment == "pay_on_location" || type == "location" {
+            return ParticipantPaymentBadgeInfo(label: "Sul posto", needsAttention: true)
+        }
+
+        if payment == "pending" || normalizedStatus == "pending_payment" {
+            return ParticipantPaymentBadgeInfo(label: "In attesa pagamento", needsAttention: true)
+        }
+
+        if payment == "failed" {
+            return ParticipantPaymentBadgeInfo(label: "Pagamento fallito", needsAttention: true)
+        }
+
+        return type == "paid" || type == "deposit"
+            ? ParticipantPaymentBadgeInfo(label: "In attesa pagamento", needsAttention: true)
+            : ParticipantPaymentBadgeInfo(label: "Non richiesto", needsAttention: false)
     }
 }
 
@@ -22155,64 +22198,22 @@ struct OrganizerParticipantRow: View {
     private var participantChips: [OrganizerParticipantChipModel] {
         var chips: [OrganizerParticipantChipModel] = []
         let specialRequests = registration.specialRequestAnswers(for: event)
-        if registration.isManual {
-            chips.append(.init(text: "(manual)", icon: "person.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
-            if !specialRequests.isEmpty {
-                chips.append(.init(text: "Richiesta speciale", icon: "exclamationmark.bubble.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
-            }
-            return chips
-        }
-        if let level = registration.profiles?.selfLevel?.nilIfBlank {
-            chips.append(.init(text: level, icon: selfLevelIcon(level), tint: selfLevelColor(level), fill: selfLevelColor(level).opacity(0.12)))
-        }
-        if let trekking = registration.profiles?.trekkingExperience?.nilIfBlank {
-            chips.append(.init(text: "\(trekking.webTrekkingValue) trek", icon: "mountain.2.fill", tint: Brand.mutedForeground, fill: Brand.muted.opacity(0.85)))
-        }
-        if let frequency = registration.profiles?.activityFrequency?.nilIfBlank {
-            chips.append(.init(text: frequency, icon: activityFrequencyIcon(frequency), tint: Brand.mutedForeground, fill: Brand.muted.opacity(0.85)))
-        }
-        if let grade = registration.profiles?.experienceGrade {
-            chips.append(.init(text: "Grade: \(grade)", icon: "chart.bar.fill", tint: Brand.secondary, fill: Brand.secondary.opacity(0.12)))
-        }
+
+        let levelValue = registration.isManual ? "-" : registration.profiles?.experienceGrade.map(String.init) ?? "-"
+        chips.append(.init(text: "Livello (1/5): \(levelValue)", icon: "chart.bar.fill", tint: Brand.mutedForeground, fill: Brand.muted.opacity(0.85)))
+
+        let paymentBadge = registration.participantPaymentBadge(for: event)
+        let paymentTint = paymentBadge.needsAttention ? Brand.warning : Brand.success
+        chips.append(.init(text: paymentBadge.label, icon: "creditcard", tint: paymentTint, fill: paymentTint.opacity(0.12)))
+
         if registration.profiles?.healthSafetyStatus == "has_info" {
-            chips.append(.init(text: "Salute: da leggere", icon: "cross.case.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
-        } else if registration.profiles?.healthSafetyStatus == "none" {
-            chips.append(.init(text: "Salute: ok", icon: "checkmark.shield.fill", tint: Brand.success, fill: Brand.success.opacity(0.12)))
+            chips.append(.init(text: "Salute", icon: "cross.case.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
         }
+
         if !specialRequests.isEmpty {
             chips.append(.init(text: "Richiesta speciale", icon: "exclamationmark.bubble.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
         }
-        if let sportLevel = registration.sportLevel?.nilIfBlank, !sportLevel.hasPrefix("manual:") {
-            chips.append(.init(text: "Level: \(sportLevel)", icon: "figure.hiking", tint: Brand.primary, fill: Brand.primary.opacity(0.10)))
-        }
-        if let payment = registration.webParticipantPaymentLabel(for: event) {
-            let isPaid = registration.paymentStatus == "paid" || registration.normalizedStatus == "paid"
-            chips.append(.init(text: payment, icon: "creditcard", tint: isPaid ? Brand.success : Brand.warning, fill: (isPaid ? Brand.success : Brand.warning).opacity(0.12)))
-        }
         return chips
-    }
-
-    private func selfLevelIcon(_ value: String) -> String {
-        switch value {
-        case "advanced": return "bolt.fill"
-        case "intermediate": return "figure.hiking"
-        default: return "leaf.fill"
-        }
-    }
-
-    private func selfLevelColor(_ value: String) -> Color {
-        switch value {
-        case "advanced": return Brand.success
-        case "intermediate": return Brand.primary
-        default: return Brand.warning
-        }
-    }
-
-    private func activityFrequencyIcon(_ value: String) -> String {
-        switch value {
-        case "high", ">2/week": return "bolt.fill"
-        default: return "face.smiling"
-        }
     }
 }
 
@@ -37348,28 +37349,28 @@ private extension String {
 
     var webRegistrationStatusLabel: String {
         switch self {
-        case "registered": return "Registered"
-        case "deposit_paid": return "Deposit Paid"
-        case "paid": return "Paid"
-        case "attended": return "Attended"
+        case "registered": return "Iscritto"
+        case "deposit_paid": return "Acconto pagato"
+        case "paid": return "Pagato"
+        case "attended": return "Presente"
         case "no_show": return "No-show"
-        case "pending_payment": return "Pending Payment"
-        case "pending_approval": return "Pending Approval"
+        case "pending_payment": return "Pagamento in sospeso"
+        case "pending_approval": return "In attesa di approvazione"
         case "waitlist": return "Waitlist"
-        case "cancelled": return "Cancel"
-        default: return self
+        case "cancelled": return "Cancellato"
+        default: return replacingOccurrences(of: "_", with: " ").capitalized
         }
     }
 
     var webPaymentStatusLabel: String {
         switch self {
-        case "deposit_paid": return "Deposit Paid"
-        case "paid": return "Paid"
-        case "pending": return "Pending"
-        case "pay_on_location": return "Pay on location"
-        case "not_required": return "Not Required"
-        case "failed": return "Failed"
-        default: return self
+        case "deposit_paid": return "Acconto pagato"
+        case "paid": return "Pagato"
+        case "pending": return "In sospeso"
+        case "pay_on_location": return "Sul posto"
+        case "not_required": return "Non richiesto"
+        case "failed": return "Fallito"
+        default: return replacingOccurrences(of: "_", with: " ").capitalized
         }
     }
 
