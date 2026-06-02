@@ -7895,7 +7895,7 @@ struct RootView: View {
                     .tag(AppTab.profile)
             }
             .tint(Brand.primary)
-            .nativeTabBarStableLayout()
+            .nativeTabBarMinimizeOnScroll()
             .safeAreaPadding(.top, AppChrome.topSafeAreaClearance)
         }
         .background(KeyboardDismissOnTapView())
@@ -8361,11 +8361,9 @@ enum AppTab: CaseIterable, Hashable {
 
 private extension View {
     @ViewBuilder
-    func nativeTabBarStableLayout() -> some View {
+    func nativeTabBarMinimizeOnScroll() -> some View {
         if #available(iOS 26, *) {
-            // Detail screens hide the native tab bar and anchor CTA bars to the bottom safe area.
-            // Keeping the tab bar from minimizing avoids stale floating tab-bar insets on push/pop.
-            self.tabBarMinimizeBehavior(.never)
+            self.tabBarMinimizeBehavior(.onScrollDown)
         } else {
             self
         }
