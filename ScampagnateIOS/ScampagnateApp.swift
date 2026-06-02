@@ -2385,7 +2385,7 @@ struct SupabaseAPI {
     private static let priceOptionSelect = "id,name,price,sort_order,original_price,eligible_group,is_promotional,promo_start,promo_end,payment_type,deposit_amount,balance_amount,balance_payment_mode,has_dedicated_spots,dedicated_spots,spots_taken,waitlist_enabled"
     private static let eventSelect = "id,title,date,time,location,location_label,category_id,status,price,deposit,payment_type,balance_payment_mode,image_url,difficulty,distance,elevation,duration,spots_total,spots_taken,reserved_spots,featured,event_badges,organizer_id,organizer_name,description,cancellation_policy,equipment_list,additional_fields,visibility,gallery_images,access_rules,event_categories(id,name,icon),event_meeting_points(id,name,location,time,notes),event_price_options(\(priceOptionSelect))"
     private static let registrationSelect = "*,events(\(eventSelect)),meeting_point:event_meeting_points(id,name,location,time)"
-    private static let organizerRegistrationSelect = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,sport_level,amount_paid,refund_amount,last_balance_reminder_sent_at,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,instagram_handle,avatar_url,total_points,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade,interests,birth_date,health_safety_status,health_safety_notes,emergency_medication_has,emergency_medication_notes,health_safety_help_notes),price_option:event_price_options(\(priceOptionSelect))"
+    private static let organizerRegistrationSelect = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,sport_level,amount_paid,refund_amount,last_balance_reminder_sent_at,additional_responses,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,instagram_handle,avatar_url,total_points,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade,interests,birth_date,health_safety_status,health_safety_notes,emergency_medication_has,emergency_medication_notes,health_safety_help_notes),price_option:event_price_options(\(priceOptionSelect))"
     private static let organizerDashboardRegistrationSelect = "id,event_id,status,payment_status,checked_in,created_at,sport_level"
     private static let nonManualRegistrationFilter = "&or=(sport_level.is.null,sport_level.not.like.manual:%25)"
 
@@ -5428,6 +5428,13 @@ struct ParticipantRegistrationHistoryRow: Codable, Hashable {
     }
 }
 
+struct SpecialRequestAnswer: Identifiable, Hashable {
+    let label: String
+    let response: String
+
+    var id: String { "\(label)|\(response)" }
+}
+
 struct OrganizerRegistration: Codable, Identifiable, Hashable {
     let id: String
     let eventId: String?
@@ -5441,6 +5448,7 @@ struct OrganizerRegistration: Codable, Identifiable, Hashable {
     let amountPaid: Double?
     let refundAmount: Double?
     let lastBalanceReminderSentAt: String?
+    let additionalResponses: [String: String]?
     let profiles: OrganizerParticipantProfile?
     let priceOption: PriceOption?
 
@@ -5463,6 +5471,30 @@ struct OrganizerRegistration: Codable, Identifiable, Hashable {
 
     var displayName: String {
         manualName ?? profiles?.displayName ?? "Partecipante"
+    }
+
+    func specialRequestAnswers(for event: Event) -> [SpecialRequestAnswer] {
+        guard let additionalResponses else { return [] }
+
+        var usedLabels = Set<String>()
+        var answers: [SpecialRequestAnswer] = []
+        let fieldLabels = event.checkoutCustomFields.compactMap { $0.label.nilIfBlank }
+
+        for label in fieldLabels {
+            guard let response = additionalResponses[label]?.nilIfBlank else { continue }
+            usedLabels.insert(label)
+            answers.append(SpecialRequestAnswer(label: label, response: response))
+        }
+
+        for key in additionalResponses.keys.sorted(by: { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }) {
+            guard usedLabels.insert(key).inserted,
+                  let label = key.nilIfBlank,
+                  let response = additionalResponses[key]?.nilIfBlank
+            else { continue }
+            answers.append(SpecialRequestAnswer(label: label, response: response))
+        }
+
+        return answers
     }
 
     var isActive: Bool {
@@ -13293,6 +13325,10 @@ struct OrganizerParticipantProfileSheet: View {
         history.filter(\.isCompleted).count
     }
 
+    private var specialRequestAnswers: [SpecialRequestAnswer] {
+        registration.specialRequestAnswers(for: event)
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -13453,6 +13489,9 @@ struct OrganizerParticipantProfileSheet: View {
                 OrganizerParticipantProfileInfoTile(icon: "creditcard", title: "Pagamento", value: payment.webPaymentStatusLabel)
             }
             OrganizerParticipantProfileInfoTile(icon: "checkmark.circle", title: "Check-in", value: registration.checkedIn == true ? "Si" : "No")
+            if !specialRequestAnswers.isEmpty {
+                OrganizerParticipantSpecialRequestsBox(answers: specialRequestAnswers)
+            }
         }
     }
 }
@@ -13509,6 +13548,36 @@ private struct OrganizerParticipantHealthText: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.top, 4)
+    }
+}
+
+private struct OrganizerParticipantSpecialRequestsBox: View {
+    let answers: [SpecialRequestAnswer]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(answers.enumerated()), id: \.element.id) { index, answer in
+                VStack(alignment: .leading, spacing: 4) {
+                    if index > 0 {
+                        Divider()
+                            .background(Brand.warning.opacity(0.22))
+                            .padding(.bottom, 6)
+                    }
+                    Text(answer.label)
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(answer.response)
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Brand.warning.opacity(0.10), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.warning.opacity(0.28), lineWidth: 1))
     }
 }
 
@@ -22085,8 +22154,12 @@ struct OrganizerParticipantRow: View {
 
     private var participantChips: [OrganizerParticipantChipModel] {
         var chips: [OrganizerParticipantChipModel] = []
+        let specialRequests = registration.specialRequestAnswers(for: event)
         if registration.isManual {
             chips.append(.init(text: "(manual)", icon: "person.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
+            if !specialRequests.isEmpty {
+                chips.append(.init(text: "Richiesta speciale", icon: "exclamationmark.bubble.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
+            }
             return chips
         }
         if let level = registration.profiles?.selfLevel?.nilIfBlank {
@@ -22105,6 +22178,9 @@ struct OrganizerParticipantRow: View {
             chips.append(.init(text: "Salute: da leggere", icon: "cross.case.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
         } else if registration.profiles?.healthSafetyStatus == "none" {
             chips.append(.init(text: "Salute: ok", icon: "checkmark.shield.fill", tint: Brand.success, fill: Brand.success.opacity(0.12)))
+        }
+        if !specialRequests.isEmpty {
+            chips.append(.init(text: "Richiesta speciale", icon: "exclamationmark.bubble.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
         }
         if let sportLevel = registration.sportLevel?.nilIfBlank, !sportLevel.hasPrefix("manual:") {
             chips.append(.init(text: "Level: \(sportLevel)", icon: "figure.hiking", tint: Brand.primary, fill: Brand.primary.opacity(0.10)))
