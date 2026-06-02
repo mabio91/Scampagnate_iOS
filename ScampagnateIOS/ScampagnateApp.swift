@@ -22200,7 +22200,7 @@ struct OrganizerParticipantRow: View {
         let specialRequests = registration.specialRequestAnswers(for: event)
 
         let levelValue = registration.isManual ? "-" : registration.profiles?.experienceGrade.map(String.init) ?? "-"
-        chips.append(.init(text: "Livello (1/5): \(levelValue)", icon: "chart.bar.fill", tint: Brand.mutedForeground, fill: Brand.muted.opacity(0.85)))
+        chips.append(.init(text: "Liv. (1/5): \(levelValue)", icon: "chart.bar.fill", tint: Brand.mutedForeground, fill: Brand.muted.opacity(0.85)))
 
         let paymentBadge = registration.participantPaymentBadge(for: event)
         let paymentTint = paymentBadge.needsAttention ? Brand.warning : Brand.success
