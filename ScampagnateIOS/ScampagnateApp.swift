@@ -17495,12 +17495,12 @@ struct OrganizerDashboardAnalytics: View {
             OrganizerAnalyticsBreakdownItem(label: "Cancellati", value: totalCancelled, color: Brand.warning)
         ].filter { $0.value > 0 }
     }
-    private var participationItems: [OrganizerAnalyticsComparisonItem] {
+    private var capacityItems: [OrganizerAnalyticsComparisonItem] {
         pastStats.prefix(10).map {
             OrganizerAnalyticsComparisonItem(
                 label: $0.event.title,
                 firstValue: $0.registered,
-                secondValue: $0.checkedIn
+                secondValue: $0.spotsTotal
             )
         }
     }
@@ -17572,14 +17572,14 @@ struct OrganizerDashboardAnalytics: View {
                     }
                 }
 
-                if participationItems.count > 1 {
-                    OrganizerAnalyticsPanel(title: "Partecipazione per evento", systemImage: "chart.bar.xaxis", subtitle: "Iscritti e presenti sui passati") {
+                if capacityItems.count > 1 {
+                    OrganizerAnalyticsPanel(title: "Partecipazione per evento", systemImage: "chart.bar.xaxis", subtitle: "Iscritti e posti max sui passati") {
                         OrganizerAnalyticsComparisonBars(
-                            items: participationItems,
+                            items: capacityItems,
                             firstLabel: "Iscritti",
-                            secondLabel: "Presenti",
+                            secondLabel: "Posti max",
                             firstColor: Brand.primary,
-                            secondColor: Brand.success
+                            secondColor: Brand.secondary
                         )
                     }
                 }
