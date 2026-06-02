@@ -310,6 +310,8 @@ final class AppStore: ObservableObject {
     @Published var communityLevels: [CommunityLevelDefinition] = []
     @Published var roles: Set<AppRole> = []
     @Published var organizerEvents: [Event] = []
+    @Published var organizerDashboardRegistrations: [OrganizerDashboardRegistration] = []
+    @Published var isLoadingOrganizerDashboard = false
     @Published var isLoading = false
     @Published var errorMessage: String?
     @Published var pendingPayment: PendingPayment?
@@ -406,6 +408,7 @@ final class AppStore: ObservableObject {
             do { roles = Set(try await rolesTask) } catch { remember(error, in: &firstError) }
 
             report(firstError, when: reportingErrors)
+            await loadOrganizerDashboardIfAvailable(session: authSession, reportingErrors: reportingErrors)
         } catch {
             report(error, when: reportingErrors)
             if session == nil {
@@ -1181,6 +1184,7 @@ final class AppStore: ObservableObject {
         profile = nil
         roles = []
         organizerEvents = []
+        organizerDashboardRegistrations = []
         myEvents = []
         savedEvents = []
         eventOpeningReminders = []
@@ -1236,6 +1240,7 @@ final class AppStore: ObservableObject {
     func loadOrganizerEvents(reportingErrors: Bool = true) async {
         guard isOrganizer else {
             organizerEvents = []
+            organizerDashboardRegistrations = []
             return
         }
         do {
@@ -1267,15 +1272,60 @@ final class AppStore: ObservableObject {
         }
     }
 
-    func fetchOrganizerDashboardRegistrations(eventIds: [String], reportingErrors: Bool = true) async -> [OrganizerRegistration] {
-        guard !eventIds.isEmpty else { return [] }
+    func loadOrganizerDashboard(reportingErrors: Bool = true) async {
+        guard isOrganizer else {
+            organizerEvents = []
+            organizerDashboardRegistrations = []
+            return
+        }
         do {
             let authSession = try await authenticatedSession()
-            return try await api.fetchOrganizerDashboardRegistrations(eventIds: eventIds, session: authSession)
+            await loadOrganizerDashboardIfAvailable(session: authSession, reportingErrors: reportingErrors)
         } catch {
             report(error, when: reportingErrors)
-            return []
         }
+    }
+
+    func loadOrganizerDashboardRegistrations(reportingErrors: Bool = true) async {
+        let ids = organizerEvents.map(\.id)
+        guard !ids.isEmpty else {
+            organizerDashboardRegistrations = []
+            return
+        }
+        do {
+            let authSession = try await authenticatedSession()
+            try await loadOrganizerDashboardRegistrations(eventIds: ids, session: authSession)
+        } catch {
+            report(error, when: reportingErrors)
+        }
+    }
+
+    private func loadOrganizerDashboardIfAvailable(session authSession: AuthSession, reportingErrors: Bool) async {
+        guard isOrganizer else {
+            organizerEvents = []
+            organizerDashboardRegistrations = []
+            return
+        }
+
+        isLoadingOrganizerDashboard = true
+        defer { isLoadingOrganizerDashboard = false }
+
+        do {
+            let events = try await api.fetchOrganizerEvents(session: authSession, includeAll: isAdmin)
+            organizerEvents = events
+            let ids = events.map(\.id)
+            guard !ids.isEmpty else {
+                organizerDashboardRegistrations = []
+                return
+            }
+            try await loadOrganizerDashboardRegistrations(eventIds: ids, session: authSession)
+        } catch {
+            report(error, when: reportingErrors)
+        }
+    }
+
+    private func loadOrganizerDashboardRegistrations(eventIds: [String], session authSession: AuthSession) async throws {
+        organizerDashboardRegistrations = try await api.fetchOrganizerDashboardRegistrations(eventIds: eventIds, session: authSession)
     }
 
     func fetchParticipantRegistrationHistory(userIds: [String], reportingErrors: Bool = true) async -> [ParticipantRegistrationHistoryRow] {
@@ -2753,16 +2803,16 @@ struct SupabaseAPI {
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [OrganizerRegistration].self)
     }
 
-    func fetchOrganizerDashboardRegistrations(eventIds: [String], session: AuthSession) async throws -> [OrganizerRegistration] {
+    func fetchOrganizerDashboardRegistrations(eventIds: [String], session: AuthSession) async throws -> [OrganizerDashboardRegistration] {
         let uniqueIds = Array(Set(eventIds.compactMap(\.nilIfBlank))).sorted()
         guard !uniqueIds.isEmpty else { return [] }
 
-        var registrations: [OrganizerRegistration] = []
+        var registrations: [OrganizerDashboardRegistration] = []
         for chunk in uniqueIds.chunked(maxSize: 25) {
             let ids = chunk.map(\.urlEncoded).joined(separator: ",")
             let select = Self.organizerDashboardRegistrationSelect
             let path = "/rest/v1/event_registrations?select=\(select.urlEncoded)&event_id=in.(\(ids))&order=created_at.asc"
-            let rows = try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [OrganizerRegistration].self)
+            let rows = try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [OrganizerDashboardRegistration].self)
             registrations.append(contentsOf: rows)
         }
 
@@ -5447,6 +5497,25 @@ struct OrganizerRegistration: Codable, Identifiable, Hashable {
                 : "Iscritto - Da saldare"
         }
         return payment
+    }
+}
+
+struct OrganizerDashboardRegistration: Codable, Identifiable, Hashable {
+    let id: String
+    let eventId: String?
+    let status: String?
+    let paymentStatus: String?
+    let checkedIn: Bool?
+    let createdAt: String?
+    let sportLevel: String?
+
+    var normalizedStatus: String {
+        status?.nilIfBlank?.lowercased() ?? "registered"
+    }
+
+    var isActive: Bool {
+        ["registered", "deposit_paid", "paid", "attended", "no_show"].contains(normalizedStatus) &&
+        paymentStatus?.nilIfBlank?.lowercased() != "pending"
     }
 }
 
@@ -17113,8 +17182,6 @@ struct OrganizerDashboardView: View {
     @State private var editorRoute: OrganizerEditorRoute?
     @State private var deleteCandidate: Event?
     @State private var deletingEventId: String?
-    @State private var dashboardRegistrations: [OrganizerRegistration] = []
-    @State private var loadingDashboardRegistrations = false
 
     private var upcomingEvents: [Event] {
         store.organizerEvents.filter(\.organizerIsPublishedUpcoming)
@@ -17153,7 +17220,7 @@ struct OrganizerDashboardView: View {
     }
 
     private var dashboardPastStats: [OrganizerDashboardPastEventStat] {
-        OrganizerDashboardPastEventStat.stats(events: pastEvents, registrations: dashboardRegistrations)
+        OrganizerDashboardPastEventStat.stats(events: pastEvents, registrations: store.organizerDashboardRegistrations)
     }
 
     private func count(for filter: OrganizerEventBoardFilter) -> Int {
@@ -17211,14 +17278,14 @@ struct OrganizerDashboardView: View {
                                 case 1:
                                     OrganizerPastEventList(
                                         stats: dashboardPastStats,
-                                        loading: loadingDashboardRegistrations,
+                                        loading: store.isLoadingOrganizerDashboard,
                                         selectedEvent: $selectedEvent
                                     )
                                 case 2:
                                     OrganizerDashboardAnalytics(
                                         events: store.organizerEvents,
-                                        registrations: dashboardRegistrations,
-                                        loading: loadingDashboardRegistrations
+                                        registrations: store.organizerDashboardRegistrations,
+                                        loading: store.isLoadingOrganizerDashboard
                                     )
                                 case 3:
                                     OrganizerProposalsPanel { proposal in
@@ -17278,6 +17345,7 @@ struct OrganizerDashboardView: View {
                 openRoutedRouteIfNeeded()
             }
             .onChange(of: store.organizerEvents) { _, _ in
+                Task { await store.loadOrganizerDashboardRegistrations(reportingErrors: false) }
                 openRoutedRouteIfNeeded()
             }
         }
@@ -17291,20 +17359,7 @@ struct OrganizerDashboardView: View {
 
     @MainActor
     private func loadDashboardData(reportingErrors: Bool) async {
-        await store.loadOrganizerEvents(reportingErrors: reportingErrors)
-        await loadDashboardRegistrations(reportingErrors: reportingErrors)
-    }
-
-    @MainActor
-    private func loadDashboardRegistrations(reportingErrors: Bool) async {
-        let ids = store.organizerEvents.map(\.id)
-        guard !ids.isEmpty else {
-            dashboardRegistrations = []
-            return
-        }
-        loadingDashboardRegistrations = true
-        dashboardRegistrations = await store.fetchOrganizerDashboardRegistrations(eventIds: ids, reportingErrors: reportingErrors)
-        loadingDashboardRegistrations = false
+        await store.loadOrganizerDashboard(reportingErrors: reportingErrors)
     }
 
     private func openRoutedRouteIfNeeded() {
@@ -17344,7 +17399,7 @@ private struct OrganizerDashboardPastEventStat: Identifiable {
         categoryLabel(event.category)
     }
 
-    static func stats(events: [Event], registrations: [OrganizerRegistration]) -> [OrganizerDashboardPastEventStat] {
+    static func stats(events: [Event], registrations: [OrganizerDashboardRegistration]) -> [OrganizerDashboardPastEventStat] {
         let registrationsByEvent = Dictionary(grouping: registrations) { $0.eventId ?? "" }
         return events.map { event in
             let rows = registrationsByEvent[event.id] ?? []
@@ -17464,7 +17519,7 @@ private struct OrganizerPastEventKPI: View {
 
 struct OrganizerDashboardAnalytics: View {
     let events: [Event]
-    let registrations: [OrganizerRegistration]
+    let registrations: [OrganizerDashboardRegistration]
     let loading: Bool
 
     private var pastStats: [OrganizerDashboardPastEventStat] {
