@@ -11264,6 +11264,8 @@ struct EventDetailView: View {
                     showCancelConfirm = true
                 }
                 .buttonStyle(OutlineDestructiveButtonStyle())
+
+                RegistrationEditHintCard()
             }
         }
         .padding(.horizontal, 16)
@@ -11584,6 +11586,24 @@ struct EventDetailView: View {
         return destination.nilIfBlank?.addingPercentEncoding(withAllowedCharacters: allowedCharacters)
     }
 
+}
+
+struct RegistrationEditHintCard: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Label("Vuoi modificare la tua iscrizione?", systemImage: "square.and.pencil")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(Brand.foreground)
+            Text("Per cambiare meeting point o altre preferenze, vai su My events e gestisci la tua partecipazione da lì.")
+                .font(.caption)
+                .foregroundStyle(Brand.mutedForeground)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Brand.muted.opacity(0.5), lineWidth: 1))
+    }
 }
 
 struct DetailMetric: Identifiable {
