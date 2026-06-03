@@ -6936,7 +6936,7 @@ private extension Reward {
     var displayDescription: String {
         switch kind {
         case .points:
-            return missions?.title?.nilIfBlank ?? "Punti accreditati"
+            return pointReason ?? missions?.title?.nilIfBlank ?? "Punti accreditati"
         case .badge:
             if let description = sourceReward?.badges?.description?.nilIfBlank {
                 return description
@@ -6995,7 +6995,7 @@ private extension Reward {
         }
         switch kind {
         case .points:
-            return "Accreditata dopo una partecipazione o un'azione completata."
+            return pointReason ?? "Accreditata dopo una partecipazione o un'azione completata."
         case .badge:
             return "Sbloccata completando un obiettivo della community."
         case .coupon:
@@ -7023,6 +7023,15 @@ private extension Reward {
             }
         }
         return nil
+    }
+
+    var pointReason: String? {
+        guard kind == .points, let title = cleanTitle else { return nil }
+        let lowercased = title.lowercased()
+        if lowercased == "punti" || lowercased == "points" { return nil }
+        if let pointValueLabel, lowercased == pointValueLabel.lowercased() { return nil }
+        if lowercased.contains("punt"), title.firstInteger != nil { return nil }
+        return title
     }
 
     var iconName: String {
