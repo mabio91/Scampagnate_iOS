@@ -6167,24 +6167,44 @@ struct OrganizerEventDraft: Equatable {
     }
 
     var validationMessages: [String] {
+        validationMessages(requiringPublicationFields: !canSaveIncompleteDraft)
+    }
+
+    var publicationValidationMessages: [String] {
+        validationMessages(requiringPublicationFields: true)
+    }
+
+    var canSaveIncompleteDraft: Bool {
+        Self.canSaveIncompleteEventDraft(status)
+    }
+
+    static func canSaveIncompleteEventDraft(_ status: String?) -> Bool {
+        editableStatus(status) == "draft"
+    }
+
+    private func validationMessages(requiringPublicationFields: Bool) -> [String] {
         var messages: [String] = []
-        if title.nilIfBlank == nil { messages.append("Titolo evento") }
-        if date.nilIfBlank == nil { messages.append("Data evento") }
-        if time.nilIfBlank == nil { messages.append("Ora evento") }
-        if location.nilIfBlank == nil { messages.append("Luogo evento") }
-        if imageUrl.nilIfBlank == nil { messages.append("Immagine di copertina") }
-        if fitScoreMainCategory.nilIfBlank == nil { messages.append("Categoria principale fit score") }
-        if spotsTotal < 1 { messages.append("Capienza almeno 1 posto") }
-        let validOptions = priceOptions
-        if validOptions.isEmpty {
-            if paymentType != "free" && paymentType != "location" && price <= 0 { messages.append("Prezzo totale evento") }
-            if paymentType == "deposit" && deposit <= 0 { messages.append("Acconto evento") }
-            if paymentType == "deposit" && price - deposit <= 0 { messages.append("Saldo evento maggiore di zero") }
+        if requiringPublicationFields {
+            if title.nilIfBlank == nil { messages.append("Titolo evento") }
+            if date.nilIfBlank == nil { messages.append("Data evento") }
+            if time.nilIfBlank == nil { messages.append("Ora evento") }
+            if location.nilIfBlank == nil { messages.append("Luogo evento") }
+            if imageUrl.nilIfBlank == nil { messages.append("Immagine di copertina") }
+            if fitScoreMainCategory.nilIfBlank == nil { messages.append("Categoria principale fit score") }
+            if spotsTotal < 1 { messages.append("Capienza almeno 1 posto") }
+            let validOptions = priceOptions
+            if validOptions.isEmpty {
+                if paymentType != "free" && paymentType != "location" && price <= 0 { messages.append("Prezzo totale evento") }
+                if paymentType == "deposit" && deposit <= 0 { messages.append("Acconto evento") }
+                if paymentType == "deposit" && price - deposit <= 0 { messages.append("Saldo evento maggiore di zero") }
+            }
+            if validOptions.contains(where: { $0.paymentType != "free" && $0.paymentType != "location" && $0.price <= 0 }) { messages.append("Prezzo per ogni formula a pagamento online") }
+            if validOptions.contains(where: { $0.paymentType == "deposit" && $0.depositAmount <= 0 }) { messages.append("Acconto per le opzioni con acconto") }
+            if validOptions.contains(where: { $0.paymentType == "deposit" && ($0.price - $0.depositAmount) <= 0 }) { messages.append("Saldo per le opzioni con acconto") }
+            if validOptions.contains(where: { $0.hasDedicatedSpots && $0.dedicatedSpots < 1 }) { messages.append("Posti dedicati per le opzioni con limite attivo") }
+        } else {
+            if spotsTotal < 1 { messages.append("Capienza almeno 1 posto") }
         }
-        if validOptions.contains(where: { $0.paymentType != "free" && $0.paymentType != "location" && $0.price <= 0 }) { messages.append("Prezzo per ogni formula a pagamento online") }
-        if validOptions.contains(where: { $0.paymentType == "deposit" && $0.depositAmount <= 0 }) { messages.append("Acconto per le opzioni con acconto") }
-        if validOptions.contains(where: { $0.paymentType == "deposit" && ($0.price - $0.depositAmount) <= 0 }) { messages.append("Saldo per le opzioni con acconto") }
-        if validOptions.contains(where: { $0.hasDedicatedSpots && $0.dedicatedSpots < 1 }) { messages.append("Posti dedicati per le opzioni con limite attivo") }
         return messages
     }
 
@@ -6246,11 +6266,14 @@ struct OrganizerEventDraft: Equatable {
         let legacyPrice = legacyPaymentType == "free" ? 0 : (legacyOption?.price ?? price)
         let legacyDeposit = legacyPaymentType == "deposit" ? (legacyOption?.depositAmount ?? deposit) : 0
         let legacyBalancePaymentMode = legacyPaymentType == "deposit" ? (legacyOption?.balancePaymentMode ?? balancePaymentMode) : "online"
+        let storageDate = date.nilIfBlank ?? DateFormatter.eventDate.string(from: Date())
+        let storageTime = time.nilIfBlank.map { String($0.prefix(5)) } ?? "09:00"
+        let storageStatus = canSaveIncompleteDraft && !publicationValidationMessages.isEmpty ? "draft" : status
         var payload: [String: JSONValue] = [
             "title": .string(title.nilIfBlank ?? "Evento"),
             "description": .string(cleanDescription),
-            "date": .string(date),
-            "time": .string(time),
+            "date": .string(storageDate),
+            "time": .string(storageTime),
             "location": .string(location.nilIfBlank ?? "Da definire"),
             "location_label": locationLabel.nilIfBlank.map { .string($0) } ?? .null,
             "category_id": categoryId.nilIfBlank.map { .string($0) } ?? .null,
@@ -6273,7 +6296,7 @@ struct OrganizerEventDraft: Equatable {
             "additional_fields": .object(additionalObject),
             "access_rules": validAccessRules.isEmpty && preservedAccessRules.isEmpty ? .null : .object(accessObject),
             "event_badges": .array(eventBadges.map { .string($0) }),
-            "status": .string(status)
+            "status": .string(storageStatus)
         ]
         if includeOrganizerFields {
             payload["organizer_id"] = .string(organizerId)
