@@ -2874,7 +2874,7 @@ struct SupabaseAPI {
 
         do {
             let select = "id,event_id,user_id,status,payment_status,sport_level"
-            let path = "/rest/v1/event_registrations?select=\(select.urlEncoded)&event_id=eq.\(eventId.urlEncoded)&status=in.(registered,deposit_paid,paid,attended,no_show)&payment_status=neq.pending"
+            let path = "/rest/v1/event_registrations?select=\(select.urlEncoded)&event_id=eq.\(eventId.urlEncoded)&status=in.(registered,deposit_paid,paid,attended,no_show)&payment_status=neq.pending&order=created_at.asc"
             let registrations = try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [EventParticipantRegistration].self)
             let userIds = registrations.compactMap { $0.userId?.nilIfBlank }
             let profiles = try await fetchPublicProfiles(userIds: userIds, session: session)
