@@ -4395,25 +4395,88 @@ struct Event: Codable, Identifiable, Hashable {
     var shouldShowPublicCapacity: Bool { !isManualSoldOut }
     var isFull: Bool { isSoldOut }
     var requiresOnlinePayment: Bool { paymentType == "paid" || paymentType == "deposit" }
+    private static let lifecycleTimeZone = TimeZone(identifier: "Europe/Rome")!
+    private static var lifecycleCalendar: Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = Locale(identifier: "it_IT")
+        calendar.timeZone = lifecycleTimeZone
+        return calendar
+    }
+    private var lifecycleDateComponents: DateComponents? {
+        guard let date else { return nil }
+        let parts = date.prefix(10).split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        var components = DateComponents()
+        components.calendar = Self.lifecycleCalendar
+        components.timeZone = Self.lifecycleTimeZone
+        components.year = parts[0]
+        components.month = parts[1]
+        components.day = parts[2]
+        return components
+    }
+    var eventStartDateTime: Date? {
+        guard var components = lifecycleDateComponents else { return nil }
+        if let time = time?.prefix(5) {
+            let parts = time.split(separator: ":").compactMap { Int($0) }
+            if parts.count == 2 {
+                components.hour = parts[0]
+                components.minute = parts[1]
+            }
+        }
+        components.second = 0
+        return Self.lifecycleCalendar.date(from: components)
+    }
+    private var fallbackVisibilityEndDateTime: Date? {
+        guard var components = lifecycleDateComponents else { return nil }
+        components.day = (components.day ?? 0) + 1
+        components.hour = 0
+        components.minute = 0
+        components.second = 0
+        return Self.lifecycleCalendar.date(from: components)
+    }
+    private var lifecycleDurationMinutes: Int? {
+        guard let duration = duration?.nilIfBlank?.lowercased() else { return nil }
+        let days = lifecycleDurationComponent(in: duration, matching: #"(\d+(?:[,.]\d+)?)\s*(?:giorn(?:o|i)?|gg|g|days?|d)\b"#)
+        let hours = lifecycleDurationComponent(in: duration, matching: #"(\d+(?:[,.]\d+)?)\s*(?:h|ore?|hours?)\b"#)
+        let minutes = lifecycleDurationComponent(in: duration, matching: #"(\d+(?:[,.]\d+)?)\s*(?:m|min|mins|minuti?)\b"#)
+        let total = Int((days * 24 * 60 + hours * 60 + minutes).rounded())
+        return total > 0 ? total : nil
+    }
+    private func lifecycleDurationComponent(in duration: String, matching pattern: String) -> Double {
+        duration
+            .firstRegexCapture(pattern)?
+            .replacingOccurrences(of: ",", with: ".")
+            .nilIfBlank
+            .flatMap(Double.init) ?? 0
+    }
+    var eventVisibilityEndDateTime: Date? {
+        if let start = eventStartDateTime, let lifecycleDurationMinutes {
+            return start.addingTimeInterval(TimeInterval(lifecycleDurationMinutes * 60))
+        }
+        return fallbackVisibilityEndDateTime
+    }
+    var hasRegistrationStarted: Bool {
+        eventStartDateTime.map { $0 <= Date() } ?? false
+    }
     var acceptsRegistrations: Bool {
         guard ["available", "published", "open", "full"].contains(normalizedStatus) else { return false }
-        guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return true }
-        return eventDate >= Calendar.current.startOfDay(for: Date())
+        guard let start = eventStartDateTime else { return true }
+        return start > Date()
     }
     var canNotifyWhenRegistrationsOpen: Bool {
         guard ["draft", "unpublished", "upcoming"].contains(normalizedStatus) else { return false }
-        guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return true }
-        return eventDate >= Calendar.current.startOfDay(for: Date())
+        guard let start = eventStartDateTime else { return true }
+        return start > Date()
     }
     var acceptsWaitlistCompletion: Bool {
         guard ["available", "published", "open", "full"].contains(normalizedStatus) else { return false }
-        guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return true }
-        return eventDate >= Calendar.current.startOfDay(for: Date())
+        guard let start = eventStartDateTime else { return true }
+        return start > Date()
     }
     var isVisibleInUpcomingList: Bool {
         guard !["draft", "unpublished", "past", "completed", "cancelled", "archived"].contains(normalizedStatus) else { return false }
-        guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return true }
-        return eventDate >= Calendar.current.startOfDay(for: Date())
+        guard let end = eventVisibilityEndDateTime else { return true }
+        return end > Date()
     }
     var registrationUnavailableMessage: String {
         switch normalizedStatus {
@@ -4432,16 +4495,19 @@ struct Event: Codable, Identifiable, Hashable {
         case "archived":
             return "Questo evento non è più disponibile."
         default:
-            if let date, let eventDate = DateFormatter.eventDate.date(from: date), eventDate < Calendar.current.startOfDay(for: Date()) {
+            if hasRegistrationStarted && !isPastOrCancelled {
+                return "Le iscrizioni per questo evento sono chiuse."
+            }
+            if isPastOrCancelled {
                 return "Questo evento è già passato."
             }
             return "Le iscrizioni per questo evento non sono disponibili."
         }
     }
     var isPastOrCancelled: Bool {
-        if ["draft", "past", "cancelled", "archived"].contains(normalizedStatus) { return true }
-        guard let date, let eventDate = DateFormatter.eventDate.date(from: date) else { return false }
-        return eventDate < Calendar.current.startOfDay(for: Date())
+        if ["draft", "past", "completed", "cancelled", "archived"].contains(normalizedStatus) { return true }
+        guard let end = eventVisibilityEndDateTime else { return false }
+        return end <= Date()
     }
     var registrationDeadlineText: String? {
         guard let raw = additionalFields?.string(at: "registration_deadline")?.nilIfBlank else { return nil }
