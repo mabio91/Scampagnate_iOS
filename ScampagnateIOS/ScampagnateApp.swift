@@ -3008,14 +3008,14 @@ struct SupabaseAPI {
 
     func fetchMissionCards(session: AuthSession) async throws -> [MissionCardModel] {
         async let progressTask: [UserMissionProgress] = request(
-            path: "/rest/v1/user_mission_progress?select=id,mission_id,current_value,target_value,is_completed,completed_at,updated_at&user_id=eq.\(session.user.id)&is_locked=eq.false&is_expired=eq.false&order=updated_at.desc",
+            path: "/rest/v1/user_mission_progress?select=id,mission_id,cycle_key,current_value,target_value,is_completed,completed_at,updated_at&user_id=eq.\(session.user.id)&is_locked=eq.false&is_expired=eq.false&order=updated_at.desc",
             method: "GET",
             bodyData: nil,
             auth: session,
             decode: [UserMissionProgress].self
         )
         async let activeTask: [ActiveMissionDefinition] = request(
-            path: "/rest/v1/missions?select=id,title,description,target_value,reward_points,type,icon,reward_type,reward_value,category,target_action,expires_at,mission_rewards(id,reward_kind,points_value,title,sort_order,visible_on_profile,physical_config,badges(name,icon))&is_active=eq.true&status=eq.active&visibility=eq.visible&is_archived=eq.false&order=sort_order.asc&order=created_at.asc",
+            path: "/rest/v1/missions?select=id,title,description,target_value,reward_points,type,icon,reward_type,reward_value,category,target_action,timezone,expires_at,mission_rewards(id,reward_kind,points_value,title,sort_order,visible_on_profile,physical_config,badges(name,icon))&is_active=eq.true&status=eq.active&visibility=eq.visible&is_archived=eq.false&order=sort_order.asc&order=created_at.asc",
             method: "GET",
             bodyData: nil,
             auth: session,
@@ -3023,18 +3023,14 @@ struct SupabaseAPI {
         )
 
         let (progressRows, activeMissions) = try await (progressTask, activeTask)
-        var progressByMissionId: [String: UserMissionProgress] = [:]
+        var progressRowsByMissionId: [String: [UserMissionProgress]] = [:]
         for row in progressRows {
             guard let missionId = row.missionId else { continue }
-            if let existing = progressByMissionId[missionId] {
-                progressByMissionId[missionId] = UserMissionProgress.preferred(existing, row)
-            } else {
-                progressByMissionId[missionId] = row
-            }
+            progressRowsByMissionId[missionId, default: []].append(row)
         }
 
         return activeMissions.map { mission in
-            let progress = progressByMissionId[mission.id]
+            let progress = mission.preferredProgress(in: progressRowsByMissionId[mission.id] ?? [])
             return MissionCardModel(
                 id: progress?.id ?? mission.id,
                 missionId: mission.id,
@@ -3052,6 +3048,7 @@ struct SupabaseAPI {
                     rewardValue: mission.rewardValue,
                     category: mission.category,
                     targetAction: mission.targetAction,
+                    timezone: mission.timezone,
                     expiresAt: mission.expiresAt,
                     missionRewards: mission.missionRewards
                 )
@@ -7081,6 +7078,7 @@ struct CommunityLevelDefinition: Codable, Identifiable, Hashable {
 struct UserMissionProgress: Codable, Identifiable {
     let id: String
     let missionId: String?
+    let cycleKey: String?
     let progress: Int?
     let completed: Bool?
     let currentValue: Int?
@@ -7130,8 +7128,58 @@ struct ActiveMissionDefinition: Codable, Identifiable {
     let rewardValue: String?
     let category: String?
     let targetAction: String?
+    let timezone: String?
     let expiresAt: String?
     let missionRewards: [MissionRewardDefinition]?
+}
+
+private extension ActiveMissionDefinition {
+    var normalizedType: String {
+        (type ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    var isPeriodic: Bool {
+        normalizedType == "monthly" || normalizedType == "weekly"
+    }
+
+    func preferredProgress(in rows: [UserMissionProgress]) -> UserMissionProgress? {
+        let scopedRows: [UserMissionProgress]
+        if isPeriodic {
+            let currentCycleKey = MissionCycle.currentKey(type: normalizedType, timezone: timezone)
+            scopedRows = rows.filter { $0.cycleKey == currentCycleKey }
+        } else {
+            scopedRows = rows
+        }
+
+        return scopedRows.reduce(nil) { selected, row in
+            guard let selected else { return row }
+            return UserMissionProgress.preferred(selected, row)
+        }
+    }
+}
+
+enum MissionCycle {
+    static func currentKey(type: String?, timezone: String?, date: Date = Date()) -> String {
+        let normalizedType = (type ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let timeZone = TimeZone(identifier: timezone?.nilIfBlank ?? "Europe/Rome") ?? TimeZone(identifier: "Europe/Rome")!
+        var calendar = Calendar(identifier: normalizedType == "weekly" ? .iso8601 : .gregorian)
+        calendar.timeZone = timeZone
+
+        switch normalizedType {
+        case "monthly":
+            let components = calendar.dateComponents([.year, .month], from: date)
+            let year = components.year ?? 0
+            let month = components.month ?? 1
+            return "\(year)-\(String(format: "%02d", month))"
+        case "weekly":
+            let components = calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)
+            let year = components.yearForWeekOfYear ?? 0
+            let week = components.weekOfYear ?? 1
+            return "\(year)-W\(String(format: "%02d", week))"
+        default:
+            return "lifetime"
+        }
+    }
 }
 
 struct MissionCardModel: Codable, Identifiable {
@@ -7154,6 +7202,7 @@ struct MissionDetail: Codable {
     let rewardValue: String?
     let category: String?
     let targetAction: String?
+    let timezone: String?
     let expiresAt: String?
     let missionRewards: [MissionRewardDefinition]?
 }
