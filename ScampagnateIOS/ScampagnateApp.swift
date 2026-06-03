@@ -769,6 +769,20 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func createStandaloneMembershipCheckout() async -> CheckoutResult? {
+        guard session != nil else {
+            errorMessage = "Devi effettuare il login"
+            return nil
+        }
+        do {
+            let authSession = try await authenticatedSession()
+            return try await api.createMembershipCheckout(session: authSession)
+        } catch {
+            report(error)
+            return nil
+        }
+    }
+
     func resumeCheckout(for registration: Registration, event overrideEvent: Event? = nil) async -> CheckoutResult? {
         guard session != nil else {
             errorMessage = "Devi effettuare il login"
@@ -3715,14 +3729,18 @@ struct SupabaseAPI {
         )
     }
 
-    func createMembershipCheckout(eventId: String, session: AuthSession) async throws -> CheckoutResult {
+    func createMembershipCheckout(eventId: String? = nil, session: AuthSession) async throws -> CheckoutResult {
+        var body: [String: JSONValue] = [
+            "returnUrlBase": .string("scampagnate://membership-success"),
+            "cancelUrlBase": .string("scampagnate://payment-cancelled")
+        ]
+        if let eventId {
+            body["eventId"] = .string(eventId)
+        }
+
         let result: CheckoutFunctionResponse = try await function(
             name: "create-membership-checkout",
-            body: [
-                "eventId": .string(eventId),
-                "returnUrlBase": .string("scampagnate://membership-success"),
-                "cancelUrlBase": .string("scampagnate://payment-cancelled")
-            ],
+            body: body,
             session: session
         )
         let url = result.url.flatMap(URL.init(string:))
@@ -8665,7 +8683,7 @@ struct AppFeedback: Identifiable, Equatable {
         case .success:
             self.init(title: "Pagamento confermato", message: "Sei ufficialmente iscritto all'evento.", icon: "checkmark.seal.fill", tone: .success)
         case .membershipSuccess:
-            self.init(title: "Tessera attivata", message: "Pagamento confermato. Ora puoi completare l'iscrizione all'evento.", icon: "checkmark.shield.fill", tone: .success)
+            self.init(title: "Tessera attivata", message: "Pagamento confermato. Abbiamo aggiornato il tuo profilo.", icon: "checkmark.shield.fill", tone: .success)
         case .spotTaken(let message):
             self.init(title: "Posto non confermato", message: message, icon: "person.2.slash", tone: .warning)
         case .error(let message):
@@ -27949,6 +27967,9 @@ struct ProfileView: View {
     @State private var showHealthSafetyEdit = false
     @State private var showPointsInfo = false
     @State private var showRoutedRewards = false
+    @State private var activeCheckout: ActiveCheckout?
+    @State private var feedback: AppFeedback?
+    @State private var isStartingMembershipCheckout = false
 
     var body: some View {
         NavigationStack {
@@ -28027,7 +28048,17 @@ struct ProfileView: View {
                                                 showHealthSafetyEdit = true
                                             }
                                         }
-                                        MembershipCard(profile: profile)
+                                        MembershipCard(
+                                            profile: profile,
+                                            isStartingMembershipCheckout: isStartingMembershipCheckout,
+                                            onCompleteMembershipData: {
+                                                profileEditInitialFocus = profile.isMissingMembershipSex ? .membershipSex : .membership
+                                                showEdit = true
+                                            },
+                                            onMembershipCheckout: {
+                                                Task { await startStandaloneMembershipCheckout() }
+                                            }
+                                        )
                                             .id(ProfileScrollTarget.membership)
                                         ProfileProgressionSection(profile: profile, levels: store.communityLevels)
                                         MissionsSection(missions: store.missions, routedMission: $routedMission)
@@ -28066,6 +28097,15 @@ struct ProfileView: View {
                         .fullScreenCover(isPresented: $showHealthSafetyEdit) {
                             OnboardingView(mode: .healthSafetyEdit)
                         }
+                        .fullScreenCover(item: $activeCheckout) { checkout in
+                            PaymentAuthenticationView(checkout: checkout) { result in
+                                feedback = result
+                            }
+                        }
+                        .sheet(item: $feedback) { feedback in
+                            AppFeedbackSheet(feedback: feedback)
+                                .presentationDetents([.height(300)])
+                        }
                     }
                 }
             }
@@ -28099,6 +28139,27 @@ struct ProfileView: View {
                 proxy.scrollTo(target, anchor: .top)
             }
             scrollTarget = nil
+        }
+    }
+
+    private func startStandaloneMembershipCheckout() async {
+        guard !isStartingMembershipCheckout else { return }
+        guard let profile = store.profile else { return }
+        guard profile.hasCompleteMembershipProfile else {
+            profileEditInitialFocus = profile.isMissingMembershipSex ? .membershipSex : .membership
+            showEdit = true
+            return
+        }
+
+        isStartingMembershipCheckout = true
+        defer { isStartingMembershipCheckout = false }
+
+        guard let result = await store.createStandaloneMembershipCheckout() else { return }
+        if let url = result.url {
+            activeCheckout = ActiveCheckout(url: url, sessionId: result.sessionId, kind: result.kind)
+        } else if result.free {
+            feedback = AppFeedback(title: "Tessera attivata", message: "Abbiamo aggiornato il tuo profilo.", icon: "checkmark.shield.fill", tone: .success)
+            await store.refreshUserData(reportingErrors: false)
         }
     }
 }
@@ -28341,6 +28402,9 @@ struct MembershipProfileCallout: View {
 struct MembershipCard: View {
     @EnvironmentObject private var store: AppStore
     let profile: Profile
+    let isStartingMembershipCheckout: Bool
+    let onCompleteMembershipData: () -> Void
+    let onMembershipCheckout: () -> Void
     @State private var benefitsExpanded = false
     @State private var isGeneratingWalletPass = false
     @State private var walletPassPayload: WalletPassPayload?
@@ -28479,6 +28543,8 @@ struct MembershipCard: View {
                     .frame(maxWidth: .infinity)
                     .padding(14)
                     .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+
+                    membershipCheckoutButton
                 }
             }
             .padding(14)
@@ -28519,6 +28585,50 @@ struct MembershipCard: View {
         .opacity(isGeneratingWalletPass ? 0.72 : 1)
         .accessibilityLabel("Aggiungi tessera ad Apple Wallet")
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var membershipCheckoutButton: some View {
+        Button {
+            if profile.hasCompleteMembershipProfile {
+                onMembershipCheckout()
+            } else {
+                onCompleteMembershipData()
+            }
+        } label: {
+            HStack(spacing: 8) {
+                if isStartingMembershipCheckout {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(.white)
+                } else {
+                    Image(systemName: "creditcard.fill")
+                        .font(.system(size: 13, weight: .bold))
+                }
+                Text(membershipActionTitle)
+                    .font(.caption.weight(.bold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.86)
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 14)
+            .frame(maxWidth: .infinity)
+            .frame(height: 38)
+            .background(Brand.primary, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(isStartingMembershipCheckout)
+        .opacity(isStartingMembershipCheckout ? 0.72 : 1)
+        .accessibilityLabel(membershipActionTitle)
+    }
+
+    private var membershipActionTitle: String {
+        if !profile.hasCompleteMembershipProfile {
+            return "Completa dati tessera"
+        }
+        if profile.membershipStatus == "Expired" {
+            return "Rinnova tessera"
+        }
+        return "Acquista tessera"
     }
 
     @MainActor
