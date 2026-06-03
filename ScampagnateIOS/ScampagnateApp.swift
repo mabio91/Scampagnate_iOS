@@ -26531,6 +26531,7 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
     private var googleSessionToken = UUID().uuidString
     private var googleResults: [OrganizerAddressSuggestion] = []
     private var mapKitResults: [OrganizerAddressSuggestion] = []
+    private var googleLookupCompleted = false
 
     override init() {
         super.init()
@@ -26549,6 +26550,7 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
         latestQuery = value
         googleResults = []
         mapKitResults = []
+        googleLookupCompleted = false
         results = []
         completer.queryFragment = value
         searchTask?.cancel()
@@ -26561,6 +26563,7 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
             guard !Task.isCancelled, self.latestQuery == value else { return }
 
             self.googleResults = googleResults
+            self.googleLookupCompleted = true
             self.publishMergedResults()
         }
     }
@@ -26573,6 +26576,7 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
         completer.queryFragment = ""
         googleResults = []
         mapKitResults = []
+        googleLookupCompleted = false
         results = []
     }
 
@@ -26600,7 +26604,18 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
             results = []
             return
         }
-        results = Self.dedupedSuggestions(googleResults + mapKitResults)
+
+        guard googleLookupCompleted else {
+            results = []
+            return
+        }
+
+        if !googleResults.isEmpty {
+            results = Self.dedupedSuggestions(googleResults)
+            return
+        }
+
+        results = Self.dedupedSuggestions(mapKitResults)
     }
 
     private static func dedupedSuggestions(_ suggestions: [OrganizerAddressSuggestion]) -> [OrganizerAddressSuggestion] {
@@ -26628,8 +26643,13 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
         let request = MKLocalSearch.Request()
         request.naturalLanguageQuery = suggestion.query
         request.region = Self.italyRegion
-        if let item = try? await MKLocalSearch(request: request).start().mapItems.first {
-            let address = item.placemark.title?.nilIfBlank ?? suggestion.query
+        if let response = try? await MKLocalSearch(request: request).start(),
+           let item = Self.bestMapKitMatch(in: response.mapItems, for: suggestion) {
+            let address = Self.formatSelectedAddress(
+                name: item.name?.nilIfBlank,
+                formattedAddress: item.placemark.title?.nilIfBlank,
+                fallback: suggestion.query
+            )
             let label = item.name?.nilIfBlank ?? suggestion.title
             return OrganizerAddressSelection(address: address, label: label)
         }
@@ -26690,13 +26710,53 @@ final class OrganizerAddressAutocompleteModel: NSObject, ObservableObject, MKLoc
             let (data, response) = try await URLSession.shared.data(for: request)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
             let place = try JSONDecoder().decode(GooglePlaceDetailsResponse.self, from: data)
+            let placeName = place.displayName?.text.nilIfBlank
             return OrganizerAddressSelection(
-                address: place.formattedAddress?.nilIfBlank ?? fallback.query,
-                label: place.displayName?.text.nilIfBlank ?? fallback.title
+                address: Self.formatSelectedAddress(
+                    name: placeName,
+                    formattedAddress: place.formattedAddress?.nilIfBlank,
+                    fallback: fallback.query
+                ),
+                label: placeName ?? fallback.title
             )
         } catch {
             return nil
         }
+    }
+
+    private static func bestMapKitMatch(in items: [MKMapItem], for suggestion: OrganizerAddressSuggestion) -> MKMapItem? {
+        let selectedTitle = suggestion.title.normalizedSearchKey
+        guard !selectedTitle.isEmpty else { return nil }
+
+        return items.first { item in
+            let itemName = item.name?.normalizedSearchKey ?? ""
+            let itemAddress = item.placemark.title?.normalizedSearchKey ?? ""
+            let nameMatches = !itemName.isEmpty && (
+                itemName == selectedTitle ||
+                itemName.contains(selectedTitle) ||
+                selectedTitle.contains(itemName)
+            )
+
+            return nameMatches
+                || itemAddress.contains(selectedTitle)
+        }
+    }
+
+    private static func formatSelectedAddress(name: String?, formattedAddress: String?, fallback: String) -> String {
+        guard let cleanName = name?.nilIfBlank else {
+            return formattedAddress?.nilIfBlank ?? fallback
+        }
+        guard let cleanAddress = formattedAddress?.nilIfBlank else {
+            return cleanName
+        }
+
+        let normalizedName = cleanName.normalizedSearchKey
+        let normalizedAddress = cleanAddress.normalizedSearchKey
+        if normalizedAddress == normalizedName || normalizedAddress.hasPrefix("\(normalizedName) ") {
+            return cleanAddress
+        }
+
+        return "\(cleanName), \(cleanAddress)"
     }
 
     private static let italyRegion = MKCoordinateRegion(
