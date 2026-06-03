@@ -2886,7 +2886,10 @@ struct SupabaseAPI {
                     lastNameInitial: profile?.lastNameInitial ?? publicParticipant?.lastNameInitial,
                     avatarUrl: profile?.avatarUrl ?? publicParticipant?.avatarUrl,
                     age: publicParticipant?.age,
-                    totalPoints: profile?.totalPoints ?? publicParticipant?.totalPoints
+                    totalPoints: profile?.totalPoints ?? publicParticipant?.totalPoints,
+                    bio: publicParticipant?.bio,
+                    attendedEventsCount: publicParticipant?.attendedEventsCount,
+                    badges: publicParticipant?.badges
                 )
             }
             return organizerRows + participantRows
@@ -6335,10 +6338,13 @@ struct EventParticipant: Identifiable, Hashable, Codable {
     let avatarUrl: String?
     let age: Int?
     let totalPoints: Int?
+    let bio: String?
+    let attendedEventsCount: Int?
+    let badges: [PublicParticipantBadge]?
     let role: String?
     let sortOrder: Int?
 
-    init(id: String, userId: String?, firstName: String?, lastNameInitial: String?, avatarUrl: String?, age: Int? = nil, totalPoints: Int? = nil, role: String? = "participant", sortOrder: Int? = nil) {
+    init(id: String, userId: String?, firstName: String?, lastNameInitial: String?, avatarUrl: String?, age: Int? = nil, totalPoints: Int? = nil, bio: String? = nil, attendedEventsCount: Int? = nil, badges: [PublicParticipantBadge]? = nil, role: String? = "participant", sortOrder: Int? = nil) {
         self.id = id
         self.userId = userId
         self.firstName = firstName
@@ -6346,6 +6352,9 @@ struct EventParticipant: Identifiable, Hashable, Codable {
         self.avatarUrl = avatarUrl
         self.age = age
         self.totalPoints = totalPoints
+        self.bio = bio
+        self.attendedEventsCount = attendedEventsCount
+        self.badges = badges
         self.role = role
         self.sortOrder = sortOrder
     }
@@ -6385,6 +6394,11 @@ struct EventParticipant: Identifiable, Hashable, Codable {
         guard let value = lastNameInitial?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
         return String(value.prefix(1)).uppercased()
     }
+}
+
+struct PublicParticipantBadge: Hashable, Codable {
+    let name: String?
+    let icon: String?
 }
 
 struct EventParticipantRegistration: Codable {
@@ -13030,6 +13044,7 @@ struct ParticipantsSheet: View {
     @State private var organizerRegistrations: [OrganizerRegistration] = []
     @State private var registrationHistoryByUserId: [String: [ParticipantRegistrationHistoryRow]] = [:]
     @State private var selectedParticipantProfile: OrganizerRegistration?
+    @State private var selectedPublicParticipant: EventParticipant?
 
     private var participants: [EventParticipant] {
         store.eventParticipants[eventId] ?? []
@@ -13103,7 +13118,12 @@ struct ParticipantsSheet: View {
                                         }
                                     )
                                 } else {
-                                    ParticipantPersonRow(participant: participant, levels: store.communityLevels, mode: .details)
+                                    Button {
+                                        selectedPublicParticipant = participant
+                                    } label: {
+                                        ParticipantPersonRow(participant: participant, levels: store.communityLevels, mode: .details)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
                             }
                         }
@@ -13143,6 +13163,9 @@ struct ParticipantsSheet: View {
                     history: history(for: registration)
                 )
             }
+        }
+        .sheet(item: $selectedPublicParticipant) { participant in
+            PublicParticipantProfileSheet(participant: participant, levels: store.communityLevels)
         }
     }
 
@@ -13466,6 +13489,189 @@ struct ParticipantDetailChip: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
         .background(color.opacity(0.10), in: Capsule())
+    }
+}
+
+struct PublicParticipantProfileSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let participant: EventParticipant
+    let levels: [CommunityLevelDefinition]
+    @State private var avatarExpanded = false
+
+    private var points: Int {
+        participant.totalPoints ?? 0
+    }
+
+    private var level: CommunityLevelDefinition? {
+        CommunityLevelDefinition.currentLevel(points: points, levels: levels)
+    }
+
+    private var levelColor: Color {
+        level.flatMap { Color(hex: $0.color) } ?? Brand.primary
+    }
+
+    private var badges: [PublicParticipantBadge] {
+        (participant.badges ?? []).filter { $0.name?.nilIfBlank != nil || $0.icon?.nilIfBlank != nil }
+    }
+
+    private var bioText: String {
+        participant.bio?.nilIfBlank ?? "Bio non ancora compilata."
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    header
+                    stats
+                    bioSection
+                    badgesSection
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 18)
+                .padding(.bottom, 34)
+            }
+            .background(Brand.background)
+            .navigationTitle("Profilo partecipante")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Chiudi") {
+                        dismiss()
+                    }
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Brand.primary)
+                }
+            }
+        }
+    }
+
+    private var header: some View {
+        VStack(spacing: 14) {
+            Button {
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                    avatarExpanded.toggle()
+                }
+            } label: {
+                ZStack(alignment: .bottomTrailing) {
+                    ParticipantAvatar(participant: participant, size: avatarExpanded ? 248 : 112)
+                        .overlay(Circle().stroke(Brand.background, lineWidth: 4))
+                        .shadow(color: .black.opacity(0.12), radius: 12, x: 0, y: 6)
+
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                        .frame(width: 34, height: 34)
+                        .background(Brand.card, in: Circle())
+                        .overlay(Circle().stroke(Brand.muted, lineWidth: 1))
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(avatarExpanded ? "Riduci avatar" : "Ingrandisci avatar")
+
+            VStack(spacing: 8) {
+                Text(participant.displayNameWithAge)
+                    .font(.system(.title2, design: .rounded, weight: .bold))
+                    .foregroundStyle(Brand.foreground)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let level {
+                    BadgeLabel(text: level.name, color: levelColor.opacity(0.12), foreground: levelColor)
+                }
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 20))
+        .overlay(RoundedRectangle(cornerRadius: 20).stroke(Brand.muted, lineWidth: 1))
+    }
+
+    private var stats: some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+            PublicParticipantStatTile(
+                icon: "checkmark.seal.fill",
+                title: "Eventi",
+                value: "\(participant.attendedEventsCount ?? 0)",
+                subtitle: "partecipati"
+            )
+            PublicParticipantStatTile(
+                icon: "star.fill",
+                title: "Punti",
+                value: "\(points)",
+                subtitle: "community"
+            )
+        }
+    }
+
+    private var bioSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionTitle("Bio")
+            Text(bioText)
+                .font(.subheadline)
+                .foregroundStyle(Brand.foreground)
+                .lineSpacing(3)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(14)
+                .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+                .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+        }
+    }
+
+    @ViewBuilder
+    private var badgesSection: some View {
+        if !badges.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle("Badge")
+                FlowLayout(spacing: 7, rowSpacing: 7) {
+                    ForEach(Array(badges.enumerated()), id: \.offset) { _, badge in
+                        HStack(spacing: 5) {
+                            BadgeIconView(icon: badge.icon?.nilIfBlank ?? "sparkles", size: 13)
+                            Text(badge.name?.nilIfBlank ?? "Badge")
+                                .font(.caption.weight(.bold))
+                                .lineLimit(1)
+                        }
+                        .foregroundStyle(Brand.primary)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 6)
+                        .background(Brand.primary.opacity(0.10), in: Capsule())
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct PublicParticipantStatTile: View {
+    let icon: String
+    let title: String
+    let value: String
+    let subtitle: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 12, weight: .bold))
+                Text(title)
+                    .font(.caption.weight(.bold))
+            }
+            .foregroundStyle(Brand.mutedForeground)
+
+            Text(value)
+                .font(.system(.title3, design: .rounded, weight: .bold))
+                .foregroundStyle(Brand.foreground)
+
+            Text(subtitle)
+                .font(.caption)
+                .foregroundStyle(Brand.mutedForeground)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
     }
 }
 
