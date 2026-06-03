@@ -16726,20 +16726,21 @@ struct EventRegistrationCard: View {
     }
 
     private var shouldShowUtilityActions: Bool {
-        (showActions || isPast) && registration.normalizedStatus != "cancelled" && event != nil
+        guard showActions, !isPast, registration.normalizedStatus != "cancelled", let event else { return false }
+        return !event.isPastOrCancelled
     }
 
     private var canCancel: Bool {
-        showActions && registration.canCancel
+        shouldShowUtilityActions && registration.canCancel
     }
 
     private var canCompletePayment: Bool {
-        guard showActions, let event, registration.normalizedStatus != "cancelled" else { return false }
+        guard shouldShowUtilityActions, let event else { return false }
         return store.pendingCheckout(for: registration, event: event) != nil || registration.canResumePayment(in: event)
     }
 
     private var canEditDetails: Bool {
-        guard showActions, let event, registration.normalizedStatus != "cancelled" else { return false }
+        guard shouldShowUtilityActions, let event else { return false }
         let hasEditableFields = !event.meetingPoints.isEmpty || event.asksCarAvailability || !event.checkoutCustomFields.isEmpty || event.priceOptions.count > 1
         guard hasEditableFields else { return false }
         return event.calendarStartDate.map { $0 > Date() } ?? false
