@@ -28635,8 +28635,8 @@ struct MembershipCard: View {
             .foregroundStyle(.white)
             .padding(.horizontal, 14)
             .frame(maxWidth: .infinity)
-            .frame(height: 38)
-            .background(Brand.primary, in: Capsule())
+            .frame(height: 42)
+            .background(Brand.primary, in: RoundedRectangle(cornerRadius: 10))
         }
         .buttonStyle(.plain)
         .disabled(isStartingMembershipCheckout)
