@@ -21729,7 +21729,6 @@ struct OrganizerEventAnalyticsSection: View {
     let registrations: [OrganizerRegistration]
     let priceOptions: [PriceOption]
     let broadcastHistory: [EventBroadcast]
-    @State private var showCancelledDetails = false
 
     private var active: [OrganizerRegistration] { registrations.filter(\.isActive) }
     private var validRegistrations: [OrganizerRegistration] { registrations.filter { $0.normalizedStatus != "cancelled" } }
@@ -21836,10 +21835,8 @@ struct OrganizerEventAnalyticsSection: View {
                         icon: "person.2.fill",
                         tint: Brand.secondary
                     )
-                    Button {
-                        withAnimation(.snappy) {
-                            showCancelledDetails.toggle()
-                        }
+                    NavigationLink {
+                        OrganizerAnalyticsCancelledListView(registrations: cancelledDetails)
                     } label: {
                         OrganizerAnalyticsMetricCard(
                             title: "Cancellati",
@@ -21848,15 +21845,11 @@ struct OrganizerEventAnalyticsSection: View {
                             icon: "xmark.circle",
                             tint: Brand.destructive
                         )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 16)
-                                .stroke(showCancelledDetails ? Brand.destructive : Color.clear, lineWidth: 2)
-                        )
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Cancellati")
                     .accessibilityValue("\(cancelled.count)")
-                    .accessibilityHint("Mostra o nasconde le iscrizioni cancellate")
+                    .accessibilityHint("Apre la lista delle iscrizioni cancellate")
 
                     if isPastEvent {
                         OrganizerAnalyticsMetricCard(
@@ -21901,11 +21894,6 @@ struct OrganizerEventAnalyticsSection: View {
                     OrganizerAnalyticsPanel(title: "Status Breakdown", systemImage: "slider.horizontal.3", subtitle: "Distribuzione delle iscrizioni") {
                         OrganizerAnalyticsBars(items: statusItems)
                     }
-                }
-
-                if showCancelledDetails {
-                    OrganizerAnalyticsCancelledPanel(registrations: cancelledDetails)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
                 }
 
                 if !meetingPointItems.isEmpty {
@@ -21958,28 +21946,32 @@ struct OrganizerEventAnalyticsSection: View {
     }
 }
 
-private struct OrganizerAnalyticsCancelledPanel: View {
+private struct OrganizerAnalyticsCancelledListView: View {
     let registrations: [OrganizerRegistration]
 
     var body: some View {
-        OrganizerAnalyticsPanel(
-            title: "Cancellati",
-            systemImage: "xmark.circle",
-            subtitle: registrations.isEmpty ? "Nessuna cancellazione registrata" : "\(registrations.count) iscrizioni cancellate"
-        ) {
-            if registrations.isEmpty {
-                Text("Nessuna cancellazione registrata.")
-                    .font(.caption)
-                    .foregroundStyle(Brand.mutedForeground)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                VStack(spacing: 10) {
-                    ForEach(registrations) { registration in
-                        OrganizerAnalyticsCancelledRow(registration: registration)
+        ZStack {
+            Brand.background.ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if registrations.isEmpty {
+                        EmptyState(
+                            icon: "xmark.circle",
+                            title: "Nessuna cancellazione",
+                            message: "Non ci sono iscrizioni cancellate per questo evento."
+                        )
+                        .padding(.top, 24)
+                    } else {
+                        ForEach(registrations) { registration in
+                            OrganizerAnalyticsCancelledRow(registration: registration)
+                        }
                     }
                 }
+                .padding(16)
             }
         }
+        .navigationTitle("Cancellati")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
