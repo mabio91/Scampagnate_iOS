@@ -11001,10 +11001,17 @@ struct EventDetailView: View {
         Group {
             if let event {
                 GeometryReader { proxy in
+                    let heroHeight = max(proxy.safeAreaInsets.top, 22) + proxy.size.width
                     ZStack(alignment: .top) {
+                        hero(event, width: proxy.size.width, topInset: proxy.safeAreaInsets.top)
+                            .allowsHitTesting(false)
+                            .ignoresSafeArea(edges: .top)
+                            .zIndex(0)
+
                         ScrollView {
                             LazyVStack(spacing: 0) {
-                                hero(event, width: proxy.size.width, topInset: proxy.safeAreaInsets.top)
+                                Color.clear
+                                    .frame(width: proxy.size.width, height: heroHeight)
                                 content(event)
                                     .frame(width: proxy.size.width, alignment: .leading)
                             }
@@ -11028,13 +11035,22 @@ struct EventDetailView: View {
                         .onPreferenceChange(ScrollOffsetPreferenceKey.self) { newValue in
                             scrollOffset = newValue
                         }
+                        .zIndex(1)
 
                         let headerProgress = compactHeaderProgress()
+                        let heroControlsOpacity = heroOpacity(heroHeight: heroHeight)
+                        if heroControlsOpacity > 0.04 {
+                            heroControls(event, width: proxy.size.width, topInset: proxy.safeAreaInsets.top)
+                                .opacity(heroControlsOpacity)
+                                .ignoresSafeArea(edges: .top)
+                                .zIndex(25)
+                        }
+
                         compactHeader(event)
                             .opacity(headerProgress > 0.04 ? 1 : 0)
                             .offset(y: compactHeaderOffset(progress: headerProgress))
                             .allowsHitTesting(headerProgress > 0.35)
-                            .zIndex(20)
+                            .zIndex(30)
                     }
                     .safeAreaInset(edge: .bottom, spacing: 0) {
                         bottomBar(event)
@@ -11198,7 +11214,6 @@ struct EventDetailView: View {
         let pullDistance = eventDetailPullDistance
         let heroScrollProgress = min(max(positiveScrollOffset / max(heroHeight, 1), 0), 1)
         let heroOpacity = heroOpacity(heroHeight: heroHeight)
-        let heroTranslateY = positiveScrollOffset * 0.08 - rawPullDistance
         let heroScale = 1.08 - heroScrollProgress * 0.08 + min(pullDistance / max(imageHeight, 1) * 0.42, 0.16)
         let heroImageHeight = heroHeight + rawPullDistance
 
@@ -11209,7 +11224,6 @@ struct EventDetailView: View {
                 .frame(width: width, height: heroImageHeight)
                 .background(Brand.muted.opacity(0.28))
                 .saturation(event.isSoldOut ? 0 : 1)
-                .offset(y: heroTranslateY)
                 .scaleEffect(heroScale, anchor: .top)
                 .opacity(heroOpacity)
                 .overlay {
@@ -11240,30 +11254,6 @@ struct EventDetailView: View {
                 }
                 .clipped()
 
-            VStack {
-                HStack {
-                    EventDetailCircleButton(systemImage: "chevron.left") {
-                        dismiss()
-                    }
-                    Spacer()
-                    HStack(spacing: 10) {
-                        EventDetailCircleButton(systemImage: isSaved ? "bookmark.fill" : "bookmark") {
-                            Task { await toggleSaved(event) }
-                        }
-                        .disabled(savingEvent)
-                        EventDetailCircleButton(systemImage: "square.and.arrow.up") {
-                            showShare = true
-                        }
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, safeTop + 10)
-                Spacer()
-            }
-            .frame(width: width, height: safeTop + imageHeight)
-            .offset(y: -rawPullDistance)
-            .opacity(heroOpacity)
-
             VStack(alignment: .leading, spacing: 12) {
                 Spacer()
                 Text(event.title)
@@ -11281,6 +11271,33 @@ struct EventDetailView: View {
         }
         .frame(width: width, height: heroHeight)
         .background(Brand.background)
+    }
+
+    private func heroControls(_ event: Event, width: CGFloat, topInset: CGFloat) -> some View {
+        let safeTop = max(topInset, 22)
+        let imageHeight = width
+
+        return VStack {
+            HStack {
+                EventDetailCircleButton(systemImage: "chevron.left") {
+                    dismiss()
+                }
+                Spacer()
+                HStack(spacing: 10) {
+                    EventDetailCircleButton(systemImage: isSaved ? "bookmark.fill" : "bookmark") {
+                        Task { await toggleSaved(event) }
+                    }
+                    .disabled(savingEvent)
+                    EventDetailCircleButton(systemImage: "square.and.arrow.up") {
+                        showShare = true
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, safeTop + 10)
+            Spacer()
+        }
+        .frame(width: width, height: safeTop + imageHeight)
     }
 
     private func heroOpacity(heroHeight: CGFloat) -> Double {
