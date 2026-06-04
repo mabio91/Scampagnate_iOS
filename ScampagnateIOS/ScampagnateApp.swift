@@ -13618,8 +13618,8 @@ struct PublicParticipantProfileSheet: View {
         (participant.badges ?? []).filter { $0.name?.nilIfBlank != nil || $0.icon?.nilIfBlank != nil }
     }
 
-    private var bioText: String {
-        participant.bio?.nilIfBlank ?? "Bio non ancora compilata."
+    private var bioText: String? {
+        participant.bio?.nilIfBlank
     }
 
     var body: some View {
@@ -13628,7 +13628,9 @@ struct PublicParticipantProfileSheet: View {
                 VStack(alignment: .leading, spacing: 18) {
                     header
                     stats
-                    bioSection
+                    if let bioText = bioText {
+                        bioSection(bioText)
+                    }
                     badgesSection
                 }
                 .padding(.horizontal, 20)
@@ -13709,7 +13711,7 @@ struct PublicParticipantProfileSheet: View {
         }
     }
 
-    private var bioSection: some View {
+    private func bioSection(_ bioText: String) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionTitle("Bio")
             Text(bioText)
