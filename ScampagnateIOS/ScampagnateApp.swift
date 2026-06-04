@@ -22507,7 +22507,11 @@ struct OrganizerParticipantRow: View {
                             Button {
                                 UIApplication.shared.open(url)
                             } label: {
-                                Label(instagram, systemImage: "camera")
+                                Label {
+                                    Text(instagram)
+                                } icon: {
+                                    OrganizerInstagramIcon()
+                                }
                             }
                             .buttonStyle(.plain)
                             .foregroundStyle(Brand.primary)
@@ -22681,6 +22685,22 @@ struct OrganizerParticipantRow: View {
             chips.append(.init(text: "Rich. speciale", icon: "exclamationmark.bubble.fill", tint: Brand.warning, fill: Brand.warning.opacity(0.12)))
         }
         return chips
+    }
+}
+
+private struct OrganizerInstagramIcon: View {
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 3.8, style: .continuous)
+                .stroke(style: StrokeStyle(lineWidth: 1.55, lineCap: .round, lineJoin: .round))
+            Circle()
+                .stroke(style: StrokeStyle(lineWidth: 1.45, lineCap: .round, lineJoin: .round))
+                .frame(width: 6.3, height: 6.3)
+            Circle()
+                .frame(width: 2.2, height: 2.2)
+                .offset(x: 4.2, y: -4.2)
+        }
+        .frame(width: 14, height: 14)
     }
 }
 
