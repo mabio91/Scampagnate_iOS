@@ -11271,7 +11271,7 @@ struct EventDetailView: View {
             .offset(y: titleFloatOffset)
             .opacity(heroOpacity)
         }
-        .frame(width: width, height: heroHeight)
+        .frame(width: width, height: heroImageHeight)
         .background(Brand.background)
     }
 
