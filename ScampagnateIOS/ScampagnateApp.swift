@@ -4326,21 +4326,26 @@ struct Event: Codable, Identifiable, Hashable {
     var equipmentItems: [EquipmentItem] { equipmentList ?? [] }
     var staffMembers: [EventStaffMember] { (eventStaff ?? []).sorted { ($0.sortOrder ?? 0) < ($1.sortOrder ?? 0) } }
     var hasEquipment: Bool { !equipmentItems.isEmpty }
-    var hasEventTopBadge: Bool { featured == true || (eventBadges ?? []).contains("evento_top") }
+    var storedEventBadges: [String] {
+        (eventBadges ?? []).compactMap { $0.nilIfBlank }
+    }
+    var hasEventTopBadge: Bool {
+        storedEventBadges.contains { $0.lowercased() == "evento_top" }
+    }
     var hasActivePromo: Bool { priceOptions.contains { $0.hasActivePromo() } }
     var manualBadgeTexts: [String] {
-        (eventBadges ?? []).compactMap { badge -> String? in
-            let cleanBadge = badge.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard cleanBadge != "evento_top" else { return nil }
-            return Self.manualEventBadgeLabels[cleanBadge]
+        storedEventBadges.compactMap { badge -> String? in
+            let badgeKey = badge.lowercased()
+            guard badgeKey != "evento_top" else { return nil }
+            return Self.manualEventBadgeLabels[badgeKey]
         }
         .removingDuplicates()
     }
     var customBadgeText: String? {
-        (eventBadges ?? []).compactMap { badge -> String? in
-            let cleanBadge = badge.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !cleanBadge.isEmpty, !Self.managedEventBadgeIds.contains(cleanBadge) else { return nil }
-            return cleanBadge
+        storedEventBadges.compactMap { badge -> String? in
+            let badgeKey = badge.lowercased()
+            guard !Self.managedEventBadgeIds.contains(badgeKey) else { return nil }
+            return badge
         }
         .first
     }
