@@ -22691,16 +22691,18 @@ struct OrganizerParticipantRow: View {
 private struct OrganizerInstagramIcon: View {
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 3.8, style: .continuous)
-                .stroke(style: StrokeStyle(lineWidth: 1.55, lineCap: .round, lineJoin: .round))
+            RoundedRectangle(cornerRadius: 3.2, style: .continuous)
+                .stroke(style: StrokeStyle(lineWidth: 1.2, lineCap: .round, lineJoin: .round))
+                .frame(width: 12, height: 12)
             Circle()
-                .stroke(style: StrokeStyle(lineWidth: 1.45, lineCap: .round, lineJoin: .round))
-                .frame(width: 6.3, height: 6.3)
+                .stroke(style: StrokeStyle(lineWidth: 1.15, lineCap: .round, lineJoin: .round))
+                .frame(width: 4.8, height: 4.8)
             Circle()
-                .frame(width: 2.2, height: 2.2)
-                .offset(x: 4.2, y: -4.2)
+                .frame(width: 1.5, height: 1.5)
+                .offset(x: 3.35, y: -3.35)
         }
-        .frame(width: 14, height: 14)
+        .frame(width: 17, height: 13, alignment: .center)
+        .accessibilityHidden(true)
     }
 }
 
