@@ -13141,19 +13141,10 @@ struct ParticipantsSheet: View {
     let eventId: String
     let fallbackCount: Int
     @Binding var showAuth: Bool
-    @State private var organizerRegistrations: [OrganizerRegistration] = []
-    @State private var registrationHistoryByUserId: [String: [ParticipantRegistrationHistoryRow]] = [:]
-    @State private var selectedParticipantProfile: OrganizerRegistration?
     @State private var selectedPublicParticipant: EventParticipant?
 
     private var participants: [EventParticipant] {
         store.eventParticipants[eventId] ?? []
-    }
-
-    private var event: Event? {
-        store.events.first { $0.id == eventId }
-            ?? store.organizerEvents.first { $0.id == eventId }
-            ?? store.myEvents.compactMap(\.event).first { $0.id == eventId }
     }
 
     private var attendeeParticipants: [EventParticipant] {
@@ -13168,12 +13159,8 @@ struct ParticipantsSheet: View {
         store.isAuthenticated && store.profile != nil && !store.needsOnboarding
     }
 
-    private var canViewOrganizerDetails: Bool {
-        store.isAdmin || (store.isOrganizer && event?.organizerId == store.session?.user.id)
-    }
-
     private var loadKey: String {
-        "\(eventId)-\(store.session?.user.id ?? "anon")-\(store.needsOnboarding)-\(store.isAdmin)-\(store.isOrganizer)"
+        "\(eventId)-\(store.session?.user.id ?? "anon")-\(store.needsOnboarding)"
     }
 
     private var counterText: String {
@@ -13204,27 +13191,12 @@ struct ParticipantsSheet: View {
                     } else {
                         VStack(alignment: .leading, spacing: 18) {
                             ForEach(attendeeParticipants) { participant in
-                                if canViewOrganizerDetails, let event {
-                                    OrganizerPublicParticipantDetailRow(
-                                        participant: participant,
-                                        registration: organizerRegistration(for: participant),
-                                        event: event,
-                                        levels: store.communityLevels,
-                                        history: history(for: participant),
-                                        onOpenProfile: {
-                                            if let registration = organizerRegistration(for: participant), !registration.isManual {
-                                                selectedParticipantProfile = registration
-                                            }
-                                        }
-                                    )
-                                } else {
-                                    Button {
-                                        selectedPublicParticipant = participant
-                                    } label: {
-                                        ParticipantPersonRow(participant: participant, levels: store.communityLevels, mode: .details)
-                                    }
-                                    .buttonStyle(.plain)
+                                Button {
+                                    selectedPublicParticipant = participant
+                                } label: {
+                                    ParticipantPersonRow(participant: participant, levels: store.communityLevels, mode: .details)
                                 }
+                                .buttonStyle(.plain)
                             }
                         }
                     }
@@ -13252,17 +13224,6 @@ struct ParticipantsSheet: View {
         .background(Brand.background)
         .task(id: loadKey) {
             await store.loadParticipants(eventId: eventId)
-            await loadOrganizerDetailsIfNeeded()
-        }
-        .sheet(item: $selectedParticipantProfile) { registration in
-            if let event {
-                OrganizerParticipantProfileSheet(
-                    registration: registration,
-                    event: event,
-                    levels: store.communityLevels,
-                    history: history(for: registration)
-                )
-            }
         }
         .sheet(item: $selectedPublicParticipant) { participant in
             PublicParticipantProfileSheet(participant: participant, levels: store.communityLevels)
@@ -13304,43 +13265,6 @@ struct ParticipantsSheet: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
             showAuth = true
         }
-    }
-
-    @MainActor
-    private func loadOrganizerDetailsIfNeeded() async {
-        guard canViewOrganizerDetails else {
-            organizerRegistrations = []
-            registrationHistoryByUserId = [:]
-            return
-        }
-        let registrations = await store.fetchOrganizerRegistrations(eventId: eventId, reportingErrors: false)
-        organizerRegistrations = registrations
-
-        let userIds = registrations
-            .filter { !$0.isManual }
-            .compactMap(\.userId)
-            .removingDuplicates()
-        let history = await store.fetchParticipantRegistrationHistory(userIds: userIds, reportingErrors: false)
-        registrationHistoryByUserId = Dictionary(grouping: history, by: { $0.userId ?? "" })
-            .filter { !$0.key.isEmpty }
-    }
-
-    private func organizerRegistration(for participant: EventParticipant) -> OrganizerRegistration? {
-        if let directMatch = organizerRegistrations.first(where: { $0.id == participant.id }) {
-            return directMatch
-        }
-        guard let userId = participant.userId?.nilIfBlank else { return nil }
-        return organizerRegistrations.first { $0.userId == userId && !$0.isManual }
-    }
-
-    private func history(for participant: EventParticipant) -> [ParticipantRegistrationHistoryRow] {
-        guard let userId = participant.userId?.nilIfBlank else { return [] }
-        return registrationHistoryByUserId[userId] ?? []
-    }
-
-    private func history(for registration: OrganizerRegistration) -> [ParticipantRegistrationHistoryRow] {
-        guard let userId = registration.userId?.nilIfBlank else { return [] }
-        return registrationHistoryByUserId[userId] ?? []
     }
 }
 
