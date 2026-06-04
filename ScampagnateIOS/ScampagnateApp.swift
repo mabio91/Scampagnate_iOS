@@ -11014,7 +11014,7 @@ struct EventDetailView: View {
                                 GeometryReader { scrollProxy in
                                     Color.clear.preference(
                                         key: ScrollOffsetPreferenceKey.self,
-                                        value: max(0, -scrollProxy.frame(in: .named("event-detail-scroll")).minY)
+                                        value: -scrollProxy.frame(in: .named("event-detail-scroll")).minY
                                     )
                                 }
                             }
@@ -11177,20 +11177,36 @@ struct EventDetailView: View {
         }
     }
 
+    private var eventDetailPositiveScrollOffset: CGFloat {
+        max(scrollOffset, 0)
+    }
+
+    private var eventDetailRawPullDistance: CGFloat {
+        max(-scrollOffset, 0)
+    }
+
+    private var eventDetailPullDistance: CGFloat {
+        min(eventDetailRawPullDistance, 160)
+    }
+
     private func hero(_ event: Event, width: CGFloat, topInset: CGFloat) -> some View {
         let safeTop = max(topInset, 22)
         let imageHeight = width
         let heroHeight = safeTop + imageHeight
-        let heroScrollProgress = min(max(scrollOffset / max(heroHeight, 1), 0), 1)
+        let positiveScrollOffset = eventDetailPositiveScrollOffset
+        let rawPullDistance = eventDetailRawPullDistance
+        let pullDistance = eventDetailPullDistance
+        let heroScrollProgress = min(max(positiveScrollOffset / max(heroHeight, 1), 0), 1)
         let heroOpacity = heroOpacity(heroHeight: heroHeight)
-        let heroTranslateY = scrollOffset * 0.08
-        let heroScale = 1.08 - heroScrollProgress * 0.08
+        let heroTranslateY = positiveScrollOffset * 0.08 - rawPullDistance
+        let heroScale = 1.08 - heroScrollProgress * 0.08 + min(pullDistance / max(imageHeight, 1) * 0.42, 0.16)
+        let heroImageHeight = heroHeight + rawPullDistance
 
         return ZStack(alignment: .top) {
             Brand.background
 
             RemoteImage(urlString: event.imageUrl, contentMode: .fill)
-                .frame(width: width, height: heroHeight)
+                .frame(width: width, height: heroImageHeight)
                 .background(Brand.muted.opacity(0.28))
                 .saturation(event.isSoldOut ? 0 : 1)
                 .offset(y: heroTranslateY)
@@ -11245,6 +11261,7 @@ struct EventDetailView: View {
                 Spacer()
             }
             .frame(width: width, height: safeTop + imageHeight)
+            .offset(y: -rawPullDistance)
             .opacity(heroOpacity)
 
             VStack(alignment: .leading, spacing: 12) {
@@ -11264,18 +11281,18 @@ struct EventDetailView: View {
         }
         .frame(width: width, height: heroHeight)
         .background(Brand.background)
-        .clipped()
     }
 
     private func heroOpacity(heroHeight: CGFloat) -> Double {
-        max(0, min(Double(1 - scrollOffset / (heroHeight * 1.05)), 1))
+        max(0, min(Double(1 - eventDetailPositiveScrollOffset / (heroHeight * 1.05)), 1))
     }
 
     private func compactHeaderProgress() -> Double {
         let revealStart: CGFloat = 190
         let revealEnd: CGFloat = 260
-        guard scrollOffset > revealStart else { return 0 }
-        let progress = min(Double((scrollOffset - revealStart) / (revealEnd - revealStart)), 1)
+        let positiveScrollOffset = eventDetailPositiveScrollOffset
+        guard positiveScrollOffset > revealStart else { return 0 }
+        let progress = min(Double((positiveScrollOffset - revealStart) / (revealEnd - revealStart)), 1)
         return progress * progress * (3 - 2 * progress)
     }
 
@@ -36757,7 +36774,7 @@ struct EventDetailScrollTracker: ViewModifier {
         if #available(iOS 18.0, *) {
             content
                 .onScrollGeometryChange(for: CGFloat.self) { geometry in
-                    max(0, geometry.contentOffset.y)
+                    geometry.contentOffset.y
                 } action: { _, newValue in
                     scrollOffset = newValue
                 }
