@@ -22702,6 +22702,7 @@ private struct OrganizerInstagramIcon: View {
                 .offset(x: 3.35, y: -3.35)
         }
         .frame(width: 17, height: 13, alignment: .center)
+        .foregroundStyle(Brand.mutedForeground)
         .accessibilityHidden(true)
     }
 }
