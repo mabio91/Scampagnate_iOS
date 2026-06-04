@@ -11216,6 +11216,7 @@ struct EventDetailView: View {
         let heroOpacity = heroOpacity(heroHeight: heroHeight)
         let heroScale = 1.08 - heroScrollProgress * 0.08 + min(pullDistance / max(imageHeight, 1) * 0.42, 0.16)
         let heroImageHeight = heroHeight + rawPullDistance
+        let titleFloatOffset = -min(positiveScrollOffset * 0.72, imageHeight * 0.34)
 
         return ZStack(alignment: .top) {
             Brand.background
@@ -11267,6 +11268,7 @@ struct EventDetailView: View {
                     .padding(.bottom, 34)
             }
             .frame(width: width, height: heroHeight, alignment: .bottomLeading)
+            .offset(y: titleFloatOffset)
             .opacity(heroOpacity)
         }
         .frame(width: width, height: heroHeight)
