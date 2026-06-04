@@ -13707,6 +13707,7 @@ struct OrganizerParticipantProfileSheet: View {
     let event: Event
     let levels: [CommunityLevelDefinition]
     let history: [ParticipantRegistrationHistoryRow]
+    @State private var avatarExpanded = false
 
     private var profile: OrganizerParticipantProfile? {
         registration.isManual ? nil : registration.profiles
@@ -13772,12 +13773,33 @@ struct OrganizerParticipantProfileSheet: View {
     }
 
     private var header: some View {
-        HStack(alignment: .center, spacing: 16) {
-            OrganizerProfileAvatar(profile: profile, name: displayName, size: 76)
-            VStack(alignment: .leading, spacing: 8) {
+        VStack(spacing: 14) {
+            Button {
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.84)) {
+                    avatarExpanded.toggle()
+                }
+            } label: {
+                ZStack(alignment: .bottomTrailing) {
+                    OrganizerProfileAvatar(profile: profile, name: displayName, size: avatarExpanded ? 248 : 96)
+                        .overlay(Circle().stroke(Brand.background, lineWidth: 4))
+                        .shadow(color: .black.opacity(0.12), radius: 12, x: 0, y: 6)
+
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                        .frame(width: 34, height: 34)
+                        .background(Brand.card, in: Circle())
+                        .overlay(Circle().stroke(Brand.muted, lineWidth: 1))
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(avatarExpanded ? "Riduci avatar" : "Ingrandisci avatar")
+
+            VStack(spacing: 8) {
                 Text(age.map { "\(displayName), \($0)" } ?? displayName)
                     .font(.system(.title3, design: .rounded, weight: .bold))
                     .foregroundStyle(Brand.foreground)
+                    .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
                 FlowLayout(spacing: 6, rowSpacing: 6) {
                     BadgeLabel(text: registration.statusLabel, color: registration.statusColor.opacity(0.14), foreground: registration.statusColor)
@@ -13786,9 +13808,10 @@ struct OrganizerParticipantProfileSheet: View {
                     }
                 }
             }
-            Spacer(minLength: 0)
+            .frame(maxWidth: .infinity)
         }
         .padding(16)
+        .frame(maxWidth: .infinity)
         .background(Brand.card, in: RoundedRectangle(cornerRadius: 20))
         .overlay(RoundedRectangle(cornerRadius: 20).stroke(Brand.muted, lineWidth: 1))
     }
