@@ -2398,7 +2398,7 @@ struct SupabaseAPI {
     private static let priceOptionSelect = "id,name,price,sort_order,original_price,eligible_group,is_promotional,promo_start,promo_end,payment_type,deposit_amount,balance_amount,balance_payment_mode,has_dedicated_spots,dedicated_spots,spots_taken,waitlist_enabled"
     private static let eventSelect = "id,title,date,time,location,location_label,category_id,status,price,deposit,payment_type,balance_payment_mode,image_url,difficulty,distance,elevation,duration,spots_total,spots_taken,reserved_spots,featured,event_badges,organizer_id,organizer_name,description,cancellation_policy,equipment_list,additional_fields,visibility,gallery_images,access_rules,event_categories(id,name,icon),event_meeting_points(id,name,location,time,notes),event_price_options(\(priceOptionSelect))"
     private static let registrationSelect = "*,events(\(eventSelect)),meeting_point:event_meeting_points(id,name,location,time)"
-    private static let organizerRegistrationSelect = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,sport_level,amount_paid,refund_amount,last_balance_reminder_sent_at,additional_responses,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,instagram_handle,avatar_url,total_points,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade,interests,birth_date,health_safety_status,health_safety_notes,emergency_medication_has,emergency_medication_notes,health_safety_help_notes),price_option:event_price_options(\(priceOptionSelect))"
+    private static let organizerRegistrationSelect = "id,event_id,user_id,meeting_point_id,status,payment_status,checked_in,created_at,cancelled_at,sport_level,amount_paid,refund_amount,last_balance_reminder_sent_at,additional_responses,profiles!event_registrations_user_id_profiles_fkey(first_name,last_name,phone,instagram_handle,avatar_url,total_points,membership_id,membership_status,self_level,trekking_experience,activity_frequency,experience_grade,interests,birth_date,health_safety_status,health_safety_notes,emergency_medication_has,emergency_medication_notes,health_safety_help_notes),price_option:event_price_options(\(priceOptionSelect))"
     private static let organizerDashboardRegistrationSelect = "id,event_id,status,payment_status,checked_in,created_at,sport_level"
     private static let nonManualRegistrationFilter = "&or=(sport_level.is.null,sport_level.not.like.manual:%25)"
 
@@ -5534,6 +5534,7 @@ struct OrganizerRegistration: Codable, Identifiable, Hashable {
     var paymentStatus: String?
     var checkedIn: Bool?
     let createdAt: String?
+    let cancelledAt: String?
     let sportLevel: String?
     let amountPaid: Double?
     let refundAmount: Double?
@@ -21738,6 +21739,13 @@ struct OrganizerEventAnalyticsSection: View {
     private var waitlisted: [OrganizerRegistration] { registrations.filter { $0.normalizedStatus == "waitlist" } }
     private var pending: [OrganizerRegistration] { registrations.filter { ["pending_approval", "pending_payment"].contains($0.normalizedStatus) } }
     private var cancelled: [OrganizerRegistration] { registrations.filter { $0.normalizedStatus == "cancelled" } }
+    private var cancelledDetails: [OrganizerRegistration] {
+        cancelled.sorted { lhs, rhs in
+            let lhsDate = lhs.cancelledAt?.isoDate ?? lhs.createdAt?.isoDate ?? .distantPast
+            let rhsDate = rhs.cancelledAt?.isoDate ?? rhs.createdAt?.isoDate ?? .distantPast
+            return lhsDate > rhsDate
+        }
+    }
     private var attended: [OrganizerRegistration] { active.filter(isAttended) }
     private var noShows: [OrganizerRegistration] {
         guard isPastEvent else { return [] }
@@ -21883,6 +21891,8 @@ struct OrganizerEventAnalyticsSection: View {
                     }
                 }
 
+                OrganizerAnalyticsCancelledPanel(registrations: cancelledDetails)
+
                 if !meetingPointItems.isEmpty {
                     OrganizerAnalyticsPanel(title: "Meeting Point Distribution", systemImage: "mappin.and.ellipse", subtitle: "Partecipanti per punto di ritrovo") {
                         OrganizerAnalyticsBars(items: meetingPointItems)
@@ -21930,6 +21940,69 @@ struct OrganizerEventAnalyticsSection: View {
     private func percent(_ numerator: Int, _ denominator: Int) -> Int {
         guard denominator > 0 else { return 0 }
         return Int(round(min(Double(numerator) / Double(denominator), 1) * 100))
+    }
+}
+
+private struct OrganizerAnalyticsCancelledPanel: View {
+    let registrations: [OrganizerRegistration]
+
+    var body: some View {
+        OrganizerAnalyticsPanel(
+            title: "Cancellati",
+            systemImage: "xmark.circle",
+            subtitle: registrations.isEmpty ? "Nessuna cancellazione registrata" : "\(registrations.count) iscrizioni cancellate"
+        ) {
+            if registrations.isEmpty {
+                Text("Nessuna cancellazione registrata.")
+                    .font(.caption)
+                    .foregroundStyle(Brand.mutedForeground)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                VStack(spacing: 10) {
+                    ForEach(registrations) { registration in
+                        OrganizerAnalyticsCancelledRow(registration: registration)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct OrganizerAnalyticsCancelledRow: View {
+    let registration: OrganizerRegistration
+
+    private var cancellationDate: String {
+        guard let date = registration.cancelledAt?.isoDate else { return "Data non disponibile" }
+        return DateFormatter.registrationCSV.string(from: date)
+    }
+
+    private var formulaName: String {
+        registration.priceOption?.displayName.nilIfBlank ?? "Nessuna formula"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 10) {
+                OrganizerProfileAvatar(profile: registration.profiles, name: registration.displayName)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(registration.displayName)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                        .lineLimit(1)
+                    Text(cancellationDate)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Brand.mutedForeground)
+                }
+                Spacer(minLength: 0)
+            }
+
+            Label(formulaName, systemImage: "ticket")
+                .font(.caption)
+                .foregroundStyle(Brand.mutedForeground)
+                .lineLimit(1)
+        }
+        .padding(12)
+        .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
