@@ -8018,10 +8018,16 @@ private enum AppChrome {
     static let topSafeAreaClearance: CGFloat = 6
 }
 
+@MainActor
+final class AppChromeState: ObservableObject {
+    @Published var hidesStatusBarShield = false
+}
+
 struct RootView: View {
     @EnvironmentObject private var store: AppStore
     @EnvironmentObject private var pushNotifications: PushNotificationService
     @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var chrome = AppChromeState()
     @State private var selectedTab: AppTab = .home
     @State private var showAuth = false
     @State private var authInitialMode: AuthMode = .login
@@ -8080,10 +8086,13 @@ struct RootView: View {
             .tint(Brand.primary)
             .nativeTabBarMinimizeOnScroll()
             .safeAreaPadding(.top, AppChrome.topSafeAreaClearance)
+            .environmentObject(chrome)
         }
         .background(KeyboardDismissOnTapView())
         .overlay(alignment: .top) {
-            StatusBarShield()
+            if !chrome.hidesStatusBarShield {
+                StatusBarShield()
+            }
         }
         .sheet(isPresented: $showAuth) {
             AuthView(initialMode: authInitialMode)
@@ -10903,6 +10912,7 @@ struct EventAccessMessageCard: View {
 
 struct EventDetailView: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var chrome: AppChromeState
     @EnvironmentObject private var store: AppStore
     @EnvironmentObject private var pushNotifications: PushNotificationService
     @Binding var showAuth: Bool
@@ -11149,6 +11159,12 @@ struct EventDetailView: View {
         .background(Brand.background)
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .tabBar)
+        .onAppear {
+            chrome.hidesStatusBarShield = true
+        }
+        .onDisappear {
+            chrome.hidesStatusBarShield = false
+        }
         .task(id: eventId) {
             await store.refreshEventDetail(eventId: eventId, reportingErrors: false)
             openInitialParticipantsIfNeeded()
@@ -11165,17 +11181,20 @@ struct EventDetailView: View {
         let safeTop = max(topInset, 22)
         let imageHeight = width
         let heroHeight = safeTop + imageHeight
+        let heroScrollProgress = min(max(scrollOffset / max(heroHeight, 1), 0), 1)
         let heroOpacity = heroOpacity(heroHeight: heroHeight)
         let heroTranslateY = scrollOffset * 0.08
+        let heroScale = 1.08 - heroScrollProgress * 0.08
 
         return ZStack(alignment: .top) {
             Brand.background
 
             RemoteImage(urlString: event.imageUrl, contentMode: .fill)
-                .frame(width: width, height: imageHeight)
+                .frame(width: width, height: heroHeight)
                 .background(Brand.muted.opacity(0.28))
                 .saturation(event.isSoldOut ? 0 : 1)
                 .offset(y: heroTranslateY)
+                .scaleEffect(heroScale, anchor: .top)
                 .opacity(heroOpacity)
                 .overlay {
                     LinearGradient(
@@ -11204,7 +11223,6 @@ struct EventDetailView: View {
                     }
                 }
                 .clipped()
-                .padding(.top, safeTop)
 
             VStack {
                 HStack {
@@ -11250,7 +11268,7 @@ struct EventDetailView: View {
     }
 
     private func heroOpacity(heroHeight: CGFloat) -> Double {
-        max(0, min(Double(1 - scrollOffset / (heroHeight * 0.7)), 1))
+        max(0, min(Double(1 - scrollOffset / (heroHeight * 1.05)), 1))
     }
 
     private func compactHeaderProgress() -> Double {
