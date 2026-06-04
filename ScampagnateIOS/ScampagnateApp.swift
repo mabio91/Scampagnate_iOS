@@ -21729,6 +21729,7 @@ struct OrganizerEventAnalyticsSection: View {
     let registrations: [OrganizerRegistration]
     let priceOptions: [PriceOption]
     let broadcastHistory: [EventBroadcast]
+    @State private var showCancelledDetails = false
 
     private var active: [OrganizerRegistration] { registrations.filter(\.isActive) }
     private var validRegistrations: [OrganizerRegistration] { registrations.filter { $0.normalizedStatus != "cancelled" } }
@@ -21835,6 +21836,28 @@ struct OrganizerEventAnalyticsSection: View {
                         icon: "person.2.fill",
                         tint: Brand.secondary
                     )
+                    Button {
+                        withAnimation(.snappy) {
+                            showCancelledDetails.toggle()
+                        }
+                    } label: {
+                        OrganizerAnalyticsMetricCard(
+                            title: "Cancellati",
+                            value: "\(cancelled.count)",
+                            subtitle: cancelled.count == 1 ? "1 cancellazione" : "\(cancelled.count) cancellazioni",
+                            icon: "xmark.circle",
+                            tint: Brand.destructive
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16)
+                                .stroke(showCancelledDetails ? Brand.destructive : Color.clear, lineWidth: 2)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Cancellati")
+                    .accessibilityValue("\(cancelled.count)")
+                    .accessibilityHint("Mostra o nasconde le iscrizioni cancellate")
+
                     if isPastEvent {
                         OrganizerAnalyticsMetricCard(
                             title: "Attendance",
@@ -21859,13 +21882,6 @@ struct OrganizerEventAnalyticsSection: View {
                             icon: "list.bullet",
                             tint: Brand.warning
                         )
-                        OrganizerAnalyticsMetricCard(
-                            title: "Cancelled",
-                            value: "\(cancelled.count)",
-                            subtitle: "\(broadcastHistory.count) broadcast",
-                            icon: "xmark.circle",
-                            tint: Brand.destructive
-                        )
                     }
                 }
 
@@ -21887,7 +21903,10 @@ struct OrganizerEventAnalyticsSection: View {
                     }
                 }
 
-                OrganizerAnalyticsCancelledPanel(registrations: cancelledDetails)
+                if showCancelledDetails {
+                    OrganizerAnalyticsCancelledPanel(registrations: cancelledDetails)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
 
                 if !meetingPointItems.isEmpty {
                     OrganizerAnalyticsPanel(title: "Meeting Point Distribution", systemImage: "mappin.and.ellipse", subtitle: "Partecipanti per punto di ritrovo") {
