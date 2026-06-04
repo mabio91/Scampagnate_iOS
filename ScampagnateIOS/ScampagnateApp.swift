@@ -22495,7 +22495,7 @@ struct OrganizerParticipantRow: View {
 
                     VStack(alignment: .leading, spacing: 3) {
                         if let phone = registration.profiles?.phone?.nilIfBlank {
-                            Label(phone, systemImage: "phone")
+                            OrganizerParticipantInfoLine(icon: .system("phone"), text: phone)
                         }
                         if registration.isActive,
                            let instagram = registration.profiles?.instagramDisplay,
@@ -22503,20 +22503,16 @@ struct OrganizerParticipantRow: View {
                             Button {
                                 UIApplication.shared.open(url)
                             } label: {
-                                Label {
-                                    Text(instagram)
-                                } icon: {
-                                    OrganizerInstagramIcon()
-                                }
+                                OrganizerParticipantInfoLine(icon: .instagram, text: instagram)
                             }
                             .buttonStyle(.plain)
                             .foregroundStyle(Brand.primary)
                         }
                         if let meetingPoint {
-                            Label(meetingPoint.name ?? "Ritrovo", systemImage: "mappin.and.ellipse")
+                            OrganizerParticipantInfoLine(icon: .system("mappin.and.ellipse"), text: meetingPoint.name ?? "Ritrovo")
                         }
                         if let priceOption = registration.priceOption?.displayName.nilIfBlank {
-                            Label(priceOption, systemImage: "ticket")
+                            OrganizerParticipantInfoLine(icon: .system("ticket"), text: priceOption)
                         }
                     }
                     .font(.caption)
@@ -22684,6 +22680,39 @@ struct OrganizerParticipantRow: View {
     }
 }
 
+private struct OrganizerParticipantInfoLine: View {
+    enum Icon {
+        case system(String)
+        case instagram
+    }
+
+    let icon: Icon
+    let text: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 7) {
+            iconView
+                .frame(width: 17, height: 14, alignment: .center)
+                .padding(.top, 1)
+                .foregroundStyle(Brand.mutedForeground)
+
+            Text(text)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    @ViewBuilder
+    private var iconView: some View {
+        switch icon {
+        case .system(let name):
+            Image(systemName: name)
+                .symbolRenderingMode(.monochrome)
+        case .instagram:
+            OrganizerInstagramIcon()
+        }
+    }
+}
+
 private struct OrganizerInstagramIcon: View {
     var body: some View {
         ZStack {
@@ -22698,7 +22727,6 @@ private struct OrganizerInstagramIcon: View {
                 .offset(x: 3.35, y: -3.35)
         }
         .frame(width: 17, height: 13, alignment: .center)
-        .foregroundStyle(Brand.mutedForeground)
         .accessibilityHidden(true)
     }
 }
