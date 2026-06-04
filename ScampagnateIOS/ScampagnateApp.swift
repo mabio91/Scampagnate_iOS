@@ -11465,7 +11465,7 @@ struct EventDetailView: View {
                 EquipmentSection(items: event.equipmentItems)
             }
 
-            if canViewMeetingPoints(for: event), !event.meetingPoints.isEmpty {
+            if !event.meetingPoints.isEmpty {
                 DisclosureGroup {
                     VStack(alignment: .leading, spacing: 12) {
                         ForEach(event.meetingPoints) { point in
@@ -11640,10 +11640,6 @@ struct EventDetailView: View {
         }
         metrics.append(DetailMetric(title: event.shouldShowPublicCapacity ? "\(activeParticipantCount)/\(event.spotsTotal ?? 0)" : "Sold out", subtitle: "Posti", icon: "person.2"))
         return metrics
-    }
-
-    private func canViewMeetingPoints(for event: Event) -> Bool {
-        store.isAuthenticated && (registration != nil || store.session?.user.id == event.organizerId || store.isAdmin)
     }
 
     private func continueRegistration(_ registration: Registration, event: Event) async {
