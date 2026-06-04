@@ -9719,10 +9719,14 @@ struct EventCalendarView: View {
     }
 
     private var eventsByDay: [Date: [Event]] {
-        Dictionary(grouping: visibleEvents) { event in
-            event.calendarDay ?? .distantFuture
+        var grouped: [Date: [Event]] = [:]
+        for event in visibleEvents {
+            for day in event.calendarDays {
+                grouped[day, default: []].append(event)
+            }
         }
-        .mapValues { events in
+
+        return grouped.mapValues { events in
             events.sorted {
                 ($0.time ?? "") < ($1.time ?? "")
             }
@@ -37107,6 +37111,24 @@ private extension Event {
     var calendarDay: Date? {
         guard let date else { return nil }
         return DateFormatter.eventDate.date(from: date).map { Calendar.current.startOfDay(for: $0) }
+    }
+
+    var calendarDays: [Date] {
+        guard let firstDay = calendarDay else { return [] }
+        guard
+            let start = eventStartDateTime,
+            let end = eventVisibilityEndDateTime,
+            end > start
+        else {
+            return [firstDay]
+        }
+
+        let calendar = Calendar.current
+        let lastTouchedDay = calendar.startOfDay(for: end.addingTimeInterval(-0.001))
+        guard lastTouchedDay >= firstDay else { return [firstDay] }
+
+        let intervalEnd = calendar.date(byAdding: .day, value: 1, to: lastTouchedDay) ?? lastTouchedDay
+        return calendar.days(from: firstDay, to: intervalEnd)
     }
 
     var organizerDate: Date? {
