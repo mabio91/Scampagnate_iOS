@@ -2982,7 +2982,7 @@ struct SupabaseAPI {
     }
 
     func fetchNotifications(session: AuthSession) async throws -> [UserNotification] {
-        let path = "/rest/v1/notifications?select=*&user_id=eq.\(session.user.id)&order=created_at.desc&limit=50"
+        let path = "/rest/v1/notifications?select=*&user_id=eq.\(session.user.id)&type=neq.event_update&order=created_at.desc&limit=50"
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [UserNotification].self)
     }
 
