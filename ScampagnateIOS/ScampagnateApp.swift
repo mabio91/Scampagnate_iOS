@@ -11982,17 +11982,12 @@ struct WhatsAppGlyph: View {
     let size: CGFloat
 
     var body: some View {
-        ZStack {
-            Image(systemName: "bubble.left.fill")
-                .font(.system(size: size, weight: .bold))
-            Image(systemName: "phone.fill")
-                .font(.system(size: size * 0.48, weight: .bold))
-                .rotationEffect(.degrees(-18))
-                .offset(x: size * 0.04, y: -size * 0.02)
-        }
-        .foregroundStyle(.white)
-        .frame(width: size, height: size)
-        .accessibilityHidden(true)
+        Image("WhatsAppBrand")
+            .resizable()
+            .renderingMode(.original)
+            .scaledToFit()
+            .frame(width: size, height: size)
+            .accessibilityHidden(true)
     }
 }
 
