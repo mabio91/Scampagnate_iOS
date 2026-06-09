@@ -2888,7 +2888,7 @@ struct SupabaseAPI {
             }
             let participantRows = registrations.map { registration in
                 if let manual = registration.manualParticipant {
-                    return EventParticipant(id: registration.id, userId: registration.userId, firstName: manual, lastNameInitial: nil, avatarUrl: nil)
+                    return EventParticipant(id: registration.id, userId: registration.userId, firstName: manual, lastName: nil, lastNameInitial: nil, avatarUrl: nil)
                 }
                 let profile = registration.userId.flatMap { profiles[$0] }
                 let publicParticipant = publicParticipantsByRegistrationId[registration.id]
@@ -2897,6 +2897,7 @@ struct SupabaseAPI {
                     id: registration.id,
                     userId: registration.userId,
                     firstName: profile?.firstName ?? publicParticipant?.firstName ?? "?",
+                    lastName: publicParticipant?.lastName,
                     lastNameInitial: profile?.lastNameInitial ?? publicParticipant?.lastNameInitial,
                     avatarUrl: profile?.avatarUrl ?? publicParticipant?.avatarUrl,
                     age: publicParticipant?.age,
@@ -2923,7 +2924,7 @@ struct SupabaseAPI {
         let avatars = try await request(path: "/rest/v1/rpc/get_event_participant_avatars", method: "POST", body: ["p_event_id": eventId], auth: session, decode: [PublicEventAvatar].self)
         return avatars.enumerated().map { index, avatar in
             let id = avatar.userId ?? "manual-\(index)-\(avatar.firstName)"
-            return EventParticipant(id: id, userId: avatar.userId, firstName: avatar.firstName, lastNameInitial: avatar.lastNameInitial, avatarUrl: avatar.avatarUrl)
+            return EventParticipant(id: id, userId: avatar.userId, firstName: avatar.firstName, lastName: nil, lastNameInitial: avatar.lastNameInitial, avatarUrl: avatar.avatarUrl)
         }
     }
 
@@ -6381,6 +6382,7 @@ struct EventParticipant: Identifiable, Hashable, Codable {
     let id: String
     let userId: String?
     let firstName: String?
+    let lastName: String?
     let lastNameInitial: String?
     let avatarUrl: String?
     let age: Int?
@@ -6391,10 +6393,11 @@ struct EventParticipant: Identifiable, Hashable, Codable {
     let role: String?
     let sortOrder: Int?
 
-    init(id: String, userId: String?, firstName: String?, lastNameInitial: String?, avatarUrl: String?, age: Int? = nil, totalPoints: Int? = nil, bio: String? = nil, attendedEventsCount: Int? = nil, badges: [PublicParticipantBadge]? = nil, role: String? = "participant", sortOrder: Int? = nil) {
+    init(id: String, userId: String?, firstName: String?, lastName: String? = nil, lastNameInitial: String?, avatarUrl: String?, age: Int? = nil, totalPoints: Int? = nil, bio: String? = nil, attendedEventsCount: Int? = nil, badges: [PublicParticipantBadge]? = nil, role: String? = "participant", sortOrder: Int? = nil) {
         self.id = id
         self.userId = userId
         self.firstName = firstName
+        self.lastName = lastName
         self.lastNameInitial = lastNameInitial
         self.avatarUrl = avatarUrl
         self.age = age
@@ -6420,7 +6423,7 @@ struct EventParticipant: Identifiable, Hashable, Codable {
 
     var displayName: String {
         let name = firstName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let suffix = normalizedLastNameInitial.map { " \($0)." } ?? ""
+        let suffix = normalizedLastName.map { " \($0)" } ?? normalizedLastNameInitial.map { " \($0)." } ?? ""
         return (name.isEmpty || name == "?") ? "Partecipante" : name + suffix
     }
 
@@ -6440,6 +6443,11 @@ struct EventParticipant: Identifiable, Hashable, Codable {
     private var normalizedLastNameInitial: String? {
         guard let value = lastNameInitial?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
         return String(value.prefix(1)).uppercased()
+    }
+
+    private var normalizedLastName: String? {
+        guard let value = lastName?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+        return value
     }
 }
 
