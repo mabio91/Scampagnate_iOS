@@ -11599,14 +11599,14 @@ struct EventDetailView: View {
                 .tint(Brand.foreground)
             }
 
-            if let whatsappURL = whatsappGroupURL {
-                EventWhatsappGroupCard(url: whatsappURL)
-            }
-
             RulesInfoSection(event: event)
 
             if store.isAuthenticated, !fitScore.hidden {
                 FitScoreSection(result: fitScore)
+            }
+
+            if let whatsappURL = whatsappGroupURL {
+                EventWhatsappGroupCard(url: whatsappURL)
             }
 
             if registration?.canCancel == true {
