@@ -11178,7 +11178,6 @@ struct EventDetailView: View {
                             OrganizerContactDialog(
                                 event: event,
                                 profile: organizerProfile,
-                                levels: store.communityLevels,
                                 onProfile: {
                                     showOrganizerContact = false
                                     showOrganizerProfile = true
@@ -12408,6 +12407,7 @@ struct EventStaffSheet: View {
             OrganizerProfileView(
                 organizerId: contact.profileId,
                 fallbackName: contact.name,
+                roleLabel: contact.role,
                 profile: profile(for: contact),
                 showAuth: $showAuth
             )
@@ -12436,9 +12436,23 @@ struct EventStaffSheet: View {
 
     private func profile(for contact: StaffContactSelection) -> PublicProfile? {
         if contact.id == organizerContact.id {
-            return organizerProfile
+            return organizerProfile ?? publicProfileFallback(for: contact)
         }
-        return normalizedProfileId(contact.profileId).flatMap { staffProfiles[$0] }
+        return normalizedProfileId(contact.profileId).flatMap { staffProfiles[$0] } ?? publicProfileFallback(for: contact)
+    }
+
+    private func publicProfileFallback(for contact: StaffContactSelection) -> PublicProfile? {
+        guard let profileId = normalizedProfileId(contact.profileId) else { return nil }
+        return PublicProfile(
+            id: profileId,
+            firstName: contact.name,
+            avatarUrl: contact.avatarUrl,
+            lastNameInitial: nil,
+            totalPoints: contact.totalPoints,
+            instagramHandle: contact.instagramHandle,
+            phone: contact.phone,
+            bio: nil
+        )
     }
 
     private func normalizedProfileId(_ value: String?) -> String? {
@@ -12458,54 +12472,24 @@ struct StaffContactSelection: Identifiable, Hashable {
 
     var actionSheetHeight: CGFloat {
         let actionCount = (profileId?.nilIfBlank == nil ? 0 : 1)
-            + (instagramHandle?.nilIfBlank == nil ? 0 : 1)
             + (phone?.nilIfBlank == nil ? 0 : 2)
-        switch actionCount {
-        case 4:
-            return 570
-        case 3:
-            return 500
-        case 2:
-            return 430
-        case 1:
-            return 340
-        default:
-            return 320
+        return switch actionCount {
+        case 3: 500
+        case 2: 430
+        case 1: 340
+        default: 320
         }
     }
 }
 
 struct StaffContactActionSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @EnvironmentObject private var store: AppStore
     let contact: StaffContactSelection
     let event: Event
     let onProfile: () -> Void
 
     private var phone: String? {
         contact.phone?.nilIfBlank
-    }
-
-    private var normalizedInstagramHandle: String? {
-        contact.instagramHandle?
-            .trimmingCharacters(in: CharacterSet(charactersIn: "@").union(.whitespacesAndNewlines))
-            .nilIfBlank
-    }
-
-    private var instagramDisplay: String? {
-        normalizedInstagramHandle.map { "@\($0)" }
-    }
-
-    private var instagramURL: URL? {
-        normalizedInstagramHandle.flatMap { URL(string: "https://www.instagram.com/\($0)") }
-    }
-
-    private var communityLevel: CommunityLevelDefinition? {
-        CommunityLevelDefinition.currentLevel(points: contact.totalPoints, levels: store.communityLevels)
-    }
-
-    private var communityLevelColor: Color {
-        communityLevel.flatMap { Color(hex: $0.color) } ?? Brand.primary
     }
 
     private var hasProfile: Bool {
@@ -12533,23 +12517,12 @@ struct StaffContactActionSheet: View {
                         .tracking(0.6)
                         .foregroundStyle(Brand.mutedForeground)
                         .textCase(.uppercase)
-
-                    if let communityLevel {
-                        BadgeLabel(text: communityLevel.name, color: communityLevelColor.opacity(0.12), foreground: communityLevelColor)
-                    }
                 }
             }
 
             VStack(spacing: 12) {
                 if hasProfile {
                     ContactActionButton(icon: "person", title: "Profilo", action: onProfile)
-                }
-
-                if let instagramDisplay, let instagramURL {
-                    ContactActionButton(icon: "camera", title: instagramDisplay) {
-                        dismiss()
-                        UIApplication.shared.open(instagramURL)
-                    }
                 }
 
                 if let phone {
@@ -12566,7 +12539,7 @@ struct StaffContactActionSheet: View {
                     }
                 }
 
-                if !hasProfile && phone == nil && instagramDisplay == nil {
+                if !hasProfile && phone == nil {
                     Label("Nessuna azione disponibile", systemImage: "info.circle")
                         .font(.system(.footnote, design: .rounded, weight: .semibold))
                         .foregroundStyle(Brand.mutedForeground)
@@ -12586,7 +12559,6 @@ struct StaffContactActionSheet: View {
 struct OrganizerContactDialog: View {
     let event: Event
     let profile: PublicProfile?
-    let levels: [CommunityLevelDefinition]
     let onProfile: () -> Void
     let onClose: () -> Void
 
@@ -12596,14 +12568,6 @@ struct OrganizerContactDialog: View {
 
     private var phone: String? {
         profile?.phone?.nilIfBlank
-    }
-
-    private var communityLevel: CommunityLevelDefinition? {
-        CommunityLevelDefinition.currentLevel(points: profile?.totalPoints, levels: levels)
-    }
-
-    private var communityLevelColor: Color {
-        communityLevel.flatMap { Color(hex: $0.color) } ?? Brand.primary
     }
 
     var body: some View {
@@ -12633,19 +12597,9 @@ struct OrganizerContactDialog: View {
                 }
 
                 OrganizerAvatar(name: organizerName, avatarUrl: profile?.avatarUrl, size: 96)
-                if let communityLevel {
-                    BadgeLabel(text: communityLevel.name, color: communityLevelColor.opacity(0.12), foreground: communityLevelColor)
-                }
 
                 VStack(spacing: 12) {
                     ContactActionButton(icon: "person", title: "Profilo", action: onProfile)
-
-                    if let instagramDisplay = profile?.instagramDisplay, let instagramURL = profile?.instagramURL {
-                        ContactActionButton(icon: "camera", title: instagramDisplay) {
-                            onClose()
-                            UIApplication.shared.open(instagramURL)
-                        }
-                    }
 
                     if let phone {
                         ContactActionButton(icon: "message", title: "WhatsApp") {
@@ -12713,6 +12667,7 @@ struct OrganizerProfileView: View {
     @EnvironmentObject private var store: AppStore
     let organizerId: String?
     let fallbackName: String?
+    var roleLabel = "Organizzatore"
     let profile: PublicProfile?
     @Binding var showAuth: Bool
     @State private var selectedEvent: Event?
@@ -12762,9 +12717,11 @@ struct OrganizerProfileView: View {
                     VStack(spacing: 16) {
                         OrganizerAvatar(name: organizerName, avatarUrl: displayProfile?.avatarUrl, size: 112)
                             .overlay(alignment: .bottomTrailing) {
-                                Text("Organizer")
+                                Text(roleLabel)
                                     .font(.system(size: 10, weight: .bold, design: .rounded))
                                     .foregroundStyle(.white)
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.75)
                                     .padding(.horizontal, 8)
                                     .padding(.vertical, 4)
                                     .background(Brand.secondary, in: Capsule())
@@ -12776,6 +12733,12 @@ struct OrganizerProfileView: View {
                             Text(organizerName)
                                 .font(.system(.title2, design: .rounded, weight: .bold))
                                 .foregroundStyle(Brand.foreground)
+
+                            Text(roleLabel)
+                                .font(.system(.caption, design: .rounded, weight: .bold))
+                                .tracking(0.6)
+                                .foregroundStyle(Brand.mutedForeground)
+                                .textCase(.uppercase)
 
                             if let communityLevel {
                                 BadgeLabel(text: communityLevel.name, color: communityLevelColor.opacity(0.12), foreground: communityLevelColor)
