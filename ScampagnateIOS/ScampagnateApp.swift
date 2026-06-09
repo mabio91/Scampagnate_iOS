@@ -11937,16 +11937,14 @@ struct EventDetailView: View {
 struct EventWhatsappGroupCard: View {
     let url: URL
 
-    private let whatsappGreen = Color(red: 0.15, green: 0.83, blue: 0.40)
+    private let fitScoreGreen = Brand.success
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "message.fill")
-                    .font(.headline.weight(.bold))
-                    .foregroundStyle(.white)
+                WhatsAppGlyph(size: 20)
                     .frame(width: 38, height: 38)
-                    .background(whatsappGreen, in: RoundedRectangle(cornerRadius: 13))
+                    .background(fitScoreGreen, in: RoundedRectangle(cornerRadius: 13))
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Gruppo WhatsApp evento")
@@ -11962,18 +11960,39 @@ struct EventWhatsappGroupCard: View {
             Button {
                 UIApplication.shared.open(url)
             } label: {
-                Label("Entra nel gruppo", systemImage: "message.fill")
-                    .font(.subheadline.weight(.bold))
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 44)
-                    .background(whatsappGreen, in: RoundedRectangle(cornerRadius: 15))
+                HStack(spacing: 8) {
+                    WhatsAppGlyph(size: 18)
+                    Text("Entra nel gruppo")
+                }
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .frame(height: 44)
+                .background(fitScoreGreen, in: RoundedRectangle(cornerRadius: 15))
             }
             .buttonStyle(.plain)
         }
         .padding(14)
-        .background(whatsappGreen.opacity(0.10), in: RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).stroke(whatsappGreen.opacity(0.26), lineWidth: 1))
+        .background(fitScoreGreen.opacity(0.10), in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(fitScoreGreen.opacity(0.25), lineWidth: 1))
+    }
+}
+
+struct WhatsAppGlyph: View {
+    let size: CGFloat
+
+    var body: some View {
+        ZStack {
+            Image(systemName: "bubble.left.fill")
+                .font(.system(size: size, weight: .bold))
+            Image(systemName: "phone.fill")
+                .font(.system(size: size * 0.48, weight: .bold))
+                .rotationEffect(.degrees(-18))
+                .offset(x: size * 0.04, y: -size * 0.02)
+        }
+        .foregroundStyle(.white)
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
     }
 }
 
