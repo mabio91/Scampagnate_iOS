@@ -17948,7 +17948,24 @@ struct OrganizerDashboardView: View {
     }
 
     private var pastEvents: [Event] {
-        store.organizerEvents.filter(\.organizerIsHistoric)
+        store.organizerEvents
+            .filter(\.organizerIsHistoric)
+            .sorted { lhs, rhs in
+                switch (lhs.organizerDate, rhs.organizerDate) {
+                case let (lhsDate?, rhsDate?) where lhsDate != rhsDate:
+                    return lhsDate > rhsDate
+                case (.some, .none):
+                    return true
+                case (.none, .some):
+                    return false
+                default:
+                    let titleComparison = lhs.title.localizedCaseInsensitiveCompare(rhs.title)
+                    if titleComparison != .orderedSame {
+                        return titleComparison == .orderedAscending
+                    }
+                    return lhs.id < rhs.id
+                }
+            }
     }
 
     private var filteredBoardEvents: [Event] {
