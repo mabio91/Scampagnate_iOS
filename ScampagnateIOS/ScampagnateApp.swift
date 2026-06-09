@@ -11251,7 +11251,7 @@ struct EventDetailView: View {
                         }
                         .zIndex(1)
 
-                        let headerProgress = compactHeaderProgress()
+                        let headerProgress = compactHeaderProgress(heroHeight: heroHeight)
                         let heroControlsOpacity = heroOpacity(heroHeight: heroHeight)
                         if heroControlsOpacity > 0.04 {
                             heroControls(event, width: proxy.size.width, topInset: proxy.safeAreaInsets.top)
@@ -11495,7 +11495,7 @@ struct EventDetailView: View {
             }
             .frame(width: width, height: heroHeight, alignment: .bottomLeading)
             .offset(y: titleFloatOffset)
-            .opacity(heroOpacity)
+            .opacity(heroTitleOpacity(heroHeight: heroHeight))
         }
         .frame(width: width, height: heroImageHeight)
         .background(Brand.background)
@@ -11532,9 +11532,13 @@ struct EventDetailView: View {
         max(0, min(Double(1 - eventDetailPositiveScrollOffset / (heroHeight * 1.05)), 1))
     }
 
-    private func compactHeaderProgress() -> Double {
-        let revealStart: CGFloat = 190
-        let revealEnd: CGFloat = 260
+    private func heroTitleOpacity(heroHeight: CGFloat) -> Double {
+        max(0, min(Double(1 - eventDetailPositiveScrollOffset / (heroHeight * 1.16)), 1))
+    }
+
+    private func compactHeaderProgress(heroHeight: CGFloat) -> Double {
+        let revealStart = heroHeight * 0.92
+        let revealEnd = heroHeight * 1.02
         let positiveScrollOffset = eventDetailPositiveScrollOffset
         guard positiveScrollOffset > revealStart else { return 0 }
         let progress = min(Double((positiveScrollOffset - revealStart) / (revealEnd - revealStart)), 1)
