@@ -2963,6 +2963,7 @@ struct SupabaseAPI {
                 avatarUrl: profile.avatarUrl,
                 lastNameInitial: profile.lastNameInitial,
                 totalPoints: profile.totalPoints,
+                instagramHandle: profile.instagramHandle,
                 phone: details.phone ?? profile.phone,
                 bio: details.bio ?? profile.bio
             )
@@ -6553,8 +6554,23 @@ struct PublicProfile: Codable {
     let avatarUrl: String?
     let lastNameInitial: String?
     let totalPoints: Int?
+    let instagramHandle: String?
     let phone: String?
     let bio: String?
+
+    var normalizedInstagramHandle: String? {
+        instagramHandle?
+            .trimmingCharacters(in: CharacterSet(charactersIn: "@").union(.whitespacesAndNewlines))
+            .nilIfBlank
+    }
+
+    var instagramDisplay: String? {
+        normalizedInstagramHandle.map { "@\($0)" }
+    }
+
+    var instagramURL: URL? {
+        normalizedInstagramHandle.flatMap { URL(string: "https://www.instagram.com/\($0)") }
+    }
 }
 
 struct OrganizerPublicProfile {
@@ -11162,6 +11178,7 @@ struct EventDetailView: View {
                             OrganizerContactDialog(
                                 event: event,
                                 profile: organizerProfile,
+                                levels: store.communityLevels,
                                 onProfile: {
                                     showOrganizerContact = false
                                     showOrganizerProfile = true
@@ -12279,7 +12296,9 @@ struct EventStaffSheet: View {
             role: "Organizzatore",
             avatarUrl: organizerProfile?.avatarUrl,
             profileId: event.organizerId,
-            phone: organizerProfile?.phone
+            phone: organizerProfile?.phone,
+            totalPoints: organizerProfile?.totalPoints,
+            instagramHandle: organizerProfile?.instagramHandle
         )
     }
 
@@ -12409,7 +12428,9 @@ struct EventStaffSheet: View {
             role: member.role,
             avatarUrl: profile?.avatarUrl ?? member.avatarUrl,
             profileId: normalizedProfileId(member.profileId),
-            phone: profile?.phone
+            phone: profile?.phone,
+            totalPoints: profile?.totalPoints,
+            instagramHandle: profile?.instagramHandle
         )
     }
 
@@ -12432,10 +12453,16 @@ struct StaffContactSelection: Identifiable, Hashable {
     let avatarUrl: String?
     let profileId: String?
     let phone: String?
+    let totalPoints: Int?
+    let instagramHandle: String?
 
     var actionSheetHeight: CGFloat {
-        let actionCount = (profileId?.nilIfBlank == nil ? 0 : 1) + (phone?.nilIfBlank == nil ? 0 : 2)
+        let actionCount = (profileId?.nilIfBlank == nil ? 0 : 1)
+            + (instagramHandle?.nilIfBlank == nil ? 0 : 1)
+            + (phone?.nilIfBlank == nil ? 0 : 2)
         switch actionCount {
+        case 4:
+            return 570
         case 3:
             return 500
         case 2:
@@ -12450,12 +12477,35 @@ struct StaffContactSelection: Identifiable, Hashable {
 
 struct StaffContactActionSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var store: AppStore
     let contact: StaffContactSelection
     let event: Event
     let onProfile: () -> Void
 
     private var phone: String? {
         contact.phone?.nilIfBlank
+    }
+
+    private var normalizedInstagramHandle: String? {
+        contact.instagramHandle?
+            .trimmingCharacters(in: CharacterSet(charactersIn: "@").union(.whitespacesAndNewlines))
+            .nilIfBlank
+    }
+
+    private var instagramDisplay: String? {
+        normalizedInstagramHandle.map { "@\($0)" }
+    }
+
+    private var instagramURL: URL? {
+        normalizedInstagramHandle.flatMap { URL(string: "https://www.instagram.com/\($0)") }
+    }
+
+    private var communityLevel: CommunityLevelDefinition? {
+        CommunityLevelDefinition.currentLevel(points: contact.totalPoints, levels: store.communityLevels)
+    }
+
+    private var communityLevelColor: Color {
+        communityLevel.flatMap { Color(hex: $0.color) } ?? Brand.primary
     }
 
     private var hasProfile: Bool {
@@ -12483,12 +12533,23 @@ struct StaffContactActionSheet: View {
                         .tracking(0.6)
                         .foregroundStyle(Brand.mutedForeground)
                         .textCase(.uppercase)
+
+                    if let communityLevel {
+                        BadgeLabel(text: communityLevel.name, color: communityLevelColor.opacity(0.12), foreground: communityLevelColor)
+                    }
                 }
             }
 
             VStack(spacing: 12) {
                 if hasProfile {
                     ContactActionButton(icon: "person", title: "Profilo", action: onProfile)
+                }
+
+                if let instagramDisplay, let instagramURL {
+                    ContactActionButton(icon: "camera", title: instagramDisplay) {
+                        dismiss()
+                        UIApplication.shared.open(instagramURL)
+                    }
                 }
 
                 if let phone {
@@ -12505,7 +12566,7 @@ struct StaffContactActionSheet: View {
                     }
                 }
 
-                if !hasProfile && phone == nil {
+                if !hasProfile && phone == nil && instagramDisplay == nil {
                     Label("Nessuna azione disponibile", systemImage: "info.circle")
                         .font(.system(.footnote, design: .rounded, weight: .semibold))
                         .foregroundStyle(Brand.mutedForeground)
@@ -12525,6 +12586,7 @@ struct StaffContactActionSheet: View {
 struct OrganizerContactDialog: View {
     let event: Event
     let profile: PublicProfile?
+    let levels: [CommunityLevelDefinition]
     let onProfile: () -> Void
     let onClose: () -> Void
 
@@ -12534,6 +12596,14 @@ struct OrganizerContactDialog: View {
 
     private var phone: String? {
         profile?.phone?.nilIfBlank
+    }
+
+    private var communityLevel: CommunityLevelDefinition? {
+        CommunityLevelDefinition.currentLevel(points: profile?.totalPoints, levels: levels)
+    }
+
+    private var communityLevelColor: Color {
+        communityLevel.flatMap { Color(hex: $0.color) } ?? Brand.primary
     }
 
     var body: some View {
@@ -12563,9 +12633,19 @@ struct OrganizerContactDialog: View {
                 }
 
                 OrganizerAvatar(name: organizerName, avatarUrl: profile?.avatarUrl, size: 96)
+                if let communityLevel {
+                    BadgeLabel(text: communityLevel.name, color: communityLevelColor.opacity(0.12), foreground: communityLevelColor)
+                }
 
                 VStack(spacing: 12) {
                     ContactActionButton(icon: "person", title: "Profilo", action: onProfile)
+
+                    if let instagramDisplay = profile?.instagramDisplay, let instagramURL = profile?.instagramURL {
+                        ContactActionButton(icon: "camera", title: instagramDisplay) {
+                            onClose()
+                            UIApplication.shared.open(instagramURL)
+                        }
+                    }
 
                     if let phone {
                         ContactActionButton(icon: "message", title: "WhatsApp") {
@@ -12612,6 +12692,8 @@ struct ContactActionButton: View {
                 Text(title)
                     .font(.system(.title3, design: .rounded, weight: .medium))
                     .foregroundStyle(Brand.foreground)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
                 Spacer()
             }
             .frame(height: 66)
@@ -12645,6 +12727,14 @@ struct OrganizerProfileView: View {
 
     private var organizerName: String {
         displayProfile?.firstName.nilIfBlank ?? fallbackName ?? "Organizzatore"
+    }
+
+    private var communityLevel: CommunityLevelDefinition? {
+        CommunityLevelDefinition.currentLevel(points: displayProfile?.totalPoints, levels: store.communityLevels)
+    }
+
+    private var communityLevelColor: Color {
+        communityLevel.flatMap { Color(hex: $0.color) } ?? Brand.primary
     }
 
     private var organizerEvents: [Event] {
@@ -12687,6 +12777,10 @@ struct OrganizerProfileView: View {
                                 .font(.system(.title2, design: .rounded, weight: .bold))
                                 .foregroundStyle(Brand.foreground)
 
+                            if let communityLevel {
+                                BadgeLabel(text: communityLevel.name, color: communityLevelColor.opacity(0.12), foreground: communityLevelColor)
+                            }
+
                             HStack(spacing: 14) {
                                 Label("\(organizerData?.eventCount ?? organizerEvents.count) eventi creati", systemImage: "calendar")
                                 if !upcomingEvents.isEmpty {
@@ -12704,6 +12798,16 @@ struct OrganizerProfileView: View {
                                 .multilineTextAlignment(.center)
                                 .fixedSize(horizontal: false, vertical: true)
                                 .padding(.top, 4)
+                        }
+
+                        if let instagramDisplay = displayProfile?.instagramDisplay, let instagramURL = displayProfile?.instagramURL {
+                            Button {
+                                UIApplication.shared.open(instagramURL)
+                            } label: {
+                                Label(instagramDisplay, systemImage: "camera")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(SecondaryPillButtonStyle())
                         }
 
                         if !store.isAuthenticated {
