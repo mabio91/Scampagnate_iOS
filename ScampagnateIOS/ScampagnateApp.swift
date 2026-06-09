@@ -1068,6 +1068,16 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func fetchEventWhatsappGroupUrl(eventId: String, reportingErrors: Bool = false) async -> URL? {
+        do {
+            let authSession = try await authenticatedSession()
+            return try await api.fetchEventWhatsappGroupUrl(eventId: eventId, session: authSession)
+        } catch {
+            report(error, when: reportingErrors)
+            return nil
+        }
+    }
+
     func fetchPublicProfiles(userIds: [String], reportingErrors: Bool = true) async -> [String: PublicProfile] {
         do {
             return try await api.fetchPublicProfiles(userIds: userIds, session: session)
@@ -2534,6 +2544,17 @@ struct SupabaseAPI {
         let events = try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [Event].self)
         guard let event = events.first else { throw AppError.message("Evento non disponibile") }
         return event
+    }
+
+    func fetchEventWhatsappGroupUrl(eventId: String, session: AuthSession) async throws -> URL? {
+        let path = "/rest/v1/event_whatsapp_links?select=url&event_id=eq.\(eventId.urlEncoded)&limit=1"
+        let rows = try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [EventWhatsappLinkRow].self)
+        guard let raw = rows.first?.url?.nilIfBlank,
+              raw.lowercased().hasPrefix("https://chat.whatsapp.com/"),
+              let url = URL(string: raw) else {
+            return nil
+        }
+        return url
     }
 
     func fetchEventStaff(eventId: String, session: AuthSession?) async throws -> [EventStaffMember] {
@@ -4310,11 +4331,12 @@ struct Event: Codable, Identifiable, Hashable {
     let equipmentList: [EquipmentItem]?
     let additionalFields: JSONValue?
     let accessRules: JSONValue?
+    let eventWhatsappLinks: JSONValue?
     let eventStaff: [EventStaffMember]?
 
     enum CodingKeys: String, CodingKey {
         case id, title, date, time, location, categoryId, status, price, deposit, difficulty, distance, elevation, duration, featured, description, visibility
-        case locationLabel, paymentType, balancePaymentMode, imageUrl, spotsTotal, spotsTaken, reservedSpots, eventBadges, organizerId, organizerName, cancellationPolicy, galleryImages, equipmentList, additionalFields, accessRules, eventStaff
+        case locationLabel, paymentType, balancePaymentMode, imageUrl, spotsTotal, spotsTaken, reservedSpots, eventBadges, organizerId, organizerName, cancellationPolicy, galleryImages, equipmentList, additionalFields, accessRules, eventWhatsappLinks, eventStaff
         case eventCategories, eventMeetingPoints, eventPriceOptions
     }
 
@@ -4324,6 +4346,16 @@ struct Event: Codable, Identifiable, Hashable {
     var gallery: [GalleryImage] { (galleryImages ?? []).sorted { ($0.order ?? 0) < ($1.order ?? 0) } }
     var homeCardImageUrl: String? { additionalFields?.string(at: "home_card_image_url")?.nilIfBlank }
     var cardImageUrl: String? { homeCardImageUrl ?? imageUrl ?? gallery.first?.url }
+    var whatsappGroupUrlString: String? {
+        let relation = eventWhatsappLinks
+        let row = relation?.arrayValue?.first ?? relation
+        guard let raw = row?.string(at: "url")?.nilIfBlank else { return nil }
+        guard raw.lowercased().hasPrefix("https://chat.whatsapp.com/") else { return nil }
+        return raw
+    }
+    var whatsappGroupURL: URL? {
+        whatsappGroupUrlString.flatMap(URL.init(string:))
+    }
     var equipmentItems: [EquipmentItem] { equipmentList ?? [] }
     var staffMembers: [EventStaffMember] { (eventStaff ?? []).sorted { ($0.sortOrder ?? 0) < ($1.sortOrder ?? 0) } }
     var hasEquipment: Bool { !equipmentItems.isEmpty }
@@ -6498,6 +6530,10 @@ struct PublicEventAvatar: Codable {
     let lastNameInitial: String?
 }
 
+struct EventWhatsappLinkRow: Codable {
+    let url: String?
+}
+
 struct Registration: Codable, Identifiable, Hashable {
     let id: String
     let eventId: String?
@@ -6523,6 +6559,10 @@ struct Registration: Codable, Identifiable, Hashable {
         (status == nil && checkedIn != true)
     }
     var isActive: Bool { !["cancelled", "no_show", "failed", "expired"].contains(normalizedStatus) }
+    var canViewWhatsappGroup: Bool {
+        paymentStatus?.nilIfBlank?.lowercased() != "pending"
+            && ["registered", "deposit_paid", "paid", "attended", "no_show"].contains(normalizedStatus)
+    }
     var blocksNewRegistration: Bool {
         !["cancelled", "failed", "expired"].contains(normalizedStatus)
     }
@@ -10949,6 +10989,7 @@ struct EventDetailView: View {
     @State private var paymentLoading = false
     @State private var scrollOffset: CGFloat = 0
     @State private var didOpenInitialParticipants = false
+    @State private var whatsappGroupURL: URL?
 
     init(eventId: String, showAuth: Binding<Bool>, openParticipantsOnAppear: Bool = false) {
         self.eventId = eventId
@@ -11000,6 +11041,13 @@ struct EventDetailView: View {
 
     var canViewParticipantDetails: Bool {
         store.isAuthenticated && store.profile != nil && !store.needsOnboarding
+    }
+
+    var canRequestWhatsappGroupURL: Bool {
+        guard let event else { return false }
+        if store.isAdmin { return true }
+        if event.organizerId == store.session?.user.id { return true }
+        return registration?.canViewWhatsappGroup == true
     }
 
     private func accessCheck(for event: Event) -> EventAccessCheck {
@@ -11200,6 +11248,9 @@ struct EventDetailView: View {
         .task(id: "\(eventId)-\(store.session?.user.id ?? "anon")-\(store.needsOnboarding)") {
             await store.loadParticipants(eventId: eventId)
         }
+        .task(id: "\(eventId)-whatsapp-\(store.session?.user.id ?? "anon")-\(registration?.id ?? "none")-\(store.isAdmin)") {
+            await loadWhatsappGroupURLIfNeeded()
+        }
     }
 
     private var eventDetailPositiveScrollOffset: CGFloat {
@@ -11212,6 +11263,15 @@ struct EventDetailView: View {
 
     private var eventDetailPullDistance: CGFloat {
         min(eventDetailRawPullDistance, 160)
+    }
+
+    private func loadWhatsappGroupURLIfNeeded() async {
+        guard canRequestWhatsappGroupURL else {
+            whatsappGroupURL = nil
+            return
+        }
+
+        whatsappGroupURL = await store.fetchEventWhatsappGroupUrl(eventId: eventId)
     }
 
     private func hero(_ event: Event, width: CGFloat, topInset: CGFloat) -> some View {
@@ -11492,6 +11552,10 @@ struct EventDetailView: View {
                         .foregroundStyle(Brand.foreground)
                 }
                 .tint(Brand.foreground)
+            }
+
+            if let whatsappURL = whatsappGroupURL {
+                EventWhatsappGroupCard(url: whatsappURL)
             }
 
             RulesInfoSection(event: event)
@@ -11823,6 +11887,49 @@ struct EventDetailView: View {
         return destination.nilIfBlank?.addingPercentEncoding(withAllowedCharacters: allowedCharacters)
     }
 
+}
+
+struct EventWhatsappGroupCard: View {
+    let url: URL
+
+    private let whatsappGreen = Color(red: 0.15, green: 0.83, blue: 0.40)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "message.fill")
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 38, height: 38)
+                    .background(whatsappGreen, in: RoundedRectangle(cornerRadius: 13))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Gruppo WhatsApp evento")
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                    Text("Entra nel gruppo dedicato per aggiornamenti, dettagli pratici e comunicazioni dello staff.")
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Button {
+                UIApplication.shared.open(url)
+            } label: {
+                Label("Entra nel gruppo", systemImage: "message.fill")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 44)
+                    .background(whatsappGreen, in: RoundedRectangle(cornerRadius: 15))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(14)
+        .background(whatsappGreen.opacity(0.10), in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(whatsappGreen.opacity(0.26), lineWidth: 1))
+    }
 }
 
 struct RegistrationEditHintCard: View {
@@ -17038,6 +17145,7 @@ struct EventRegistrationCard: View {
     @State private var feedback: AppFeedback?
     @State private var activeCheckout: ActiveCheckout?
     @State private var paymentLoading = false
+    @State private var whatsappGroupURL: URL?
 
     private var event: Event? {
         registration.event
@@ -17062,6 +17170,10 @@ struct EventRegistrationCard: View {
         let hasEditableFields = !event.meetingPoints.isEmpty || event.asksCarAvailability || !event.checkoutCustomFields.isEmpty || event.priceOptions.count > 1
         guard hasEditableFields else { return false }
         return event.calendarStartDate.map { $0 > Date() } ?? false
+    }
+
+    private var canRequestWhatsappGroupURL: Bool {
+        registration.canViewWhatsappGroup && event != nil
     }
 
     var body: some View {
@@ -17115,6 +17227,14 @@ struct EventRegistrationCard: View {
                     .padding(12)
                 }
                 .buttonStyle(.plain)
+
+                if let whatsappURL = whatsappGroupURL {
+                    Divider()
+                        .padding(.horizontal, 12)
+                    EventWhatsappGroupCard(url: whatsappURL)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 12)
+                }
 
                 if shouldShowUtilityActions {
                     Divider()
@@ -17177,7 +17297,19 @@ struct EventRegistrationCard: View {
                     feedback = result
                 }
             }
+            .task(id: "\(registration.id)-whatsapp-\(event.id)") {
+                await loadWhatsappGroupURLIfNeeded()
+            }
         }
+    }
+
+    private func loadWhatsappGroupURLIfNeeded() async {
+        guard canRequestWhatsappGroupURL, let event else {
+            whatsappGroupURL = nil
+            return
+        }
+
+        whatsappGroupURL = await store.fetchEventWhatsappGroupUrl(eventId: event.id)
     }
 
     private func shareItems(for event: Event) -> [Any] {
