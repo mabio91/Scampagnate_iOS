@@ -10421,7 +10421,17 @@ struct FeaturedEventCard: View {
                             .padding(.vertical, 7)
                             .background(.black.opacity(0.50), in: UnevenRoundedRectangle(topLeadingRadius: 20, bottomTrailingRadius: 16))
                         Spacer()
-                        if !event.isSoldOut && event.hasActivePromo {
+                        if event.isSoldOut {
+                            Text("Sold out")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.82)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 7)
+                                .background(Brand.destructive.opacity(0.92), in: UnevenRoundedRectangle(bottomLeadingRadius: 16, topTrailingRadius: 20))
+                                .accessibilityLabel("Evento sold out")
+                        } else if event.hasActivePromo {
                             EventPromoBadge()
                                 .padding(10)
                         } else if event.featured == true {
