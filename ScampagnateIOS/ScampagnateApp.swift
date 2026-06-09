@@ -14155,18 +14155,21 @@ struct ParticipantsEmptyState: View {
 struct DescriptionBlock: View {
     let description: String
     @Binding var expanded: Bool
-    @State private var renderedHeight: CGFloat = 1
+    @State private var renderedHeight: CGFloat = 0
+    @State private var hasMeasuredHeight = false
     private let collapsedHeight: CGFloat = 168
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             SectionTitle("L'esperienza")
             ZStack(alignment: .bottom) {
-                EventDescriptionHTMLView(html: EventDescriptionHTML.cleanStoredHTML(from: description), height: $renderedHeight)
-                    .frame(height: expanded ? renderedHeight : min(renderedHeight, collapsedHeight))
+                EventDescriptionHTMLView(html: cleanHTML, height: $renderedHeight, isReady: $hasMeasuredHeight)
+                    .frame(height: descriptionFrameHeight)
                     .clipped()
+                    .opacity(hasMeasuredHeight ? 1 : 0)
+                    .accessibilityHidden(!hasMeasuredHeight)
 
-                if isLongDescription && !expanded {
+                if hasMeasuredHeight && isLongDescription && !expanded {
                     LinearGradient(
                         colors: [Brand.background.opacity(0), Brand.background],
                         startPoint: .top,
@@ -14189,14 +14192,41 @@ struct DescriptionBlock: View {
         }
     }
 
+    private var cleanHTML: String {
+        EventDescriptionHTML.cleanStoredHTML(from: description)
+    }
+
+    private var measuredHeight: CGFloat {
+        max(renderedHeight, 1)
+    }
+
+    private var descriptionFrameHeight: CGFloat {
+        if hasMeasuredHeight {
+            return expanded ? measuredHeight : min(measuredHeight, collapsedHeight)
+        }
+
+        return likelyLongDescription ? collapsedHeight : 1
+    }
+
+    private var likelyLongDescription: Bool {
+        description.htmlPlainText.count > 520
+    }
+
     private var isLongDescription: Bool {
-        description.htmlPlainText.count > 520 || renderedHeight > collapsedHeight + 20
+        likelyLongDescription || (hasMeasuredHeight && measuredHeight > collapsedHeight + 20)
     }
 }
 
 private struct EventDescriptionHTMLView: UIViewRepresentable {
     let html: String
     @Binding var height: CGFloat
+    @Binding private var isReady: Bool
+
+    init(html: String, height: Binding<CGFloat>, isReady: Binding<Bool> = .constant(true)) {
+        self.html = html
+        self._height = height
+        self._isReady = isReady
+    }
 
     func makeUIView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
@@ -14219,19 +14249,26 @@ private struct EventDescriptionHTMLView: UIViewRepresentable {
         let document = EventDescriptionHTML.renderDocument(for: html)
         guard context.coordinator.loadedDocument != document else { return }
         context.coordinator.loadedDocument = document
+        context.coordinator.markLoading()
         webView.loadHTMLString(document, baseURL: nil)
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(height: $height)
+        Coordinator(height: $height, isReady: $isReady)
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
         @Binding private var height: CGFloat
+        @Binding private var isReady: Bool
         var loadedDocument = ""
 
-        init(height: Binding<CGFloat>) {
+        init(height: Binding<CGFloat>, isReady: Binding<Bool>) {
             self._height = height
+            self._isReady = isReady
+        }
+
+        func markLoading() {
+            updateLayoutState(height: 0, isReady: false)
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -14258,8 +14295,21 @@ private struct EventDescriptionHTMLView: UIViewRepresentable {
             webView.evaluateJavaScript(script) { [weak self] result, _ in
                 let value = (result as? NSNumber)?.doubleValue ?? result as? Double ?? 0
                 let nextHeight = max(CGFloat(value).rounded(.up), 1)
-                guard abs((self?.height ?? 0) - nextHeight) > 1 else { return }
-                self?.height = nextHeight
+                self?.updateLayoutState(height: nextHeight, isReady: true)
+            }
+        }
+
+        private func updateLayoutState(height nextHeight: CGFloat, isReady nextIsReady: Bool) {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+
+            withTransaction(transaction) {
+                if abs(height - nextHeight) > 1 {
+                    height = nextHeight
+                }
+                if isReady != nextIsReady {
+                    isReady = nextIsReady
+                }
             }
         }
     }
