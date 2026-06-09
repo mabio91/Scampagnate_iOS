@@ -3368,11 +3368,28 @@ struct SupabaseAPI {
             eventId = inserted.id
         }
 
+        try await syncEventWhatsappGroupUrl(eventId: eventId, draft: draft, session: session)
         try await replaceMeetingPoints(eventId: eventId, points: draft.meetingPoints, session: session)
         try await replacePriceOptions(eventId: eventId, options: draft.priceOptions, session: session)
         try await replaceSpecialBadges(eventId: eventId, badgeIds: draft.specialBadgeIds, session: session)
         try await replaceEventStaffIfAvailable(eventId: eventId, staff: draft.staffMembers, session: session)
         return eventId
+    }
+
+    private func syncEventWhatsappGroupUrl(eventId: String, draft: OrganizerEventDraft, session: AuthSession) async throws {
+        if draft.hasInvalidWhatsappGroupUrl {
+            throw AppError.message("Link gruppo WhatsApp non valido")
+        }
+        guard let url = draft.normalizedWhatsappGroupUrl else {
+            let _: EmptyResponse = try await request(path: "/rest/v1/event_whatsapp_links?event_id=eq.\(eventId.urlEncoded)", method: "DELETE", bodyData: nil, auth: session, decode: EmptyResponse.self)
+            return
+        }
+        let payload: [String: JSONValue] = [
+            "event_id": .string(eventId),
+            "url": .string(url)
+        ]
+        let data = try JSONEncoder().encode(payload)
+        let _: EmptyResponse = try await request(path: "/rest/v1/event_whatsapp_links?on_conflict=event_id", method: "POST", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "resolution=merge-duplicates,return=minimal")
     }
 
     private func replaceMeetingPoints(eventId: String, points: [OrganizerMeetingPointDraft], session: AuthSession) async throws {
@@ -6009,6 +6026,7 @@ struct OrganizerEventDraft: Equatable {
     var cancellationPolicy = "flexible_24h"
     var imageUrl = ""
     var homeCardImageUrl = ""
+    var whatsappGroupUrl = ""
     var visibility = "public"
     var status = "open"
     var galleryImageURLs: [String] = []
@@ -6201,6 +6219,30 @@ struct OrganizerEventDraft: Equatable {
         }
     }
 
+    static func normalizedWhatsappGroupUrl(_ raw: String?) -> String? {
+        guard var candidate = raw?.nilIfBlank else { return nil }
+        if candidate.lowercased().hasPrefix("chat.whatsapp.com/") {
+            candidate = "https://\(candidate)"
+        }
+        guard var components = URLComponents(string: candidate),
+              components.scheme?.lowercased() == "https",
+              components.host?.lowercased() == "chat.whatsapp.com",
+              components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).nilIfBlank != nil else {
+            return nil
+        }
+        components.scheme = "https"
+        components.host = "chat.whatsapp.com"
+        return components.url?.absoluteString
+    }
+
+    var normalizedWhatsappGroupUrl: String? {
+        Self.normalizedWhatsappGroupUrl(whatsappGroupUrl)
+    }
+
+    var hasInvalidWhatsappGroupUrl: Bool {
+        whatsappGroupUrl.nilIfBlank != nil && normalizedWhatsappGroupUrl == nil
+    }
+
     var validationMessage: String? {
         validationMessages.first
     }
@@ -6243,6 +6285,9 @@ struct OrganizerEventDraft: Equatable {
             if validOptions.contains(where: { $0.hasDedicatedSpots && $0.dedicatedSpots < 1 }) { messages.append("Posti dedicati per le opzioni con limite attivo") }
         } else {
             if spotsTotal < 1 { messages.append("Capienza almeno 1 posto") }
+        }
+        if hasInvalidWhatsappGroupUrl {
+            messages.append("Link gruppo WhatsApp nel formato https://chat.whatsapp.com/...")
         }
         return messages
     }
@@ -23694,6 +23739,10 @@ struct OrganizerEventEditorView: View {
                                 OrganizerEventTimePickerField("Ora", timeString: $draft.time)
                                 OrganizerAddressAutocompleteField("Luogo", text: $draft.location, label: $draft.locationLabel)
                                 Field("Etichetta luogo", text: $draft.locationLabel)
+                                Field("Link gruppo WhatsApp", text: $draft.whatsappGroupUrl, keyboard: .URL)
+                                Text("Visibile solo a iscritti, organizzatore e admin.")
+                                    .font(.caption)
+                                    .foregroundStyle(Brand.mutedForeground)
                                 Text("Categoria evento")
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(Brand.foreground)
@@ -24143,7 +24192,12 @@ struct OrganizerEventEditorView: View {
                 let staff = await staffTask
                 let prices = await pricesTask
                 let badges = await specialBadgeIdsTask
-                draft = OrganizerEventDraft(event: event, meetingPoints: points, staffMembers: staff, priceOptions: prices, specialBadgeIds: badges, duplicate: route.mode.isDuplicate)
+                var loadedDraft = OrganizerEventDraft(event: event, meetingPoints: points, staffMembers: staff, priceOptions: prices, specialBadgeIds: badges, duplicate: route.mode.isDuplicate)
+                if !route.mode.isDuplicate {
+                    let whatsappGroupURL = await store.fetchEventWhatsappGroupUrl(eventId: eventId, reportingErrors: false)
+                    loadedDraft.whatsappGroupUrl = whatsappGroupURL?.absoluteString ?? ""
+                }
+                draft = loadedDraft
             }
         }
         loading = false
@@ -24158,6 +24212,9 @@ struct OrganizerEventEditorView: View {
         let messages = draft.validationMessages
         validationMessage = messages.isEmpty ? nil : "Completa prima:\n" + messages.map { "- \($0)" }.joined(separator: "\n")
         guard messages.isEmpty else { return }
+        if let normalizedWhatsappGroupUrl = draft.normalizedWhatsappGroupUrl {
+            draft.whatsappGroupUrl = normalizedWhatsappGroupUrl
+        }
         saving = true
         defer { saving = false }
         let existingId: String?
