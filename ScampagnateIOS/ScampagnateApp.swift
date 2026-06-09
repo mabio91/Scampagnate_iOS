@@ -278,9 +278,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate, @preconcurrency UNUser
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
-        let destination = NotificationDestination.from(userInfo: response.notification.request.content.userInfo)
+        let userInfo = response.notification.request.content.userInfo
+        let destination = NotificationDestination.from(userInfo: userInfo)
+        let notificationId = NotificationDestination.notificationId(from: userInfo)
         Task { @MainActor in
-            PushNotificationService.shared.handleNotificationDestination(destination)
+            PushNotificationService.shared.handleNotificationDestination(destination, notificationId: notificationId)
             completionHandler()
         }
     }
@@ -1149,6 +1151,35 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func markNotificationClicked(_ id: String) async {
+        guard session != nil else { return }
+        do {
+            let authSession = try await authenticatedSession()
+            try await api.markNotificationClicked(id: id, session: authSession)
+            notifications = notifications.map { notification in
+                var copy = notification
+                if copy.id == id {
+                    copy.read = true
+                    copy.clickedAt = ISO8601DateFormatter().string(from: Date())
+                }
+                return copy
+            }
+        } catch {
+            report(error)
+        }
+    }
+
+    func fetchEventEngagementMetrics(eventIds: [String], reportingErrors: Bool = true) async -> [String: EventEngagementMetrics] {
+        do {
+            let authSession = try await authenticatedSession()
+            let metrics = try await api.fetchEventEngagementMetrics(eventIds: eventIds, session: authSession)
+            return Dictionary(uniqueKeysWithValues: metrics.map { ($0.eventId, $0) })
+        } catch {
+            report(error, when: reportingErrors)
+            return [:]
+        }
+    }
+
     func signOut() {
         let authSession = session
         clearUserSession()
@@ -1958,6 +1989,7 @@ struct ContentPageRoute: Identifiable, Hashable, Sendable {
 struct NotificationNavigationRequest: Identifiable, Equatable, Sendable {
     let id = UUID()
     let destination: NotificationDestination?
+    let notificationId: String?
 }
 
 enum ProfileScrollTarget: Hashable, Sendable {
@@ -2052,6 +2084,14 @@ enum NotificationDestination: Equatable, Sendable {
             return nil
         }
         return destination(fromRoute: route)
+    }
+
+    static func notificationId(from userInfo: [AnyHashable: Any]) -> String? {
+        nestedPayloads(userInfo)
+            .lazy
+            .compactMap { stringValue(in: $0, keys: ["notification_id", "notificationId", "notification"]) }
+            .first?
+            .nilIfBlank
     }
 
     var actionTitle: String {
@@ -2392,8 +2432,8 @@ final class PushNotificationService: ObservableObject {
         errorMessage = error.localizedDescription
     }
 
-    func handleNotificationDestination(_ destination: NotificationDestination?) {
-        tappedNotification = NotificationNavigationRequest(destination: destination)
+    func handleNotificationDestination(_ destination: NotificationDestination?, notificationId: String? = nil) {
+        tappedNotification = NotificationNavigationRequest(destination: destination, notificationId: notificationId)
     }
 
     func consumeTappedNotification(_ request: NotificationNavigationRequest) {
@@ -3002,6 +3042,15 @@ struct SupabaseAPI {
         let select = "id,event_id,created_at,cancelled_at,notified_at"
         let path = "/rest/v1/event_opening_reminders?select=\(select.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)&cancelled_at=is.null&notified_at=is.null&order=created_at.desc"
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [EventOpeningReminder].self)
+    }
+
+    func fetchEventEngagementMetrics(eventIds: [String], session: AuthSession) async throws -> [EventEngagementMetrics] {
+        let ids = Array(Set(eventIds.compactMap { $0.nilIfBlank })).sorted()
+        guard !ids.isEmpty else { return [] }
+        let body: [String: JSONValue] = [
+            "p_event_ids": .array(ids.map { .string($0) })
+        ]
+        return try await request(path: "/rest/v1/rpc/get_event_engagement_metrics", method: "POST", body: body, auth: session, decode: [EventEngagementMetrics].self)
     }
 
     func fetchNotifications(session: AuthSession) async throws -> [UserNotification] {
@@ -3870,6 +3919,16 @@ struct SupabaseAPI {
     func markNotificationRead(id: String, session: AuthSession) async throws {
         let payload = ["read": true]
         let _: EmptyResponse = try await request(path: "/rest/v1/notifications?id=eq.\(id)", method: "PATCH", body: payload, auth: session, decode: EmptyResponse.self)
+    }
+
+    func markNotificationClicked(id: String, session: AuthSession) async throws {
+        let payload: [String: JSONValue] = [
+            "read": .bool(true),
+            "clicked_at": .string(ISO8601DateFormatter().string(from: Date()))
+        ]
+        let data = try JSONEncoder().encode(payload)
+        let path = "/rest/v1/notifications?id=eq.\(id.urlEncoded)&user_id=eq.\(session.user.id.urlEncoded)"
+        let _: EmptyResponse = try await request(path: path, method: "PATCH", bodyData: data, auth: session, decode: EmptyResponse.self, prefer: "return=minimal")
     }
 
     func upsertIOSDeviceToken(token: String, installationId: String, environment: String, deviceModel: String, session: AuthSession) async throws {
@@ -5731,6 +5790,29 @@ struct OrganizerDashboardRegistration: Codable, Identifiable, Hashable {
     }
 }
 
+struct EventEngagementMetrics: Codable, Identifiable, Hashable {
+    let eventId: String
+    let savedCount: Int
+    let openingReminderActiveCount: Int
+    let openingReminderNotifiedCount: Int
+    let openingNotificationClickCount: Int
+
+    var id: String { eventId }
+    var totalOpeningReminderCount: Int {
+        openingReminderActiveCount + openingReminderNotifiedCount
+    }
+
+    static func empty(eventId: String) -> EventEngagementMetrics {
+        EventEngagementMetrics(
+            eventId: eventId,
+            savedCount: 0,
+            openingReminderActiveCount: 0,
+            openingReminderNotifiedCount: 0,
+            openingNotificationClickCount: 0
+        )
+    }
+}
+
 struct OrganizerSearchProfile: Codable, Identifiable, Hashable {
     let id: String
     let firstName: String?
@@ -6825,6 +6907,7 @@ struct UserNotification: Codable, Identifiable {
     let missionId: String?
     var read: Bool
     let createdAt: String?
+    var clickedAt: String?
 }
 
 private extension UserNotification {
@@ -8359,6 +8442,9 @@ struct RootView: View {
     }
 
     private func handleNotificationRequest(_ request: NotificationNavigationRequest) {
+        if let notificationId = request.notificationId {
+            Task { await store.markNotificationClicked(notificationId) }
+        }
         if let destination = request.destination {
             handleNotificationDestination(destination)
         } else {
@@ -20523,6 +20609,7 @@ struct OrganizerEventManageView: View {
     @State private var priceOptions: [PriceOption] = []
     @State private var templates: [BroadcastTemplate] = []
     @State private var broadcastHistory: [EventBroadcast] = []
+    @State private var engagementMetrics: EventEngagementMetrics?
     @State private var tab = 0
     @State private var loading = true
     @State private var editorRoute: OrganizerEditorRoute?
@@ -20679,6 +20766,8 @@ struct OrganizerEventManageView: View {
                 }
             }
 
+            OrganizerEventEngagementCard(metrics: engagementMetrics ?? .empty(eventId: event.id))
+
             OrganizerParticipationOptionsBreakdown(event: event, registrations: registrations, priceOptions: priceOptions)
 
             OrganizerManagePrimaryActions(
@@ -20781,7 +20870,13 @@ struct OrganizerEventManageView: View {
                 secondaryAction: { updateStatus($0, status: "cancelled") }
             )
         case 4:
-            OrganizerEventAnalyticsSection(event: event, registrations: registrations, priceOptions: priceOptions, broadcastHistory: broadcastHistory)
+            OrganizerEventAnalyticsSection(
+                event: event,
+                registrations: registrations,
+                priceOptions: priceOptions,
+                broadcastHistory: broadcastHistory,
+                engagementMetrics: engagementMetrics ?? .empty(eventId: event.id)
+            )
         default:
             OrganizerActionsSection(
                 event: event,
@@ -20809,12 +20904,14 @@ struct OrganizerEventManageView: View {
         async let priceOptionsTask = store.fetchOrganizerPriceOptions(eventId: eventId, reportingErrors: false)
         async let templatesTask = store.fetchBroadcastTemplates(reportingErrors: false)
         async let broadcastsTask = store.fetchEventBroadcasts(eventId: eventId, reportingErrors: false)
+        async let engagementTask = store.fetchEventEngagementMetrics(eventIds: [eventId], reportingErrors: false)
         event = await eventTask
         registrations = await registrationsTask
         meetingPoints = await meetingPointsTask
         priceOptions = await priceOptionsTask
         templates = await templatesTask
         broadcastHistory = await broadcastsTask
+        engagementMetrics = await engagementTask[eventId] ?? .empty(eventId: eventId)
         loading = false
     }
 
@@ -21152,6 +21249,68 @@ struct OrganizerManageQuickActions: View {
             OrganizerManageQuickActionButton(icon: "slider.horizontal.3", title: "Stato", tint: Brand.mutedForeground, action: onStatus)
             OrganizerManageQuickActionButton(icon: "trash", title: "Elimina", tint: Brand.destructive, isDestructive: true, action: onDelete)
         }
+    }
+}
+
+struct OrganizerEventEngagementCard: View {
+    let metrics: EventEngagementMetrics
+
+    private var clickRate: Int {
+        guard metrics.openingReminderNotifiedCount > 0 else { return 0 }
+        return Int(round(Double(metrics.openingNotificationClickCount) / Double(metrics.openingReminderNotifiedCount) * 100))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("Interesse evento", systemImage: "chart.bar.fill")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Brand.foreground)
+                Spacer()
+                Text("\(clickRate)% click rate")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(Brand.primary)
+            }
+
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                OrganizerEngagementStat(title: "Salvati", value: metrics.savedCount, icon: "bookmark.fill", tint: Brand.primary)
+                OrganizerEngagementStat(title: "Reminder", value: metrics.totalOpeningReminderCount, icon: "bell.badge.fill", tint: Brand.warning)
+                OrganizerEngagementStat(title: "Notificati", value: metrics.openingReminderNotifiedCount, icon: "paperplane.fill", tint: Brand.secondary)
+                OrganizerEngagementStat(title: "Click", value: metrics.openingNotificationClickCount, icon: "cursorarrow.click", tint: Brand.success)
+            }
+        }
+        .padding(14)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(Brand.muted, lineWidth: 1))
+    }
+}
+
+private struct OrganizerEngagementStat: View {
+    let title: String
+    let value: Int
+    let icon: String
+    let tint: Color
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: icon)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(tint)
+                .frame(width: 28, height: 28)
+                .background(tint.opacity(0.12), in: Circle())
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(value)")
+                    .font(.headline.weight(.bold))
+                    .foregroundStyle(Brand.foreground)
+                Text(title)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Brand.mutedForeground)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
@@ -22072,6 +22231,7 @@ struct OrganizerEventAnalyticsSection: View {
     let registrations: [OrganizerRegistration]
     let priceOptions: [PriceOption]
     let broadcastHistory: [EventBroadcast]
+    let engagementMetrics: EventEngagementMetrics
 
     private var active: [OrganizerRegistration] { registrations.filter(\.isActive) }
     private var validRegistrations: [OrganizerRegistration] { registrations.filter { $0.normalizedStatus != "cancelled" } }
@@ -22159,6 +22319,30 @@ struct OrganizerEventAnalyticsSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                OrganizerAnalyticsMetricCard(
+                    title: "Salvati",
+                    value: "\(engagementMetrics.savedCount)",
+                    subtitle: "Utenti che hanno salvato",
+                    icon: "bookmark.fill",
+                    tint: Brand.primary
+                )
+                OrganizerAnalyticsMetricCard(
+                    title: "Reminder apertura",
+                    value: "\(engagementMetrics.totalOpeningReminderCount)",
+                    subtitle: "\(engagementMetrics.openingReminderActiveCount) attivi · \(engagementMetrics.openingReminderNotifiedCount) notificati",
+                    icon: "bell.badge.fill",
+                    tint: Brand.warning
+                )
+                OrganizerAnalyticsMetricCard(
+                    title: "Click notifica",
+                    value: "\(engagementMetrics.openingNotificationClickCount)",
+                    subtitle: "Aperture da reminder",
+                    icon: "cursorarrow.click",
+                    tint: Brand.success
+                )
+            }
+
             if registrations.isEmpty {
                 EmptyState(icon: "chart.bar.xaxis", title: "No registration data yet", message: "Le analytics si popolano appena arrivano iscrizioni.")
             } else {
@@ -35720,6 +35904,7 @@ struct NotificationsView: View {
         }
 
         if let destination = notification.destination {
+            Task { await store.markNotificationClicked(notification.id) }
             dismiss()
             onNavigate(destination)
         } else {
