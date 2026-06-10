@@ -3064,41 +3064,28 @@ struct SupabaseAPI {
     }
 
     func fetchEventEngagementAudience(eventId: String, kind: EventEngagementAudienceKind, session: AuthSession) async throws -> [EventEngagementAudienceMember] {
-        let rows: [EventEngagementSourceRow]
-        switch kind {
-        case .saved:
-            rows = try await request(
-                path: "/rest/v1/saved_events?select=id,user_id,created_at&event_id=eq.\(eventId.urlEncoded)&order=created_at.desc",
-                method: "GET",
-                bodyData: nil,
-                auth: session,
-                decode: [EventEngagementSourceRow].self
-            )
-        case .reminder:
-            rows = try await request(
-                path: "/rest/v1/event_opening_reminders?select=id,user_id,created_at,notified_at&event_id=eq.\(eventId.urlEncoded)&cancelled_at=is.null&order=created_at.desc",
-                method: "GET",
-                bodyData: nil,
-                auth: session,
-                decode: [EventEngagementSourceRow].self
-            )
-        }
-
-        let userIds = Array(Set(rows.map(\.userId).compactMap(\.nilIfBlank))).sorted()
-        let profilesById = try await fetchEventEngagementProfiles(userIds: userIds, session: session)
-
+        let body: [String: JSONValue] = [
+            "p_event_id": .string(eventId),
+            "p_kind": .string(kind.rawValue)
+        ]
+        let rows: [EventEngagementAudienceRPCRow] = try await request(
+            path: "/rest/v1/rpc/get_event_engagement_audience",
+            method: "POST",
+            body: body,
+            auth: session,
+            decode: [EventEngagementAudienceRPCRow].self
+        )
         return rows.map { row in
-            let profile = profilesById[row.userId]
             return EventEngagementAudienceMember(
                 id: row.id,
                 userId: row.userId,
-                displayName: profile?.displayName ?? "Utente \(String(row.userId.prefix(8)))",
-                email: profile?.email?.nilIfBlank,
-                phone: profile?.phone?.nilIfBlank,
-                instagramHandle: profile?.instagramHandle?.nilIfBlank,
-                avatarUrl: profile?.avatarUrl?.nilIfBlank,
+                displayName: row.displayName.nilIfBlank ?? "Utente \(String(row.userId.prefix(8)))",
+                email: row.email?.nilIfBlank,
+                phone: row.phone?.nilIfBlank,
+                instagramHandle: row.instagramHandle?.nilIfBlank,
+                avatarUrl: row.avatarUrl?.nilIfBlank,
                 createdAt: row.createdAt,
-                statusLabel: kind == .reminder ? (row.notifiedAt?.nilIfBlank == nil ? "Attivo" : "Gia avvisato") : nil
+                statusLabel: nil
             )
         }
     }
@@ -5952,11 +5939,16 @@ struct EventEngagementAudienceMember: Identifiable, Hashable {
     let statusLabel: String?
 }
 
-private struct EventEngagementSourceRow: Codable {
+private struct EventEngagementAudienceRPCRow: Codable {
     let id: String
     let userId: String
+    let displayName: String
+    let email: String?
+    let phone: String?
+    let instagramHandle: String?
+    let avatarUrl: String?
     let createdAt: String?
-    let notifiedAt: String?
+    let status: String?
 }
 
 private struct EventEngagementProfileRow: Codable {
