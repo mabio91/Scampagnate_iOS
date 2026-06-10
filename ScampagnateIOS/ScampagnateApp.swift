@@ -8354,7 +8354,7 @@ struct RootView: View {
         }
         .sheet(item: $paymentFeedback) { feedback in
             AppFeedbackSheet(feedback: feedback)
-                .presentationDetents([.height(300)])
+                .presentationDetents([.height(feedback.sheetHeight)])
         }
         .sheet(item: $passwordRecoveryLink) { recovery in
             PasswordRecoveryView(recovery: recovery)
@@ -8983,6 +8983,11 @@ struct AppFeedback: Identifiable, Equatable {
         case .error: Brand.destructive
         }
     }
+
+    var sheetHeight: CGFloat {
+        let extraRows = max(0, (message.count - 80) / 42)
+        return min(420, 340 + CGFloat(extraRows * 22))
+    }
 }
 
 struct AppFeedbackSheet: View {
@@ -8990,28 +8995,36 @@ struct AppFeedbackSheet: View {
     let feedback: AppFeedback
 
     var body: some View {
-        VStack(spacing: 18) {
-            Image(systemName: feedback.icon)
-                .font(.system(size: 42, weight: .semibold))
-                .foregroundStyle(feedback.color)
-                .frame(width: 72, height: 72)
-                .background(feedback.color.opacity(0.10), in: Circle())
+        ScrollView {
+            VStack(spacing: 18) {
+                Image(systemName: feedback.icon)
+                    .font(.system(size: 42, weight: .semibold))
+                    .foregroundStyle(feedback.color)
+                    .frame(width: 72, height: 72)
+                    .background(feedback.color.opacity(0.10), in: Circle())
 
-            VStack(spacing: 8) {
-                Text(feedback.title)
-                    .font(.system(.title3, design: .rounded, weight: .bold))
-                    .foregroundStyle(Brand.foreground)
-                    .multilineTextAlignment(.center)
-                Text(feedback.message)
-                    .font(.subheadline)
-                    .foregroundStyle(Brand.mutedForeground)
-                    .multilineTextAlignment(.center)
+                VStack(spacing: 8) {
+                    Text(feedback.title)
+                        .font(.system(.title3, design: .rounded, weight: .bold))
+                        .foregroundStyle(Brand.foreground)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(feedback.message)
+                        .font(.subheadline)
+                        .foregroundStyle(Brand.mutedForeground)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Button("OK") { dismiss() }
+                    .buttonStyle(PrimaryButtonStyle())
             }
-
-            Button("OK") { dismiss() }
-                .buttonStyle(PrimaryButtonStyle())
+            .padding(.horizontal, 24)
+            .padding(.top, 20)
+            .padding(.bottom, 28)
+            .frame(maxWidth: .infinity)
         }
-        .padding(24)
+        .scrollIndicators(.hidden)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Brand.background)
     }
@@ -11309,9 +11322,9 @@ struct EventDetailView: View {
                                 .zIndex(25)
                         }
 
-                        compactHeader(event)
+                        compactHeader(event, topInset: proxy.safeAreaInsets.top)
                             .opacity(headerProgress > 0.04 ? 1 : 0)
-                            .offset(y: compactHeaderOffset(progress: headerProgress))
+                            .offset(y: compactHeaderOffset(progress: headerProgress, topInset: proxy.safeAreaInsets.top))
                             .allowsHitTesting(headerProgress > 0.35)
                             .zIndex(30)
                     }
@@ -11375,7 +11388,7 @@ struct EventDetailView: View {
                     }
                     .sheet(item: $feedback) { feedback in
                         AppFeedbackSheet(feedback: feedback)
-                            .presentationDetents([.height(300)])
+                            .presentationDetents([.height(feedback.sheetHeight)])
                     }
                     .sheet(isPresented: $showParticipants) {
                         ParticipantsSheet(eventId: eventId, fallbackCount: activeParticipantCount, showAuth: $showAuth)
@@ -11594,15 +11607,18 @@ struct EventDetailView: View {
         return progress * progress * (3 - 2 * progress)
     }
 
-    private func compactHeaderOffset(progress: Double) -> CGFloat {
-        guard progress > 0 else { return -78 }
-        let entrance = -78 * (1 - progress)
+    private func compactHeaderOffset(progress: Double, topInset: CGFloat) -> CGFloat {
+        let hiddenOffset = -(max(topInset, 22) + 58)
+        guard progress > 0 else { return hiddenOffset }
+        let entrance = hiddenOffset * (1 - progress)
         let bump = sin(progress * .pi) * 9
         return CGFloat(entrance + bump)
     }
 
-    private func compactHeader(_ event: Event) -> some View {
-        HStack(spacing: 10) {
+    private func compactHeader(_ event: Event, topInset: CGFloat) -> some View {
+        let safeTop = max(topInset, 22)
+
+        return HStack(spacing: 10) {
             Button {
                 dismiss()
             } label: {
@@ -11642,9 +11658,10 @@ struct EventDetailView: View {
             .buttonStyle(.plain)
         }
         .padding(.horizontal, 14)
-        .padding(.top, 6)
+        .padding(.top, safeTop + 6)
         .padding(.bottom, 8)
         .background(.regularMaterial)
+        .background(Brand.background.opacity(0.72).ignoresSafeArea(edges: .top))
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(Brand.muted.opacity(0.7))
@@ -17617,7 +17634,7 @@ struct EventRegistrationCard: View {
             }
             .sheet(item: $feedback) { feedback in
                 AppFeedbackSheet(feedback: feedback)
-                    .presentationDetents([.height(300)])
+                    .presentationDetents([.height(feedback.sheetHeight)])
             }
             .fullScreenCover(item: $activeCheckout) { checkout in
                 PaymentAuthenticationView(checkout: checkout) { result in
@@ -17839,7 +17856,7 @@ struct EditRegistrationDetailsSheet: View {
             }
             .sheet(item: $feedback) { feedback in
                 AppFeedbackSheet(feedback: feedback)
-                    .presentationDetents([.height(300)])
+                    .presentationDetents([.height(feedback.sheetHeight)])
             }
             .interactiveDismissDisabled(saving)
         }
@@ -28910,7 +28927,7 @@ struct ProfileView: View {
                         }
                         .sheet(item: $feedback) { feedback in
                             AppFeedbackSheet(feedback: feedback)
-                                .presentationDetents([.height(300)])
+                                .presentationDetents([.height(feedback.sheetHeight)])
                         }
                     }
                 }
