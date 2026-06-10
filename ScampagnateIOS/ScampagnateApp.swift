@@ -12094,6 +12094,50 @@ struct EventWhatsappGroupCard: View {
     }
 }
 
+struct EventWhatsappGroupStrip: View {
+    let url: URL
+
+    private let fitScoreGreen = Brand.success
+
+    var body: some View {
+        Button {
+            UIApplication.shared.open(url)
+        } label: {
+            HStack(spacing: 10) {
+                WhatsAppGlyph(size: 16)
+                    .frame(width: 30, height: 30)
+                    .background(fitScoreGreen, in: RoundedRectangle(cornerRadius: 10))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Gruppo WhatsApp")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                        .lineLimit(1)
+                    Text("Aggiornamenti e dettagli pratici")
+                        .font(.caption2)
+                        .foregroundStyle(Brand.mutedForeground)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                Text("Entra")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(fitScoreGreen)
+                    .padding(.horizontal, 10)
+                    .frame(height: 28)
+                    .background(fitScoreGreen.opacity(0.12), in: Capsule())
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(fitScoreGreen.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(fitScoreGreen.opacity(0.22), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Entra nel gruppo WhatsApp evento")
+    }
+}
+
 struct WhatsAppGlyph: View {
     let size: CGFloat
 
@@ -17457,9 +17501,9 @@ struct EventRegistrationCard: View {
                 if let whatsappURL = whatsappGroupURL {
                     Divider()
                         .padding(.horizontal, 12)
-                    EventWhatsappGroupCard(url: whatsappURL)
+                    EventWhatsappGroupStrip(url: whatsappURL)
                         .padding(.horizontal, 12)
-                        .padding(.bottom, 12)
+                        .padding(.vertical, 10)
                 }
 
                 if shouldShowUtilityActions {
