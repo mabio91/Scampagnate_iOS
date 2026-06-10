@@ -3122,13 +3122,13 @@ struct SupabaseAPI {
     }
 
     func fetchUserBadges(session: AuthSession) async throws -> [UserBadge] {
-        let select = "*,badges(name,description,icon,category,required_events)"
+        let select = "*,badges(name,description,icon,category,required_events,requirement_type,requirement_value,event_filters)"
         let path = "/rest/v1/user_badges?select=\(select.urlEncoded)&user_id=eq.\(session.user.id)&order=earned_at.desc"
         return try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [UserBadge].self)
     }
 
     func fetchAllBadges() async throws -> [BadgeDefinition] {
-        let select = "id,name,description,icon,required_events,category,requirement_type,requirement_value"
+        let select = "id,name,description,icon,required_events,category,requirement_type,requirement_value,event_filters"
         let path = "/rest/v1/badges?select=\(select.urlEncoded)&order=required_events.asc,name.asc"
         return try await request(path: path, method: "GET", bodyData: nil, auth: nil, decode: [BadgeDefinition].self)
     }
@@ -7539,6 +7539,9 @@ struct BadgeInfo: Codable, Hashable {
     let icon: String?
     let category: String?
     let requiredEvents: Int?
+    let requirementType: String?
+    let requirementValue: Int?
+    let eventFilters: JSONValue?
 }
 
 struct BadgeDefinition: Codable, Identifiable, Hashable {
@@ -7550,6 +7553,7 @@ struct BadgeDefinition: Codable, Identifiable, Hashable {
     let category: String?
     let requirementType: String?
     let requirementValue: Int?
+    let eventFilters: JSONValue?
 }
 
 struct CommunityLevelDefinition: Codable, Identifiable, Hashable {
@@ -30943,6 +30947,123 @@ struct RewardDetailInfoRow: View {
     }
 }
 
+private enum BadgeProgressResolver {
+    private static let activeAttendanceStatuses: Set<String> = ["registered", "deposit_paid", "paid", "attended"]
+    private static let nonInferableRequirementTypes: Set<String> = ["membership_first_150", "streak"]
+
+    static func target(for definition: BadgeDefinition) -> Int {
+        max(definition.requiredEvents ?? definition.requirementValue ?? 1, 1)
+    }
+
+    static func target(for userBadge: UserBadge, definition: BadgeDefinition?) -> Int {
+        max(
+            definition?.requiredEvents
+            ?? definition?.requirementValue
+            ?? userBadge.badges?.requiredEvents
+            ?? userBadge.badges?.requirementValue
+            ?? 1,
+            1
+        )
+    }
+
+    static func progress(for definition: BadgeDefinition, userBadge: UserBadge?, registrations: [Registration]) -> Int {
+        let target = target(for: definition)
+        if userBadge?.isCompleted == true { return target }
+        if let userProgress = userBadge?.progress {
+            return clamped(userProgress, target: target)
+        }
+        return clamped(inferredProgress(for: definition, registrations: registrations), target: target)
+    }
+
+    static func progress(for userBadge: UserBadge, definition: BadgeDefinition?, registrations: [Registration]) -> Int {
+        let target = target(for: userBadge, definition: definition)
+        if userBadge.isCompleted { return target }
+        if let userProgress = userBadge.progress {
+            return clamped(userProgress, target: target)
+        }
+        guard let definition else { return 0 }
+        return clamped(inferredProgress(for: definition, registrations: registrations), target: target)
+    }
+
+    private static func inferredProgress(for definition: BadgeDefinition, registrations: [Registration]) -> Int {
+        let requirementType = normalizedRequirementType(definition.requirementType)
+        if requirementType.map({ nonInferableRequirementTypes.contains($0) }) == true {
+            return 0
+        }
+
+        let category = definition.category?.nilIfBlank
+        if category?.normalizedSearchKey == "special" {
+            return 0
+        }
+
+        if let category, requirementType == nil || requirementType == "events_attended" || requirementType == "category_events" {
+            return countAttendedRegistrations(in: registrations, matching: { registration in
+                guard let event = registration.event else { return false }
+                return eventMatchesCategory(event, category: category)
+                    && eventMatchesFilters(event, filters: definition.eventFilters)
+            })
+        }
+
+        if category == nil && (requirementType == nil || requirementType == "events_attended") {
+            return countAttendedRegistrations(in: registrations)
+        }
+
+        return 0
+    }
+
+    private static func countAttendedRegistrations(
+        in registrations: [Registration],
+        matching predicate: (Registration) -> Bool = { _ in true }
+    ) -> Int {
+        var eventIds = Set<String>()
+        for registration in registrations where isAttendedForBadgeProgress(registration) && predicate(registration) {
+            eventIds.insert(registration.eventKey ?? registration.id)
+        }
+        return eventIds.count
+    }
+
+    private static func isAttendedForBadgeProgress(_ registration: Registration) -> Bool {
+        activeAttendanceStatuses.contains(registration.normalizedStatus)
+            && (registration.checkedIn == true || registration.normalizedStatus == "attended")
+    }
+
+    private static func eventMatchesCategory(_ event: Event, category: String) -> Bool {
+        let target = category.normalizedSearchKey
+        guard !target.isEmpty else { return false }
+        let eventCategories = [
+            event.category?.name,
+            event.additionalFields?.string(at: "fit_score_main_category")
+        ] + (event.additionalFields?.stringArray(at: "fit_score_secondary_categories") ?? []).map(Optional.some)
+
+        return eventCategories.contains { $0?.normalizedSearchKey == target }
+    }
+
+    private static func eventMatchesFilters(_ event: Event, filters: JSONValue?) -> Bool {
+        if let minimumDifficulty = integerFilter("min_difficulty", in: filters) {
+            guard let difficulty = event.difficultyLevel, difficulty >= minimumDifficulty else { return false }
+        }
+        if let maximumDifficulty = integerFilter("max_difficulty", in: filters) {
+            guard let difficulty = event.difficultyLevel, difficulty <= maximumDifficulty else { return false }
+        }
+        return true
+    }
+
+    private static func integerFilter(_ key: String, in filters: JSONValue?) -> Int? {
+        guard let value = filters?.double(at: key).map({ Int($0) }), (1...5).contains(value) else {
+            return nil
+        }
+        return value
+    }
+
+    private static func normalizedRequirementType(_ value: String?) -> String? {
+        value?.nilIfBlank?.lowercased().replacingOccurrences(of: "-", with: "_")
+    }
+
+    private static func clamped(_ value: Int, target: Int) -> Int {
+        min(max(value, 0), target)
+    }
+}
+
 struct ProfileBadgesSection: View {
     let badges: [UserBadge]
     let allBadges: [BadgeDefinition]
@@ -30970,16 +31091,20 @@ struct ProfileBadgesSection: View {
         badgeDefinitionsForDisplay.filter { !earnedBadgeIds.contains($0.id) && !earnedBadgeNames.contains($0.name) }
     }
 
-    private var attendedCount: Int {
-        registrations.filter { $0.checkedIn == true || $0.status == "attended" }.map { $0.eventId ?? $0.id }.removingDuplicates().count
-    }
-
     private func definition(for badge: UserBadge) -> BadgeDefinition? {
         allBadges.first { $0.id == badge.badgeId || $0.name == badge.displayName }
     }
 
     private func userBadge(for definition: BadgeDefinition) -> UserBadge? {
         badges.first { $0.badgeId == definition.id || $0.displayName == definition.name }
+    }
+
+    private func progress(for badge: UserBadge, definition: BadgeDefinition?) -> Int {
+        BadgeProgressResolver.progress(for: badge, definition: definition, registrations: registrations)
+    }
+
+    private func progress(for definition: BadgeDefinition, userBadge: UserBadge?) -> Int {
+        BadgeProgressResolver.progress(for: definition, userBadge: userBadge, registrations: registrations)
     }
 
     var body: some View {
@@ -30999,10 +31124,11 @@ struct ProfileBadgesSection: View {
                         HStack(spacing: 10) {
                             ForEach(completedBadges) { badge in
                                 Button {
+                                    let definition = definition(for: badge)
                                     selectedBadgeDetail = BadgeDetail(
                                         userBadge: badge,
-                                        definition: definition(for: badge),
-                                        attendedCount: attendedCount
+                                        definition: definition,
+                                        progress: progress(for: badge, definition: definition)
                                     )
                                 } label: {
                                     VStack(spacing: 7) {
@@ -31045,17 +31171,19 @@ struct ProfileBadgesSection: View {
             if showAll {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
                     ForEach(availableBadgeDefinitions) { badge in
+                        let userBadge = userBadge(for: badge)
+                        let badgeProgress = progress(for: badge, userBadge: userBadge)
                         Button {
                             selectedBadgeDetail = BadgeDetail(
                                 definition: badge,
-                                userBadge: userBadge(for: badge),
-                                attendedCount: attendedCount
+                                userBadge: userBadge,
+                                progress: badgeProgress
                             )
                         } label: {
                             BadgeDefinitionCard(
                                 badge: badge,
                                 isEarned: false,
-                                attendedCount: userBadge(for: badge)?.progress ?? attendedCount
+                                progress: badgeProgress
                             )
                         }
                         .buttonStyle(.plain)
@@ -31083,29 +31211,24 @@ struct BadgeDetail: Identifiable {
     let earnedAt: String?
     let completedAt: String?
 
-    init(userBadge: UserBadge, definition: BadgeDefinition?, attendedCount: Int) {
-        let target = max(definition?.requiredEvents ?? definition?.requirementValue ?? userBadge.badges?.requiredEvents ?? 1, 1)
+    init(userBadge: UserBadge, definition: BadgeDefinition?, progress: Int) {
+        let target = BadgeProgressResolver.target(for: userBadge, definition: definition)
 
         self.id = userBadge.badgeId ?? userBadge.id
         self.name = definition?.name ?? userBadge.displayName
         self.description = definition?.description?.nilIfBlank ?? userBadge.displayDescription.nilIfBlank
         self.icon = definition?.icon.nilIfBlank ?? userBadge.displayIcon
         self.category = definition?.category?.nilIfBlank ?? userBadge.badges?.category?.nilIfBlank
-        self.requirementType = definition?.requirementType?.nilIfBlank
+        self.requirementType = definition?.requirementType?.nilIfBlank ?? userBadge.badges?.requirementType?.nilIfBlank
         self.target = target
         self.isCompleted = userBadge.isCompleted
-        self.progress = Self.normalizedProgress(
-            userProgress: userBadge.progress,
-            attendedCount: attendedCount,
-            target: target,
-            isCompleted: userBadge.isCompleted
-        )
+        self.progress = Self.normalizedProgress(progress, target: target, isCompleted: userBadge.isCompleted)
         self.earnedAt = userBadge.earnedAt
         self.completedAt = userBadge.completedAt
     }
 
-    init(definition: BadgeDefinition, userBadge: UserBadge?, attendedCount: Int) {
-        let target = max(definition.requiredEvents ?? definition.requirementValue ?? 1, 1)
+    init(definition: BadgeDefinition, userBadge: UserBadge?, progress: Int) {
+        let target = BadgeProgressResolver.target(for: definition)
 
         self.id = definition.id
         self.name = definition.name
@@ -31115,12 +31238,7 @@ struct BadgeDetail: Identifiable {
         self.requirementType = definition.requirementType?.nilIfBlank
         self.target = target
         self.isCompleted = userBadge?.isCompleted ?? false
-        self.progress = Self.normalizedProgress(
-            userProgress: userBadge?.progress,
-            attendedCount: attendedCount,
-            target: target,
-            isCompleted: userBadge?.isCompleted ?? false
-        )
+        self.progress = Self.normalizedProgress(progress, target: target, isCompleted: userBadge?.isCompleted ?? false)
         self.earnedAt = userBadge?.earnedAt
         self.completedAt = userBadge?.completedAt
     }
@@ -31129,10 +31247,9 @@ struct BadgeDetail: Identifiable {
         isCompleted ? "Completato" : "\(progress)/\(target)"
     }
 
-    private static func normalizedProgress(userProgress: Int?, attendedCount: Int, target: Int, isCompleted: Bool) -> Int {
+    private static func normalizedProgress(_ progress: Int, target: Int, isCompleted: Bool) -> Int {
         guard !isCompleted else { return target }
-        let rawProgress = max(userProgress ?? attendedCount, 0)
-        return min(rawProgress, target)
+        return min(max(progress, 0), target)
     }
 }
 
@@ -31268,10 +31385,10 @@ struct NextBadgeCard: View {
 struct BadgeDefinitionCard: View {
     let badge: BadgeDefinition
     let isEarned: Bool
-    let attendedCount: Int
+    let progress: Int
 
     private var target: Int { max(badge.requiredEvents ?? badge.requirementValue ?? 1, 1) }
-    private var progress: Int { min(attendedCount, target) }
+    private var normalizedProgress: Int { min(max(progress, 0), target) }
 
     var body: some View {
         VStack(spacing: 8) {
@@ -31301,7 +31418,7 @@ struct BadgeDefinitionCard: View {
                 .minimumScaleFactor(0.76)
 
             if !isEarned {
-                Text("\(progress)/\(target) eventi")
+                Text("\(normalizedProgress)/\(target) eventi")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(Brand.mutedForeground)
             }
