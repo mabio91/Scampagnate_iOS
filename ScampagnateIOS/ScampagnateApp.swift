@@ -4656,6 +4656,41 @@ struct Event: Codable, Identifiable, Hashable {
     static func == (lhs: Event, rhs: Event) -> Bool { lhs.id == rhs.id }
 }
 
+private extension Event {
+    static func isOrderedByUpcomingDate(_ lhs: Event?, _ rhs: Event?) -> Bool {
+        guard let lhs else { return false }
+        guard let rhs else { return true }
+        let leftDate = lhs.eventStartDateTime ?? .distantFuture
+        let rightDate = rhs.eventStartDateTime ?? .distantFuture
+        if leftDate != rightDate { return leftDate < rightDate }
+        return isOrderedByStableLabel(lhs, rhs)
+    }
+
+    static func isOrderedByPastDate(_ lhs: Event?, _ rhs: Event?) -> Bool {
+        guard let lhs else { return false }
+        guard let rhs else { return true }
+        let leftDate = lhs.eventStartDateTime ?? .distantPast
+        let rightDate = rhs.eventStartDateTime ?? .distantPast
+        if leftDate != rightDate { return leftDate > rightDate }
+        return isOrderedByStableLabel(lhs, rhs)
+    }
+
+    static func isOrderedByRelevantDate(_ lhs: Event?, _ rhs: Event?) -> Bool {
+        guard let lhs else { return false }
+        guard let rhs else { return true }
+        let leftPast = lhs.isPastOrCancelled
+        let rightPast = rhs.isPastOrCancelled
+        if leftPast != rightPast { return !leftPast && rightPast }
+        return leftPast ? isOrderedByPastDate(lhs, rhs) : isOrderedByUpcomingDate(lhs, rhs)
+    }
+
+    private static func isOrderedByStableLabel(_ lhs: Event, _ rhs: Event) -> Bool {
+        let titleComparison = lhs.title.localizedCaseInsensitiveCompare(rhs.title)
+        if titleComparison != .orderedSame { return titleComparison == .orderedAscending }
+        return lhs.id < rhs.id
+    }
+}
+
 struct EventStaffMember: Codable, Identifiable, Hashable {
     let id: String
     let eventId: String?
@@ -6871,6 +6906,14 @@ private extension Array where Element == Registration {
         }
     }
 
+    func sortedByUpcomingEventDate() -> [Registration] {
+        sorted { Event.isOrderedByUpcomingDate($0.event, $1.event) }
+    }
+
+    func sortedByPastEventDate() -> [Registration] {
+        sorted { Event.isOrderedByPastDate($0.event, $1.event) }
+    }
+
     private var sortedByNewestRegistration: [Registration] {
         sorted { lhs, rhs in
             (lhs.createdAt ?? "") > (rhs.createdAt ?? "")
@@ -6883,6 +6926,12 @@ struct SavedEvent: Codable, Identifiable {
     let eventId: String?
     let events: Event?
     var event: Event? { events }
+}
+
+private extension Array where Element == SavedEvent {
+    func sortedByRelevantEventDate() -> [SavedEvent] {
+        sorted { Event.isOrderedByRelevantDate($0.event, $1.event) }
+    }
 }
 
 struct EventOpeningReminder: Codable, Identifiable {
@@ -17261,11 +17310,19 @@ struct MyEventsView: View {
     }
 
     var upcoming: [Registration] {
-        latestRegistrations.filter { $0.isActive && !($0.event?.isPastOrCancelled ?? false) }
+        latestRegistrations
+            .filter { $0.isActive && !($0.event?.isPastOrCancelled ?? false) }
+            .sortedByUpcomingEventDate()
     }
 
     var past: [Registration] {
-        latestRegistrations.filter { $0.isActive && ($0.event?.isPastOrCancelled ?? false) }
+        latestRegistrations
+            .filter { $0.isActive && ($0.event?.isPastOrCancelled ?? false) }
+            .sortedByPastEventDate()
+    }
+
+    var savedEvents: [SavedEvent] {
+        store.savedEvents.sortedByRelevantEventDate()
     }
 
     var body: some View {
@@ -17288,7 +17345,7 @@ struct MyEventsView: View {
                                     Picker("Vista", selection: $tab) {
                                         Text("Prossimi (\(upcoming.count))").tag(0)
                                         Text("Passati (\(past.count))").tag(1)
-                                        Text("Salvati (\(store.savedEvents.count))").tag(2)
+                                        Text("Salvati (\(savedEvents.count))").tag(2)
                                     }
                                     .pickerStyle(.segmented)
 
@@ -17312,7 +17369,7 @@ struct MyEventsView: View {
                                             emptyMessage: "Qui troverai gli eventi a cui hai partecipato."
                                         )
                                     } else {
-                                        SavedEventList(savedEvents: store.savedEvents, selectedEvent: $selectedEvent)
+                                        SavedEventList(savedEvents: savedEvents, selectedEvent: $selectedEvent)
                                     }
                                 }
                                 .frame(width: max(proxy.size.width - 32, 0), alignment: .leading)
