@@ -11443,6 +11443,7 @@ struct EventDetailView: View {
                         }
 
                         compactHeader(event, topInset: proxy.safeAreaInsets.top)
+                            .ignoresSafeArea(edges: .top)
                             .opacity(headerProgress > 0.04 ? 1 : 0)
                             .offset(y: compactHeaderOffset(progress: headerProgress, topInset: proxy.safeAreaInsets.top))
                             .allowsHitTesting(headerProgress > 0.35)
@@ -11570,6 +11571,7 @@ struct EventDetailView: View {
         }
         .background(Brand.background)
         .navigationBarBackButtonHidden(true)
+        .toolbar(.hidden, for: .navigationBar)
         .toolbar(.hidden, for: .tabBar)
         .onAppear {
             chrome.hidesStatusBarShield = true
