@@ -1351,7 +1351,7 @@ final class AppStore: ObservableObject {
     }
 
     func loadOrganizerDashboardRegistrations(reportingErrors: Bool = true) async {
-        let ids = organizerEvents.map(\.id)
+        let ids = organizerEvents.filter(\.isAnalyticsEligible).map(\.id)
         guard !ids.isEmpty else {
             organizerDashboardRegistrations = []
             return
@@ -1377,7 +1377,7 @@ final class AppStore: ObservableObject {
         do {
             let events = try await api.fetchOrganizerEvents(session: authSession, includeAll: isAdmin)
             organizerEvents = events
-            let ids = events.map(\.id)
+            let ids = events.filter(\.isAnalyticsEligible).map(\.id)
             guard !ids.isEmpty else {
                 organizerDashboardRegistrations = []
                 return
@@ -4506,6 +4506,9 @@ struct Event: Codable, Identifiable, Hashable {
     }
     var displayLocation: String { locationLabel ?? location ?? "Luogo da definire" }
     var normalizedStatus: String { status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "open" }
+    var isAnalyticsEligible: Bool {
+        !["draft", "unpublished"].contains(normalizedStatus)
+    }
     var displayPrice: String {
         guard let price, price > 0 else { return "Gratis" }
         return "€\(Int(price))"
@@ -6851,6 +6854,7 @@ struct Registration: Codable, Identifiable, Hashable {
 
     var event: Event? { events }
     var normalizedStatus: String { status?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "registered" }
+    var isAnalyticsEligible: Bool { event?.isAnalyticsEligible == true }
     var isCancelled: Bool { normalizedStatus == "cancelled" }
     var canCancel: Bool {
         ["registered", "deposit_paid", "paid", "pending_payment", "pending_approval", "waitlist"].contains(normalizedStatus) ||
@@ -10988,7 +10992,7 @@ struct PersonalizedEventRecommendation: Identifiable {
 
     private static func joinedCategoryCounts(from registrations: [Registration]) -> [String: Int] {
         var counts: [String: Int] = [:]
-        for registration in registrations where registration.normalizedStatus == "attended" || registration.checkedIn == true {
+        for registration in registrations where registration.isAnalyticsEligible && (registration.normalizedStatus == "attended" || registration.checkedIn == true) {
             guard let event = registration.event else { continue }
             for category in recommendationCategories(for: event) {
                 counts[category, default: 0] += 1
@@ -18346,6 +18350,10 @@ struct OrganizerDashboardView: View {
     @State private var deleteCandidate: Event?
     @State private var deletingEventId: String?
 
+    private var analyticsEvents: [Event] {
+        store.organizerEvents.filter(\.isAnalyticsEligible)
+    }
+
     private var upcomingEvents: [Event] {
         store.organizerEvents.filter(\.organizerIsPublishedUpcoming)
     }
@@ -18388,7 +18396,7 @@ struct OrganizerDashboardView: View {
     }
 
     private var totalRegistrations: Int {
-        store.organizerEvents.reduce(0) { $0 + ($1.spotsTaken ?? 0) }
+        analyticsEvents.reduce(0) { $0 + ($1.spotsTaken ?? 0) }
     }
 
     private var dashboardLoadKey: String {
@@ -18438,7 +18446,7 @@ struct OrganizerDashboardView: View {
                                 case 0:
                                     VStack(alignment: .leading, spacing: 12) {
                                         LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: 3), spacing: 10) {
-                                            OrganizerMetricCard(title: "\(store.organizerEvents.count)", subtitle: "Eventi", icon: "calendar")
+                                            OrganizerMetricCard(title: "\(analyticsEvents.count)", subtitle: "Eventi", icon: "calendar")
                                             OrganizerMetricCard(title: "\(totalRegistrations)", subtitle: "Iscrizioni", icon: "person.2.fill")
                                             OrganizerMetricCard(title: "\(upcomingEvents.count)", subtitle: "Futuri", icon: "chart.line.uptrend.xyaxis")
                                         }
@@ -22687,147 +22695,151 @@ struct OrganizerEventAnalyticsSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                NavigationLink {
-                    OrganizerEventEngagementAudienceView(eventId: engagementMetrics.eventId, kind: .saved)
-                } label: {
-                    OrganizerAnalyticsMetricCard(
-                        title: "Salvati",
-                        value: "\(engagementMetrics.savedCount)",
-                        subtitle: "Utenti che hanno salvato",
-                        icon: "bookmark.fill",
-                        tint: Brand.primary
-                    )
-                }
-                .buttonStyle(.plain)
-
-                NavigationLink {
-                    OrganizerEventEngagementAudienceView(eventId: engagementMetrics.eventId, kind: .reminder)
-                } label: {
-                    OrganizerAnalyticsMetricCard(
-                        title: "Reminder apertura",
-                        value: "\(engagementMetrics.totalOpeningReminderCount)",
-                        subtitle: "Utenti con reminder attivato",
-                        icon: "bell.badge.fill",
-                        tint: Brand.warning
-                    )
-                }
-                .buttonStyle(.plain)
-            }
-
-            if registrations.isEmpty {
-                EmptyState(icon: "chart.bar.xaxis", title: "No registration data yet", message: "Le analytics si popolano appena arrivano iscrizioni.")
+            if !event.isAnalyticsEligible {
+                EmptyState(icon: "chart.bar.xaxis", title: "Analytics non disponibili", message: "Le statistiche non includono eventi in bozza.")
             } else {
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                    OrganizerAnalyticsMetricCard(
-                        title: "Fill Rate",
-                        value: "\(fillRate)%",
-                        subtitle: "\(active.count)/\(capacity) posti · \(availableSpots) liberi",
-                        icon: "percent",
-                        tint: Brand.primary,
-                        progress: Double(fillRate) / 100
-                    )
-                    OrganizerAnalyticsMetricCard(
-                        title: "Total Signups",
-                        value: "\(validRegistrations.count)",
-                        subtitle: "\(active.count) attivi · \(priceOptions.count) prezzi",
-                        icon: "person.2.fill",
-                        tint: Brand.secondary
-                    )
                     NavigationLink {
-                        OrganizerAnalyticsCancelledListView(registrations: cancelledDetails)
+                        OrganizerEventEngagementAudienceView(eventId: engagementMetrics.eventId, kind: .saved)
                     } label: {
                         OrganizerAnalyticsMetricCard(
-                            title: "Cancellati",
-                            value: "\(cancelled.count)",
-                            subtitle: cancelled.count == 1 ? "1 cancellazione" : "\(cancelled.count) cancellazioni",
-                            icon: "xmark.circle",
-                            tint: Brand.destructive
+                            title: "Salvati",
+                            value: "\(engagementMetrics.savedCount)",
+                            subtitle: "Utenti che hanno salvato",
+                            icon: "bookmark.fill",
+                            tint: Brand.primary
                         )
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Cancellati")
-                    .accessibilityValue("\(cancelled.count)")
-                    .accessibilityHint("Apre la lista delle iscrizioni cancellate")
 
-                    if isPastEvent {
+                    NavigationLink {
+                        OrganizerEventEngagementAudienceView(eventId: engagementMetrics.eventId, kind: .reminder)
+                    } label: {
                         OrganizerAnalyticsMetricCard(
-                            title: "Attendance",
-                            value: "\(attendanceRate)%",
-                            subtitle: "\(attended.count) presenti",
-                            icon: "checkmark.circle.fill",
-                            tint: Brand.success,
-                            progress: Double(attendanceRate) / 100
-                        )
-                        OrganizerAnalyticsMetricCard(
-                            title: "No-Shows",
-                            value: "\(noShows.count)",
-                            subtitle: "\(noShowRate)% sul totale",
-                            icon: "person.crop.circle.badge.xmark",
-                            tint: Brand.destructive
-                        )
-                    } else {
-                        OrganizerAnalyticsMetricCard(
-                            title: "Waitlist",
-                            value: "\(waitlisted.count)",
-                            subtitle: "\(pending.count) in sospeso",
-                            icon: "list.bullet",
+                            title: "Reminder apertura",
+                            value: "\(engagementMetrics.totalOpeningReminderCount)",
+                            subtitle: "Utenti con reminder attivato",
+                            icon: "bell.badge.fill",
                             tint: Brand.warning
                         )
                     }
+                    .buttonStyle(.plain)
                 }
 
-                if trendPoints.count > 1 {
-                    OrganizerAnalyticsPanel(title: "Registration Trend", systemImage: "chart.line.uptrend.xyaxis", subtitle: "Iscrizioni cumulative nel tempo") {
-                        OrganizerAnalyticsLineChart(points: trendPoints, tint: Brand.primary)
+                if registrations.isEmpty {
+                    EmptyState(icon: "chart.bar.xaxis", title: "No registration data yet", message: "Le analytics si popolano appena arrivano iscrizioni.")
+                } else {
+                    LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                        OrganizerAnalyticsMetricCard(
+                            title: "Fill Rate",
+                            value: "\(fillRate)%",
+                            subtitle: "\(active.count)/\(capacity) posti · \(availableSpots) liberi",
+                            icon: "percent",
+                            tint: Brand.primary,
+                            progress: Double(fillRate) / 100
+                        )
+                        OrganizerAnalyticsMetricCard(
+                            title: "Total Signups",
+                            value: "\(validRegistrations.count)",
+                            subtitle: "\(active.count) attivi · \(priceOptions.count) prezzi",
+                            icon: "person.2.fill",
+                            tint: Brand.secondary
+                        )
+                        NavigationLink {
+                            OrganizerAnalyticsCancelledListView(registrations: cancelledDetails)
+                        } label: {
+                            OrganizerAnalyticsMetricCard(
+                                title: "Cancellati",
+                                value: "\(cancelled.count)",
+                                subtitle: cancelled.count == 1 ? "1 cancellazione" : "\(cancelled.count) cancellazioni",
+                                icon: "xmark.circle",
+                                tint: Brand.destructive
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Cancellati")
+                        .accessibilityValue("\(cancelled.count)")
+                        .accessibilityHint("Apre la lista delle iscrizioni cancellate")
+
+                        if isPastEvent {
+                            OrganizerAnalyticsMetricCard(
+                                title: "Attendance",
+                                value: "\(attendanceRate)%",
+                                subtitle: "\(attended.count) presenti",
+                                icon: "checkmark.circle.fill",
+                                tint: Brand.success,
+                                progress: Double(attendanceRate) / 100
+                            )
+                            OrganizerAnalyticsMetricCard(
+                                title: "No-Shows",
+                                value: "\(noShows.count)",
+                                subtitle: "\(noShowRate)% sul totale",
+                                icon: "person.crop.circle.badge.xmark",
+                                tint: Brand.destructive
+                            )
+                        } else {
+                            OrganizerAnalyticsMetricCard(
+                                title: "Waitlist",
+                                value: "\(waitlisted.count)",
+                                subtitle: "\(pending.count) in sospeso",
+                                icon: "list.bullet",
+                                tint: Brand.warning
+                            )
+                        }
+                    }
+
+                    if trendPoints.count > 1 {
+                        OrganizerAnalyticsPanel(title: "Registration Trend", systemImage: "chart.line.uptrend.xyaxis", subtitle: "Iscrizioni cumulative nel tempo") {
+                            OrganizerAnalyticsLineChart(points: trendPoints, tint: Brand.primary)
+                        }
+                    }
+
+                    if isPastEvent, !attendanceItems.isEmpty {
+                        OrganizerAnalyticsPanel(title: "Attendance Breakdown", systemImage: "chart.pie", subtitle: "Presenti e no-show dell'evento") {
+                            OrganizerAnalyticsDonut(items: attendanceItems)
+                        }
+                    }
+
+                    if !statusItems.isEmpty {
+                        OrganizerAnalyticsPanel(title: "Status Breakdown", systemImage: "slider.horizontal.3", subtitle: "Distribuzione delle iscrizioni") {
+                            OrganizerAnalyticsBars(items: statusItems)
+                        }
+                    }
+
+                    if !meetingPointItems.isEmpty {
+                        OrganizerAnalyticsPanel(title: "Meeting Point Distribution", systemImage: "mappin.and.ellipse", subtitle: "Partecipanti per punto di ritrovo") {
+                            OrganizerAnalyticsBars(items: meetingPointItems)
+                        }
                     }
                 }
 
-                if isPastEvent, !attendanceItems.isEmpty {
-                    OrganizerAnalyticsPanel(title: "Attendance Breakdown", systemImage: "chart.pie", subtitle: "Presenti e no-show dell'evento") {
-                        OrganizerAnalyticsDonut(items: attendanceItems)
-                    }
-                }
-
-                if !statusItems.isEmpty {
-                    OrganizerAnalyticsPanel(title: "Status Breakdown", systemImage: "slider.horizontal.3", subtitle: "Distribuzione delle iscrizioni") {
-                        OrganizerAnalyticsBars(items: statusItems)
-                    }
-                }
-
-                if !meetingPointItems.isEmpty {
-                    OrganizerAnalyticsPanel(title: "Meeting Point Distribution", systemImage: "mappin.and.ellipse", subtitle: "Partecipanti per punto di ritrovo") {
-                        OrganizerAnalyticsBars(items: meetingPointItems)
-                    }
-                }
-            }
-
-            if !broadcastHistory.isEmpty {
-                OrganizerAnalyticsPanel(title: "Ultimi broadcast", systemImage: "megaphone", subtitle: "Comunicazioni inviate dall'organizzatore") {
-                    VStack(spacing: 10) {
-                        ForEach(broadcastHistory.prefix(5)) { broadcast in
-                            HStack(alignment: .top, spacing: 10) {
-                                Image(systemName: broadcast.channel == "whatsapp" ? "message.fill" : "bell.fill")
-                                    .foregroundStyle(broadcast.channelColor)
-                                    .frame(width: 24)
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text("\(broadcast.channelLabel) · \(broadcast.recipientsCount ?? 0) destinatari")
-                                        .font(.caption.weight(.bold))
-                                        .foregroundStyle(Brand.foreground)
-                                    if let date = broadcast.displayDateTime {
-                                        Text(date)
-                                            .font(.caption2.weight(.semibold))
-                                            .foregroundStyle(Brand.mutedForeground.opacity(0.75))
+                if !broadcastHistory.isEmpty {
+                    OrganizerAnalyticsPanel(title: "Ultimi broadcast", systemImage: "megaphone", subtitle: "Comunicazioni inviate dall'organizzatore") {
+                        VStack(spacing: 10) {
+                            ForEach(broadcastHistory.prefix(5)) { broadcast in
+                                HStack(alignment: .top, spacing: 10) {
+                                    Image(systemName: broadcast.channel == "whatsapp" ? "message.fill" : "bell.fill")
+                                        .foregroundStyle(broadcast.channelColor)
+                                        .frame(width: 24)
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text("\(broadcast.channelLabel) · \(broadcast.recipientsCount ?? 0) destinatari")
+                                            .font(.caption.weight(.bold))
+                                            .foregroundStyle(Brand.foreground)
+                                        if let date = broadcast.displayDateTime {
+                                            Text(date)
+                                                .font(.caption2.weight(.semibold))
+                                                .foregroundStyle(Brand.mutedForeground.opacity(0.75))
+                                        }
+                                        Text(broadcast.message)
+                                            .font(.caption)
+                                            .foregroundStyle(Brand.mutedForeground)
+                                            .lineLimit(2)
                                     }
-                                    Text(broadcast.message)
-                                        .font(.caption)
-                                        .foregroundStyle(Brand.mutedForeground)
-                                        .lineLimit(2)
+                                    Spacer()
                                 }
-                                Spacer()
+                                .padding(12)
+                                .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
                             }
-                            .padding(12)
-                            .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
                         }
                     }
                 }
@@ -31016,7 +31028,7 @@ private enum BadgeProgressResolver {
         matching predicate: (Registration) -> Bool = { _ in true }
     ) -> Int {
         var eventIds = Set<String>()
-        for registration in registrations where isAttendedForBadgeProgress(registration) && predicate(registration) {
+        for registration in registrations where registration.isAnalyticsEligible && isAttendedForBadgeProgress(registration) && predicate(registration) {
             eventIds.insert(registration.eventKey ?? registration.id)
         }
         return eventIds.count
@@ -31816,7 +31828,7 @@ struct ProfileActivityHistorySection: View {
     private var uniqueRegistrations: [Registration] {
         var byEvent: [String: Registration] = [:]
 
-        for registration in registrations {
+        for registration in registrations where registration.isAnalyticsEligible {
             let key = registration.eventId ?? registration.event?.id ?? registration.id
             guard !key.isEmpty else { continue }
 
@@ -38226,7 +38238,7 @@ private extension Event {
     }
 
     var organizerIsDraft: Bool {
-        normalizedStatus == "draft"
+        ["draft", "unpublished"].contains(normalizedStatus)
     }
 
     var organizerIsCancelled: Bool {
@@ -38234,11 +38246,11 @@ private extension Event {
     }
 
     var organizerIsPublishedUpcoming: Bool {
-        !organizerIsPastByDate && !["draft", "cancelled", "archived", "past", "completed"].contains(normalizedStatus)
+        !organizerIsPastByDate && !["draft", "unpublished", "cancelled", "archived", "past", "completed"].contains(normalizedStatus)
     }
 
     var organizerIsHistoric: Bool {
-        organizerIsPastByDate && !organizerIsDraft && !organizerIsCancelled
+        organizerIsPastByDate && isAnalyticsEligible && !organizerIsCancelled
     }
 
     var organizerCapacityWarning: (text: String, icon: String, color: Color)? {
