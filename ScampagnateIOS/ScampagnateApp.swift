@@ -1180,6 +1180,16 @@ final class AppStore: ObservableObject {
         }
     }
 
+    func fetchEventEngagementAudience(eventId: String, kind: EventEngagementAudienceKind, reportingErrors: Bool = true) async -> [EventEngagementAudienceMember] {
+        do {
+            let authSession = try await authenticatedSession()
+            return try await api.fetchEventEngagementAudience(eventId: eventId, kind: kind, session: authSession)
+        } catch {
+            report(error, when: reportingErrors)
+            return []
+        }
+    }
+
     func signOut() {
         let authSession = session
         clearUserSession()
@@ -3051,6 +3061,54 @@ struct SupabaseAPI {
             "p_event_ids": .array(ids.map { .string($0) })
         ]
         return try await request(path: "/rest/v1/rpc/get_event_engagement_metrics", method: "POST", body: body, auth: session, decode: [EventEngagementMetrics].self)
+    }
+
+    func fetchEventEngagementAudience(eventId: String, kind: EventEngagementAudienceKind, session: AuthSession) async throws -> [EventEngagementAudienceMember] {
+        let rows: [EventEngagementSourceRow]
+        switch kind {
+        case .saved:
+            rows = try await request(
+                path: "/rest/v1/saved_events?select=id,user_id,created_at&event_id=eq.\(eventId.urlEncoded)&order=created_at.desc",
+                method: "GET",
+                bodyData: nil,
+                auth: session,
+                decode: [EventEngagementSourceRow].self
+            )
+        case .reminder:
+            rows = try await request(
+                path: "/rest/v1/event_opening_reminders?select=id,user_id,created_at,notified_at&event_id=eq.\(eventId.urlEncoded)&cancelled_at=is.null&order=created_at.desc",
+                method: "GET",
+                bodyData: nil,
+                auth: session,
+                decode: [EventEngagementSourceRow].self
+            )
+        }
+
+        let userIds = Array(Set(rows.map(\.userId).compactMap(\.nilIfBlank))).sorted()
+        let profilesById = try await fetchEventEngagementProfiles(userIds: userIds, session: session)
+
+        return rows.map { row in
+            let profile = profilesById[row.userId]
+            return EventEngagementAudienceMember(
+                id: row.id,
+                userId: row.userId,
+                displayName: profile?.displayName ?? "Utente \(String(row.userId.prefix(8)))",
+                email: profile?.email?.nilIfBlank,
+                phone: profile?.phone?.nilIfBlank,
+                instagramHandle: profile?.instagramHandle?.nilIfBlank,
+                avatarUrl: profile?.avatarUrl?.nilIfBlank,
+                createdAt: row.createdAt,
+                statusLabel: kind == .reminder ? (row.notifiedAt?.nilIfBlank == nil ? "Attivo" : "Gia avvisato") : nil
+            )
+        }
+    }
+
+    private func fetchEventEngagementProfiles(userIds: [String], session: AuthSession) async throws -> [String: EventEngagementProfileRow] {
+        guard !userIds.isEmpty else { return [:] }
+        let ids = userIds.map(\.urlEncoded).joined(separator: ",")
+        let path = "/rest/v1/profiles?select=id,first_name,last_name,email,phone,instagram_handle,avatar_url&id=in.(\(ids))"
+        let profiles: [EventEngagementProfileRow] = try await request(path: path, method: "GET", bodyData: nil, auth: session, decode: [EventEngagementProfileRow].self)
+        return Dictionary(uniqueKeysWithValues: profiles.map { ($0.id, $0) })
     }
 
     func fetchNotifications(session: AuthSession) async throws -> [UserNotification] {
@@ -5845,6 +5903,76 @@ struct EventEngagementMetrics: Codable, Identifiable, Hashable {
             openingReminderNotifiedCount: 0,
             openingNotificationClickCount: 0
         )
+    }
+}
+
+enum EventEngagementAudienceKind: String, Identifiable, Hashable {
+    case saved
+    case reminder
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .saved:
+            return "Salvati"
+        case .reminder:
+            return "Reminder"
+        }
+    }
+
+    var emptyTitle: String {
+        switch self {
+        case .saved:
+            return "Nessun salvataggio"
+        case .reminder:
+            return "Nessun reminder"
+        }
+    }
+
+    var emptyMessage: String {
+        switch self {
+        case .saved:
+            return "Quando qualcuno salva questo evento lo vedrai qui."
+        case .reminder:
+            return "Quando qualcuno attiva il reminder di apertura lo vedrai qui."
+        }
+    }
+}
+
+struct EventEngagementAudienceMember: Identifiable, Hashable {
+    let id: String
+    let userId: String
+    let displayName: String
+    let email: String?
+    let phone: String?
+    let instagramHandle: String?
+    let avatarUrl: String?
+    let createdAt: String?
+    let statusLabel: String?
+}
+
+private struct EventEngagementSourceRow: Codable {
+    let id: String
+    let userId: String
+    let createdAt: String?
+    let notifiedAt: String?
+}
+
+private struct EventEngagementProfileRow: Codable {
+    let id: String
+    let firstName: String?
+    let lastName: String?
+    let email: String?
+    let phone: String?
+    let instagramHandle: String?
+    let avatarUrl: String?
+
+    var displayName: String {
+        [firstName, lastName]
+            .compactMap { $0?.nilIfBlank }
+            .joined(separator: " ")
+            .nilIfBlank ?? "Utente \(String(id.prefix(8)))"
     }
 }
 
@@ -21377,11 +21505,6 @@ struct OrganizerManageQuickActions: View {
 struct OrganizerEventEngagementCard: View {
     let metrics: EventEngagementMetrics
 
-    private var clickRate: Int {
-        guard metrics.openingReminderNotifiedCount > 0 else { return 0 }
-        return Int(round(Double(metrics.openingNotificationClickCount) / Double(metrics.openingReminderNotifiedCount) * 100))
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
@@ -21389,16 +21512,24 @@ struct OrganizerEventEngagementCard: View {
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(Brand.foreground)
                 Spacer()
-                Text("\(clickRate)% click rate")
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(Brand.primary)
             }
 
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                OrganizerEngagementStat(title: "Salvati", value: metrics.savedCount, icon: "bookmark.fill", tint: Brand.primary)
-                OrganizerEngagementStat(title: "Reminder", value: metrics.totalOpeningReminderCount, icon: "bell.badge.fill", tint: Brand.warning)
-                OrganizerEngagementStat(title: "Notificati", value: metrics.openingReminderNotifiedCount, icon: "paperplane.fill", tint: Brand.secondary)
-                OrganizerEngagementStat(title: "Click", value: metrics.openingNotificationClickCount, icon: "cursorarrow.click", tint: Brand.success)
+                NavigationLink {
+                    OrganizerEventEngagementAudienceView(eventId: metrics.eventId, kind: .saved)
+                } label: {
+                    OrganizerEngagementStat(title: "Salvati", value: metrics.savedCount, icon: "bookmark.fill", tint: Brand.primary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Apre la lista degli utenti")
+
+                NavigationLink {
+                    OrganizerEventEngagementAudienceView(eventId: metrics.eventId, kind: .reminder)
+                } label: {
+                    OrganizerEngagementStat(title: "Reminder", value: metrics.totalOpeningReminderCount, icon: "bell.badge.fill", tint: Brand.warning)
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Apre la lista degli utenti")
             }
         }
         .padding(14)
@@ -21433,6 +21564,123 @@ private struct OrganizerEngagementStat: View {
         }
         .padding(10)
         .background(Brand.muted.opacity(0.45), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+struct OrganizerEventEngagementAudienceView: View {
+    @EnvironmentObject private var store: AppStore
+    let eventId: String
+    let kind: EventEngagementAudienceKind
+    @State private var members: [EventEngagementAudienceMember] = []
+    @State private var loading = true
+
+    var body: some View {
+        ZStack {
+            Brand.background.ignoresSafeArea()
+            if loading {
+                ProgressView()
+                    .tint(Brand.primary)
+            } else if members.isEmpty {
+                EmptyState(icon: kind == .saved ? "bookmark" : "bell.badge", title: kind.emptyTitle, message: kind.emptyMessage)
+                    .padding(20)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 10) {
+                        ForEach(members) { member in
+                            OrganizerEngagementAudienceRow(member: member)
+                        }
+                    }
+                    .padding(16)
+                }
+                .refreshable { await load() }
+            }
+        }
+        .navigationTitle(kind.title)
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await load() }
+    }
+
+    @MainActor
+    private func load() async {
+        loading = true
+        members = await store.fetchEventEngagementAudience(eventId: eventId, kind: kind, reportingErrors: false)
+        loading = false
+    }
+}
+
+private struct OrganizerEngagementAudienceRow: View {
+    let member: EventEngagementAudienceMember
+
+    private var contactText: String? {
+        let instagram = member.instagramHandle?.nilIfBlank.map { $0.hasPrefix("@") ? $0 : "@\($0)" }
+        let values = [member.phone?.nilIfBlank, member.email?.nilIfBlank, instagram].compactMap { $0 }
+        return values.isEmpty ? nil : values.joined(separator: " · ")
+    }
+
+    private var createdAtText: String? {
+        guard let date = member.createdAt?.isoDate else { return nil }
+        return DateFormatter.localizedString(from: date, dateStyle: .short, timeStyle: .short)
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            OrganizerEngagementAudienceAvatar(name: member.displayName, avatarUrl: member.avatarUrl)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(member.displayName)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(Brand.foreground)
+                        .lineLimit(2)
+                    if let statusLabel = member.statusLabel {
+                        Text(statusLabel)
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(Brand.primary)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Brand.primary.opacity(0.12), in: Capsule())
+                    }
+                }
+                if let createdAtText {
+                    Text(createdAtText)
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                }
+                if let contactText {
+                    Text(contactText)
+                        .font(.caption)
+                        .foregroundStyle(Brand.mutedForeground)
+                        .lineLimit(2)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(Brand.card, in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Brand.muted, lineWidth: 1))
+    }
+}
+
+private struct OrganizerEngagementAudienceAvatar: View {
+    let name: String
+    let avatarUrl: String?
+
+    var body: some View {
+        ZStack {
+            if let avatarUrl, let url = URL(string: avatarUrl) {
+                AsyncImage(url: url) { image in
+                    image.resizable().scaledToFill()
+                } placeholder: {
+                    Brand.muted
+                }
+            } else {
+                Brand.primary.opacity(0.16)
+                Text(String(name.prefix(1)).uppercased())
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(Brand.primary)
+            }
+        }
+        .frame(width: 42, height: 42)
+        .clipShape(Circle())
     }
 }
 
@@ -22442,27 +22690,31 @@ struct OrganizerEventAnalyticsSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                OrganizerAnalyticsMetricCard(
-                    title: "Salvati",
-                    value: "\(engagementMetrics.savedCount)",
-                    subtitle: "Utenti che hanno salvato",
-                    icon: "bookmark.fill",
-                    tint: Brand.primary
-                )
-                OrganizerAnalyticsMetricCard(
-                    title: "Reminder apertura",
-                    value: "\(engagementMetrics.totalOpeningReminderCount)",
-                    subtitle: "\(engagementMetrics.openingReminderActiveCount) attivi · \(engagementMetrics.openingReminderNotifiedCount) notificati",
-                    icon: "bell.badge.fill",
-                    tint: Brand.warning
-                )
-                OrganizerAnalyticsMetricCard(
-                    title: "Click notifica",
-                    value: "\(engagementMetrics.openingNotificationClickCount)",
-                    subtitle: "Aperture da reminder",
-                    icon: "cursorarrow.click",
-                    tint: Brand.success
-                )
+                NavigationLink {
+                    OrganizerEventEngagementAudienceView(eventId: engagementMetrics.eventId, kind: .saved)
+                } label: {
+                    OrganizerAnalyticsMetricCard(
+                        title: "Salvati",
+                        value: "\(engagementMetrics.savedCount)",
+                        subtitle: "Utenti che hanno salvato",
+                        icon: "bookmark.fill",
+                        tint: Brand.primary
+                    )
+                }
+                .buttonStyle(.plain)
+
+                NavigationLink {
+                    OrganizerEventEngagementAudienceView(eventId: engagementMetrics.eventId, kind: .reminder)
+                } label: {
+                    OrganizerAnalyticsMetricCard(
+                        title: "Reminder apertura",
+                        value: "\(engagementMetrics.totalOpeningReminderCount)",
+                        subtitle: "Utenti con reminder attivato",
+                        icon: "bell.badge.fill",
+                        tint: Brand.warning
+                    )
+                }
+                .buttonStyle(.plain)
             }
 
             if registrations.isEmpty {
